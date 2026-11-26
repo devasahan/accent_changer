@@ -1,5 +1,7 @@
-# Every push: the JavaScript tests (unit + the probe page in headless Chromium)
-# on Linux, and the Rust shell's tests and lints on Windows.
+# Every push: the JavaScript tests on Linux (unit tests, then the probe page and
+# the app's page in headless Chromium), and the Rust shell's tests and lints on
+# Windows. GitHub starts no run for a push whose newest commit message asks it
+# to skip CI.
 name: CI
 
 on:
