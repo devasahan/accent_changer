@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Vad, frameLevelsDb } from "../src/core/vad.js";
+import { SpeechPeak, Vad, frameLevelsDb } from "../src/core/vad.js";
 import { envelopeDb } from "../src/core/delay-estimate.js";
 import { breathNoise, rng, synthSpeech } from "./helpers/synth.js";
 
@@ -235,6 +235,65 @@ test("a voice that drops 30 dB is not ignored for good: the peak sinks while the
   // ... and not right away: just after the drop the soft voice is under the old peak's range.
   const first = utterances[0].start + offset;
   assert.ok(!segs.some((s) => s.on > first - 0.05 && s.on < first + 1), "the soft voice passed at once");
+});
+
+test("a cough does not make the next sentences too quiet to be speech: the peak follows the voice, not the loudest sound", () => {
+  // A speech peak that jumped to the cough and held there would put most of the voice more
+  // than 25 dB under it for seconds: whole sentences after the cough would be missed.
+  const attack = 0.03 + 0.01;
+  const hang = 0.3 + 0.01;
+  for (const seed of [1, 2, 3, 4]) {
+    const { samples, utterances } = speech(seed);
+    for (const [voiceDb, coughDb] of [
+      [-12, -6], // a quiet speaker (vowels near -31 dBFS) coughs 25 dB louder than they speak
+      [0, -3], // 100 ms at -3 dBFS: 15 dB over the vowels
+    ]) {
+      const x = samples.map((v) => v * 10 ** (voiceDb / 20));
+      const cough = noise(ms(100), coughDb, seed);
+      const at = Math.round((utterances[2].start + 0.2) * SR); // in the middle of the third sentence
+      for (let i = 0; i < cough.length; i++) x[at + i] += cough[i];
+      const { segs, vad } = segments(x);
+      const what = `seed ${seed}, voice ${voiceDb} dB, cough ${coughDb} dBFS`;
+      assert.equal(segs.length, utterances.length, `${what}: ${segs.length} segments`);
+      utterances.slice(3).forEach((u, k) => {
+        const s = segs[k + 3];
+        assert.ok(Math.abs(s.on - u.start) <= attack + 1e-9, `${what}: sentence ${k + 3} on at ${s.on.toFixed(3)} s, starts ${u.start.toFixed(3)} s`);
+        assert.ok(s.off !== null && Math.abs(s.off - u.end) <= hang + 1e-9, `${what}: sentence ${k + 3} off at ${s.off} s, ends ${u.end.toFixed(3)} s`);
+      });
+      const voicePeak = Math.max(...frameLevelsDb(samples, SR, 10)) + voiceDb;
+      assert.ok(vad.peakDb <= voicePeak + 4, `${what}: peak ${vad.peakDb.toFixed(1)} dB, the voice's ${voicePeak.toFixed(1)}`);
+    }
+  }
+});
+
+test("SpeechPeak: at most capDb over the level the loudest fifth of recent speech reaches; follows a voice that gets louder or quieter", () => {
+  const p = new SpeechPeak(); // 10 ms frames, 2 s hold, 3 dB/s decay, 2.5 s window, loudest fifth + 4 dB
+  assert.equal(p.db, -Infinity);
+  const voice = (i, gain = 0) => gain - 20 - 8 * Math.abs(Math.sin(i * 0.37)); // syllables: -28..-20 dB
+  let i = 0;
+  for (; i < 300; i++) p.push(voice(i), true);
+  assert.ok(p.db <= -20 && p.db > -21, `voice peak ${p.db}`); // the loudest recent frame, held then sinking
+  // A cough, a click, one shouted word: 3, 10 and 30 frames 15-25 dB over the voice.
+  for (const [n, level] of [
+    [3, 0],
+    [10, -5],
+    [30, -8],
+  ]) {
+    for (let k = 0; k < n; k++) p.push(level, true);
+    assert.ok(p.db <= -20 + 4 + 0.5, `after ${n} frames at ${level} dB: peak ${p.db}`);
+    for (let k = 0; k < 100; k++, i++) p.push(voice(i), true);
+  }
+  // Frames that are not speech let time pass but never raise it.
+  for (let k = 0; k < 50; k++) p.push(-3, false);
+  assert.ok(p.db <= -15.5, `after loud non-speech: ${p.db}`);
+  // The voice gets 10 dB louder for good: within a fifth of the window (0.5 s).
+  for (let k = 0; k < 60; k++, i++) p.push(voice(i, 10), true);
+  assert.ok(Math.abs(p.db + 10) < 0.5, `louder voice: ${p.db}`);
+  // ... and 20 dB quieter: down to it within the window (2.5 s).
+  for (let k = 0; k < 250; k++, i++) p.push(voice(i, -20), true);
+  assert.ok(p.db <= -40 + 4 + 0.5, `quieter voice: ${p.db}`);
+  p.reset();
+  assert.equal(p.db, -Infinity);
 });
 
 test("attack: a 15 ms click is not speech, a 35 ms burst is", () => {

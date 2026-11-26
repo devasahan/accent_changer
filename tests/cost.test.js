@@ -236,6 +236,36 @@ test("a corrupt or hand-edited state never stops the app: what can't be read is 
   assert.equal(kept.months["2026-11"], 4);
 });
 
+test("without a clock reading serialize() drops nothing: one future date cannot wipe the history", () => {
+  // A day in 2031 from a PC clock that was wrong during an earlier run (or a hand edit). This run
+  // makes no call (the app was opened and closed, or only settings changed) and saves with the
+  // plain serialize(): counting the kept days back from the newest saved date dropped every real
+  // day and month, so this month's spend read $0 after the next start.
+  const state = {
+    version: 1,
+    days: { "2031-01-01": 1, "2026-11-20": 4, "2026-11-25": 30 },
+    months: { "2031-01": 1, "2026-11": 34, "2026-10": 120 },
+  };
+  const m = new CostMeter({ state });
+  assert.deepEqual(m.serialize(), {
+    version: 1,
+    days: { "2026-11-20": 4, "2026-11-25": 30, "2031-01-01": 1 },
+    months: { "2026-10": 120, "2026-11": 34, "2031-01": 1 },
+  });
+  const next = new CostMeter({ state: JSON.stringify(m.serialize()) });
+  const now = at("2026-11-26T12:00:00Z");
+  assert.deepEqual(mins(next.totals(now)), { session: 0, today: 0, month: 34 });
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: next.totals(now).month.usd }), { minutesLeft: 1077, red: false });
+  // Old days are still trimmed once there is a clock reading: atMs, or a call made in this run.
+  const old = new CostMeter({ state: { days: { "2026-01-02": 3, "2026-11-25": 30 }, months: { "2026-01": 3, "2026-11": 30 } } });
+  assert.deepEqual(old.serialize().days, { "2026-01-02": 3, "2026-11-25": 30 }, "no clock reading: kept");
+  assert.deepEqual(old.serialize({ atMs: now }).days, { "2026-11-25": 30 });
+  old.callStarted("c", now);
+  old.callEnded("c", now + 2 * MIN);
+  assert.deepEqual(old.serialize().days, { "2026-11-25": 30, "2026-11-26": 2 }, "this run's call is the clock reading");
+  assert.deepEqual(old.serialize().months, { "2026-01": 3, "2026-11": 32 });
+});
+
 test("budgetStatus: minutes left before the cap, red under 90", () => {
   assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 0 }), { minutesLeft: 1111, red: false });
   assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 9.19 }), { minutesLeft: 90, red: false });
