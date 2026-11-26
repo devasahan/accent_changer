@@ -12,11 +12,15 @@ import { socketHosts, watchStats } from "./webrtc-stats.js"; // first: watches W
 import { analyzeRun, estimateDelay, median, percentile } from "../src/core/delay-estimate.js";
 import { encodeWav } from "../src/core/wav.js";
 import { DEFAULT_SCRIPT } from "./script.js";
+import { quietNote, quietTest, soundSec } from "./quiet-test.js";
 import { connectSanas, disconnectSanas, mockEngine, sanasEngine } from "./engines.js";
 
 const PRICE_PER_MIN = 0.009; // AT5.2 on Sanas Cloud (developer.sanas.ai pricing, 2026-10-01)
 const TAIL_SEC = 2.5; // keep recording after the script ends, to catch the delayed output
 const DELAY_LIMIT_MS = 380; // GO needs a median at or under this (spike/FINDINGS.md)
+// A ready-made app's delay includes its microphone path, which our app adds on top of the
+// Sanas figure (Gate 1 allows 120 ms): INTERVIEW.md's bar is about 500 ms.
+const APP_DELAY_LIMIT_MS = DELAY_LIMIT_MS + 120;
 const LONG_MAX_MIN = 90; // the README asks for one 65-minute run
 const READ_MAX_SEC = 300; // "Read the script" stops by itself after 5 minutes
 const READ_TAIL_SEC = 3; // after Stop, "Read the script" listens this long for the app's last words
@@ -117,8 +121,15 @@ const BUTTONS = {
 // Settings stay fixed while something runs (each run also keeps a copy of the ones it used).
 const SETUP_IDS = ["engine", "model", "rate", "jitter", "mockDelay", "mockFail", "mockConnect", "mic", "out", "longMinutes", "pairDevice"];
 
+// Run and the stability run use step 2's recording, which lives only in the open page.
+const NEEDS_RECORDING = "Record the script first (step 2): this uses that recording. A reopened page has none.";
+
 function refreshButtons() {
   for (const [id, enabled] of Object.entries(BUTTONS)) $(id).disabled = !enabled();
+  for (const id of ["runInfo", "longInfo"]) {
+    if (!state.recording) $(id).textContent = NEEDS_RECORDING;
+    else if ($(id).textContent === NEEDS_RECORDING) $(id).textContent = "";
+  }
   for (const id of SETUP_IDS) $(id).disabled = state.mode !== "idle";
   $("rateRun").disabled = !["idle", "long"].includes(state.mode);
   const mock = $("engine").value === "mock";
@@ -436,6 +447,7 @@ function updateCost() {
 
 async function listDevices() {
   const devices = await navigator.mediaDevices.enumerateDevices();
+  const outBefore = $("out").value;
   const fill = (select, list, defaultLabel) => {
     const previous = select.value;
     const options = list.map((d, i) => new Option(d.label || `${d.kind} ${i + 1}`, d.deviceId));
@@ -465,6 +477,8 @@ async function listDevices() {
     if (other) pair.value = other.value;
   }
   state.defaultOutputRate = readDefaultOutputRate();
+  // The list changed what the output shows (headphones plugged in or out): play there too.
+  if ($("out").value !== outBefore) await applySink();
 }
 
 action("btnMic", "busy", async () => {
@@ -694,7 +708,8 @@ function renderRuns() {
       cells.forEach((text, c) => {
         const td = document.createElement("td");
         td.textContent = text;
-        if ((c === 3 && (!r.ok || r.delayMs > DELAY_LIMIT_MS)) || (c === 5 && gapsBad(r))) td.className = "bad";
+        const limit = r.settings?.engine === "device" ? APP_DELAY_LIMIT_MS : DELAY_LIMIT_MS;
+        if ((c === 3 && (!r.ok || r.delayMs > limit)) || (c === 5 && gapsBad(r))) td.className = "bad";
         tr.append(td);
       });
       return tr;
@@ -936,12 +951,13 @@ const clock = (secs) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)
  * Follows a call while you talk. Every 3 s it looks at the last 12 s of your
  * microphone and of the converted voice: when converted speech follows
  * yours, it notes the delay. It also notes when your microphone had speech,
- * so the quiet test can tell "you were silent" from "nothing came back".
+ * and how many seconds of it were loud, so the quiet test (quiet-test.js) can
+ * tell "you were silent" from "nothing came back", and a cough from talk.
  * Only the last 12 s are kept, so it can run for an hour.
  */
 function followCall(ctx, rec) {
   const t0 = performance.now();
-  const f = { t0, delays: [], heard: [], speech: [], last: null };
+  const f = { t0, delays: [], heard: [], speech: [], sound: [], last: null };
   f.tick = () => {
     const [ref, sig] = rec.recent(12);
     const secs = round((performance.now() - t0) / 1000, 1);
@@ -952,39 +968,14 @@ function followCall(ctx, rec) {
       f.heard.push(secs);
     }
     const last3 = Math.round(ctx.sampleRate * 3);
-    if (ref.length >= last3 && rmsDb(ref.subarray(ref.length - last3)) > SPEECH_DB) f.speech.push(secs);
+    const tail = ref.length >= last3 ? ref.subarray(ref.length - last3) : null;
+    if (tail && rmsDb(tail) > SPEECH_DB) {
+      f.speech.push(secs);
+      f.sound.push(soundSec(tail, ctx.sampleRate, SPEECH_DB));
+    }
     return secs;
   };
   return f;
-}
-
-/**
- * The quiet test: your longest silence in the call (from the start, between
- * stretches of speech, or until the end), and how many seconds after you
- * spoke again converted speech came back (null: it didn't, or you stayed
- * silent until the end).
- */
-function quietTest(speech, heard, endSec) {
-  let silence = 0;
-  let resumedAt = null;
-  let previous = 0;
-  for (const t of speech) {
-    if (t - previous > silence) {
-      silence = t - previous;
-      resumedAt = t;
-    }
-    previous = t;
-  }
-  if (endSec - previous > silence) {
-    silence = endSec - previous;
-    resumedAt = null;
-  }
-  const back = resumedAt == null ? null : heard.find((t) => t >= resumedAt) ?? null;
-  return {
-    silenceLongestSec: round(silence, 1),
-    speechResumedAtSec: resumedAt,
-    convertedBackAfterSec: back == null ? null : round(back - resumedAt, 1),
-  };
 }
 
 /** What a followed call saves: delays, the quiet test, and both timelines (seconds). */
@@ -994,9 +985,10 @@ function callSummary(f) {
     ok: f.delays.length > 0,
     reason: f.delays.length ? null : f.speech.length ? "you spoke, but no converted speech came back" : "no speech detected",
     durationSec: endSec,
-    ...quietTest(f.speech, f.heard, endSec),
+    ...quietTest(f.speech, f.heard, endSec, f.sound),
     heardAtSec: f.heard,
     speechAtSec: f.speech,
+    speechSoundSec: f.sound,
     delayMs: round(median(f.delays), 1),
     delayMedianMs: round(median(f.delays), 1),
     delayP95Ms: round(percentile(f.delays, 95), 1),
@@ -1004,18 +996,6 @@ function callSummary(f) {
     gapCount: null,
     longestGapMs: null,
   };
-}
-
-/** The quiet test in words, when there was a silence of 10 s or more followed by speech. */
-function quietNote(s) {
-  if (s.speechResumedAtSec == null || s.silenceLongestSec < 10) return { text: "", bad: false };
-  const quiet = s.silenceLongestSec >= 90 ? `${(s.silenceLongestSec / 60).toFixed(1)} min` : `${Math.round(s.silenceLongestSec)} s`;
-  if (s.convertedBackAfterSec == null) {
-    return { text: ` Quiet test: after ${quiet} of silence you spoke, but the converted voice did not come back.`, bad: true };
-  }
-  const late = s.convertedBackAfterSec > 6;
-  const when = late ? `only ${Math.round(s.convertedBackAfterSec)} s after you spoke again` : "at once";
-  return { text: ` Quiet test: after ${quiet} of silence the converted voice came back ${when}.`, bad: late };
 }
 
 // ---------- 5 · live ----------
@@ -1642,6 +1622,14 @@ async function loadOriginCheck() {
 }
 
 // ---------- start ----------
+
+// Runs, ratings, notes and the recording live only in the open page: ask before leaving it.
+window.addEventListener("beforeunload", (event) => {
+  if (state.runs.length || state.recording || state.mode !== "idle") {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
 
 window.addEventListener("pagehide", () => {
   state.liveStart?.abort();

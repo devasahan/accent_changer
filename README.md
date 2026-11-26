@@ -20,15 +20,15 @@ Results so far: [spike/FINDINGS.md](spike/FINDINGS.md).
 Two rules for every sitting:
 
 - **Download results (JSON) before you close the page.** Runs, ratings and notes live only in the open page. Each file has its own time stamp, so send all of them.
-- **Don't reload the page in the middle of a sitting.** The page remembers your script, model name, sample rate and devices, but not your runs.
+- **Keep the page open in its own tab until you have downloaded.** Don't reload it, and open other sites (Zoom, Meet) in a new tab (Ctrl+T). The page remembers your script text, model name, sample rate and devices, but not your recording, runs, ratings or notes. If you try to leave it, Edge asks "Leave site?": choose **Cancel**.
 
 The free trials last 7 days each. Starting them 5–6 days before the interview means they still run on interview day.
 
 ## Before you start (once)
 
-1. **Node.js 20 or newer.** In PowerShell type `node --version`. If it says "not recognized", or shows a version below 20, install the **LTS** version from [nodejs.org](https://nodejs.org) (Windows Installer). Then open a **new** PowerShell window.
+1. **Node.js 20 or newer.** Open PowerShell (Start menu → type `PowerShell` → Enter), then type `node --version`. If it says "not recognized", or shows a version below 20, install the **LTS** version from [nodejs.org](https://nodejs.org) (Windows Installer). Then open a **new** PowerShell window.
 2. **Get this code.** On GitHub use **Code → Download ZIP** and unzip it.
-3. **Open a terminal in the right folder.** In File Explorer, open the folder that holds `README.md` and the `spike` folder. After unzipping it is often `accent_changer-main` inside another `accent_changer-main`. Right-click an empty area → **Open in Terminal**.
+3. **Open a terminal in the right folder.** In File Explorer, open the folder that holds `README.md` and the `spike` folder. After unzipping it is often `accent_changer-main` inside another `accent_changer-main`. Click that window's address bar, type `powershell` and press Enter. This works on Windows 10 and 11.
 4. **Headphones:** make your wired or USB headphones the **default playback device** in Windows sound settings. Sanas plays its audio through the default device, so a Bluetooth headset in call mode would cut the quality.
 
 ## Part 1: test Sanas cloud (now)
@@ -62,14 +62,16 @@ The free trials last 7 days each. Starting them 5–6 days before the interview 
    4. **Baseline first (free).** Pick the **Mock** engine and press **Run** once. This measures your own laptop's audio path. It should show about 300 ms plus a little, and 0 gaps. Then switch back to **Sanas**.
    5. **Model name:** type the exact name from the Console, then press **Connect to Sanas**.
    6. **Three runs** at different times of day: two with Sample rate 16 kHz and one with 48 kHz (Sample rate is in step 1).
+
+      **In a later sitting:** start the server again (step 2), open the page, press **Allow microphone**, and **Record** the script again (3.3). The page keeps the script's text, not the recording, so Run stays grey until you record. Download the results at the end of every sitting.
    7. **Rate each run right after it.** In step 4, for every line, tick a box only if it really is true: sounds natural, still my voice, every word right, sounds American. The score stays "–" until you tick something.
    8. **Live:** press **Start live** and talk for a minute, then Stop.
    9. **Quiet test:**
       1. Press Start live again.
       2. Stay silent for 15 minutes; leave the room.
-      3. Come back, read a few lines, then press Stop.
+      3. Come back, put the headset on, and start reading the script right away. Read for about a minute, then press Stop.
 
-      The page then says whether your converted voice came back at once.
+      The page then says whether your converted voice came back at once. A cough or a knock on the headset doesn't count as speaking.
    10. **Stability:** set Minutes to **65** and press Start (about $0.60). Leave the PC plugged in and awake; you don't need to watch it.
    11. **Download results (JSON)** and send me the file. It has no audio. It holds:
        - the measurements, your ratings and your notes;
@@ -107,19 +109,19 @@ Do Part 2 in **one sitting, without reloading the page**. The page keeps the sou
    - Sample rate **48 kHz**.
 3. **Record your script** (step 2). Do **one Sanas cloud run** (step 3), and rate it in step 4 like the Part 1 runs.
 4. **For each app, in step 7 of the page:**
-   1. Pick the app's microphone as **Other microphone**, for example "Krisp Microphone". The Sanas one has "Sanas" in its name.
-   2. Press **Read the script**. Read the whole script aloud with about one second of pause between lines, then press **Stop**. The page listens 3 more seconds for the app's last words.
-   3. **Check that it really converts:** in step 4, play line 1 with **▶ original**, then **▶ converted**.
+   1. **Start this app** (again, if you quit it earlier), with accent conversion on, and **quit the other one** (its tray icon → Quit).
+   2. Pick the app's microphone as **Other microphone**, for example "Krisp Microphone". The Sanas one has "Sanas" in its name.
+   3. Press **Read the script**. Read the whole script aloud with about one second of pause between lines, then press **Stop**. The page listens 3 more seconds for the app's last words.
+   4. **Check that it really converts:** in step 4, play line 1 with **▶ original**, then **▶ converted**.
       - If the accent did not change, conversion is off: fix the app and read again.
       - A delay far below the app's own claim (Krisp says about 200 ms) is a warning sign.
-   4. Rate the run in step 4.
-   5. **Write down the app's delay** (Delay ms, in step 3's table) in the Notes box and on paper: OBS needs it later.
-   6. **CPU check:**
-      1. Quit the other app (tray icon → Quit).
-      2. Join a Zoom test call with video at zoom.us/test, and pick the app's microphone in Zoom.
-      3. Talk for 2 minutes.
-      4. Note the usual **Utilization** in Task Manager → Performance → CPU, not a short spike.
-      5. Turn the app off and note it again.
+   5. Rate the run in step 4.
+   6. **Write down the app's delay** (Delay ms, in step 3's table) in the Notes box and on paper: OBS needs it later. A red number in that table fails the bar in INTERVIEW.md.
+   7. **CPU check,** with the charger plugged in and Power mode on **Best performance** (Windows Settings → System → Power), as on the interview day:
+      1. Open zoom.us/test **in a new tab** (Ctrl+T), join the test call with video, and pick the app's microphone in Zoom.
+      2. Talk for 2 minutes.
+      3. Note the usual **Utilization** in Task Manager → Performance → CPU, not a short spike.
+      4. Turn the app's accent conversion off and note it again.
 
       Write both in Notes, for example "Krisp: 35 % (off: 25 %)".
 5. **Blind test with a friend** (about 15 minutes). Ask a friend who knows your voice and who was out of the room while you read. Start with an app run, not the Sanas cloud run. For each run, in turn:
@@ -143,7 +145,7 @@ Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to u
 | Server: "Can't ask for the key here" | That window isn't an interactive terminal (for example Git Bash). Use PowerShell or Windows Terminal. |
 | Server: "Port 8080 is already used" or "Windows does not let programs use port 8080" | Run `node spike/serve.mjs --port 8090` and add `http://localhost:8090` as an allowed origin. |
 | Server: "Sanas refused this page's own address" or "refused both app addresses" | Add the addresses under Allowed origins exactly as listed in Part 1 (no slash at the end), then restart the server. |
-| Server: "Address check skipped" or "Inconclusive" | Restart the server to try again. If it stays like that, write it in your notes. |
+| Server: "Address check skipped" or "Inconclusive" | Do what that line says: "could not be checked" needs a restart of the server, a refused key needs a working key. If it stays like that, write it in your notes. |
 | The server stopped answering | In the classic window, press Esc (a click inside it pauses the server). |
 | Page: "Origin not allowed" | In the Sanas Console, Allowed origins must contain exactly `http://localhost:8080`: no slash at the end, and `localhost` rather than an IP. |
 | "Model not entitled" | Copy the exact model name from the Console, including any suffix. |
@@ -151,6 +153,8 @@ Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to u
 | "Windows blocked the microphone" or no microphones listed | Windows Settings → Privacy & security → Microphone: allow access, including "Let desktop apps access your microphone", then reload the page. |
 | "Sanas answered, but no audio connection came up" | A firewall or VPN is blocking WebRTC (UDP). Try without the VPN, or on another network. |
 | A run reports "dropped the call" | The connection to Sanas broke during the run. Note the time; if it happens again, try another network. |
+| Run (step 3) or Start (step 6) is grey | Record the script first (step 2). A reopened page has the text but no recording. |
+| Edge asks "Leave site?" | Choose **Cancel**, then download the results first. Leaving loses the runs, ratings and recording. |
 | Step 4 shows far fewer lines than your script has | You paused too briefly between lines: record or read again with about one second of pause. |
 | Step 7: the other microphone "is silent" or "stayed silent" | The app must be running, with your headset as its microphone and accent conversion on. Some apps convert only while a call app uses their microphone: the page counts as one. |
 
@@ -172,7 +176,7 @@ cd src-tauri && cargo test   # the app's Rust side
 
 | Path | What |
 |---|---|
-| `spike/` | The Step 0 probe:<ul><li>`serve.mjs`: local server, key check, Sanas address check, token exchange</li><li>`index.html` / `probe.js`: the UI</li><li>`engines.js`: Sanas and Mock</li><li>`webrtc-stats.js`, `recorder.worklet.js`</li></ul> |
+| `spike/` | The Step 0 probe:<ul><li>`serve.mjs`: local server, key check, Sanas address check, token exchange</li><li>`index.html` / `probe.js`: the UI</li><li>`engines.js`: Sanas and Mock</li><li>`quiet-test.js`: the quiet test's rules</li><li>`webrtc-stats.js`, `recorder.worklet.js`</li></ul> |
 | `src/` | The app's page (no bundler): `index.html`, `main.js`, `engines/`, `platform/`, and `core/`, the pure logic shared with the probe |
 | `src-tauri/` | The app's Rust side (Tauri 2): key in Windows Credential Manager, token exchange, window and microphone rules |
 | `src/vendor/` | The Sanas Browser SDK, unchanged (see its README for version and hashes) |
