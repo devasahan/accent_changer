@@ -141,9 +141,12 @@ Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to u
 When I tell you the test build is ready:
 
 1. **In the Sanas Console,** check that Allowed origins has `http://tauri.localhost` (Part 1 added it).
-2. **Download the installer** from the link I send: the `.exe` file under **Assets**.
+2. **Download the installer:** open the link I send, a page on GitHub (sign in to GitHub if it asks: GitHub lets only signed-in people download these files). Scroll down to **Artifacts** and click **windows-x64-nsis**. Edge saves the file `windows-x64-nsis.zip`.
    - If Edge says the file isn't commonly downloaded: click **…** next to it, then **Keep**, then **Show more**, then **Keep anyway**. The app is new and isn't signed, so Edge doesn't know it yet.
-3. **Install it:** open the file (click it in Edge's list of downloads, or double-click it in your Downloads folder).
+3. **Unzip and install it:**
+   1. In Edge's list of downloads, click the folder icon next to the file (**Show in folder**).
+   2. Right-click `windows-x64-nsis.zip` → **Extract All…** → **Extract**.
+   3. In the folder that opens, double-click **Accent Changer_0.1.0_x64-setup**, the installer and the only file there.
    - If Windows shows "Windows protected your PC": click **More info**, then **Run anyway**. For the same reason, Windows doesn't know the app yet.
    - If you see **"Smart App Control blocked"**: stop here and tell me. Do not turn Smart App Control off.
 4. **Open Accent Changer** from the Start menu. The Diagnostics page opens.
@@ -155,7 +158,7 @@ When I tell you the test build is ready:
 
      Send me the file **Accent Changer.log** from the folder that opens (Windows may show it as just "Accent Changer"). If Windows can't find that folder, tell me that instead.
 5. Do the four steps on the page:
-   1. Look at step 1: "Secure page" should say yes. "Version" also shows which build you have, for example `(build v0.1.0-test.1 1a2b3c4)`.
+   1. Look at step 1: "Secure page" should say yes. "Version" also shows which build you have, for example `(build main 1a2b3c4)`.
    2. **Check the microphone.** Note whether Windows or the app asked for permission.
    3. **Paste your Sanas key** once and press **Save key**. It is checked with Sanas and kept in Windows Credential Manager.
    4. Press **Connect only.** It uses no Sanas minutes.
@@ -163,7 +166,7 @@ When I tell you the test build is ready:
 7. **Close the app** (the X at the top right) **and open it again** from the Start menu. Press **Check the microphone** and **Connect only** once more. Don't paste the key again: this time Connect only checks that the saved key still works after a restart. Note whether anything asked for permission this time.
 8. **Press Copy results again** and paste them under the first ones, with your notes.
 
-**A newer test build, later:** close Accent Changer, then download and install the new one as in steps 2 and 3. Open it from Edge's list of downloads: your Downloads folder may still have the old installer, with almost the same name. If the installer says Accent Changer "is already installed", keep the option it has already chosen and press **Next**. Then do steps 4 to 8 again, but don't paste the key again (step 5.3): it is still saved, and step 3 of the page says "A key is saved". In step 1 of the page, check that the build is the one I named.
+**A newer test build, later:** close Accent Changer, then download and install the new one as in steps 2 and 3, from the new link I send. Use the newest download at the top of Edge's list: your Downloads folder may still have the old zip and its folder, with almost the same names (the new ones end in "(1)"). If the installer says Accent Changer "is already installed", keep the option it has already chosen and press **Next**. Then do steps 4 to 8 again, but don't paste the key again (step 5.3): it is still saved, and step 3 of the page says "A key is saved". In step 1 of the page, check that the build is the one I named.
 
 To uninstall later: Windows Settings → Apps → Installed apps → Accent Changer → Uninstall. To remove the key too, open the app first and press **Remove key**.
 
