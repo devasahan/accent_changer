@@ -142,17 +142,28 @@ When I tell you the test build is ready:
 
 1. **In the Sanas Console,** check that Allowed origins has `http://tauri.localhost` (Part 1 added it).
 2. **Download the installer** from the link I send: the `.exe` file under **Assets**.
-3. **Install it:** double-click the file.
-   - If Windows shows "Windows protected your PC": click **More info**, then **Run anyway**. The app isn't signed, so Windows doesn't know it yet.
+   - If Edge says the file isn't commonly downloaded: click **…** next to it, then **Keep**, then **Show more**, then **Keep anyway**. The app is new and isn't signed, so Edge doesn't know it yet.
+3. **Install it:** open the file (click it in Edge's list of downloads, or double-click it in your Downloads folder).
+   - If Windows shows "Windows protected your PC": click **More info**, then **Run anyway**. For the same reason, Windows doesn't know the app yet.
    - If you see **"Smart App Control blocked"**: stop here and tell me. Do not turn Smart App Control off.
 4. **Open Accent Changer** from the Start menu. The Diagnostics page opens.
+   - If no window opens, or it closes at once: copy the line below, press **Windows key + R**, paste the line and press Enter:
+
+     ```
+     %LOCALAPPDATA%\io.github.devasahan.accentchanger\logs
+     ```
+
+     Send me the file **Accent Changer.log** from the folder that opens (Windows may show it as just "Accent Changer"). If Windows can't find that folder, tell me that instead.
 5. Do the four steps on the page:
-   1. Look at step 1: "Secure page" should say yes.
+   1. Look at step 1: "Secure page" should say yes. "Version" also shows which build you have, for example `(build v0.1.0-test.1 1a2b3c4)`.
    2. **Check the microphone.** Note whether Windows or the app asked for permission.
    3. **Paste your Sanas key** once and press **Save key**. It is checked with Sanas and kept in Windows Credential Manager.
    4. Press **Connect only.** It uses no Sanas minutes.
-6. **Close the app and open it again.** Press Check the microphone once more, and note whether anything asked for permission this time.
-7. Press **Copy results** and paste them into your message, with your notes.
+6. **Press Copy results and paste them into your message now,** before you close the app: the app forgets its results when it closes.
+7. **Close the app** (the X at the top right) **and open it again** from the Start menu. Press **Check the microphone** and **Connect only** once more. Don't paste the key again: this time Connect only checks that the saved key still works after a restart. Note whether anything asked for permission this time.
+8. **Press Copy results again** and paste them under the first ones, with your notes.
+
+**A newer test build, later:** close Accent Changer, then download and install the new one as in steps 2 and 3. Open it from Edge's list of downloads: your Downloads folder may still have the old installer, with almost the same name. If the installer says Accent Changer "is already installed", keep the option it has already chosen and press **Next**. Then do steps 4 to 8 again, but don't paste the key again (step 5.3): it is still saved, and step 3 of the page says "A key is saved". In step 1 of the page, check that the build is the one I named.
 
 To uninstall later: Windows Settings → Apps → Installed apps → Accent Changer → Uninstall. To remove the key too, open the app first and press **Remove key**.
 
@@ -168,7 +179,7 @@ To uninstall later: Windows Settings → Apps → Installed apps → Accent Chan
 | Server: "Sanas refused this page's own address" or "refused both app addresses" | Add the addresses under Allowed origins exactly as listed in Part 1 (no slash at the end), then restart the server. |
 | Server: "Address check skipped" or "Inconclusive" | Do what that line says: "could not be checked" needs a restart of the server, a refused key needs a working key. If it stays like that, write it in your notes. |
 | The server stopped answering | In the classic window, press Esc (a click inside it pauses the server). |
-| Page: "Origin not allowed" | In the Sanas Console, Allowed origins must contain exactly `http://localhost:8080`: no slash at the end, and `localhost` rather than an IP. |
+| Page: "Origin not allowed" | In the Sanas Console, Allowed origins must contain exactly `http://localhost:8080` for the test page, or `http://tauri.localhost` for the app (Session A2): no slash at the end, and `localhost` rather than an IP. |
 | "Model not entitled" | Copy the exact model name from the Console, including any suffix. |
 | "The browser blocked the microphone for this page" | Click the icon left of the address bar → Permissions for this site → Microphone → Allow, then reload. The setting is per port: after `--port 8090`, allow it again. |
 | "Windows blocked the microphone" or no microphones listed | Windows Settings → Privacy & security → Microphone: allow access, including "Let desktop apps access your microphone", then reload the page. |
@@ -178,10 +189,12 @@ To uninstall later: Windows Settings → Apps → Installed apps → Accent Chan
 | Edge asks "Leave site?" | Choose **Cancel**, then download the results first. Leaving loses the runs, ratings and recording. |
 | Step 4 shows far fewer lines than your script has | You paused too briefly between lines: record or read again with about one second of pause. |
 | Step 7: the other microphone "is silent" or "stayed silent" | The app must be running, with your headset as its microphone and accent conversion on. Some apps convert only while a call app uses their microphone: the page counts as one. |
+| Accent Changer (the test build) doesn't open, or closes at once | Send me its log file: see [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes), step 4. |
 
 ## Privacy
 
-- **API key:** only in the server's memory. It never reaches the browser, the disk or the logs.
+- **API key, test page (Parts 1 and 2):** only in the test server's memory. It never reaches the browser, the disk or the logs.
+- **API key, app (Session A2):** you paste it once into the app's page. The app checks it with Sanas and keeps it in Windows Credential Manager until you press **Remove key**. It is never written to the app's log or to the results; the page shows only its last 4 characters.
 - **Audio:** goes to Sanas Cloud (Ohio or Mumbai). Sanas says it is processed in real time and not stored.
 - **Krisp and the Sanas desktop app:** their vendors say accent conversion runs on your laptop. Their meeting-notes features upload transcripts, so keep those off.
 - **Recordings and downloads:** stay on your PC (your Downloads folder). If you copy them into this folder, `.gitignore` keeps WAV files and `sanas-check-*.json` results out of git.
@@ -191,7 +204,7 @@ To uninstall later: Windows Settings → Apps → Installed apps → Accent Chan
 ```
 npm test               # unit tests (Node 20+, no install)
 npm run test:browser   # the probe page in headless Chromium with fake microphones and the Mock engine (needs Playwright)
-npm run test:app       # the app's page in Edge dev mode, the same way
+npm run test:app       # the app's page the same way: in Edge dev mode, and as the installed app with its Rust side and Sanas faked
 cd src-tauri && cargo test   # the app's Rust side
 ```
 

@@ -21,11 +21,15 @@ export const HINTS = {
   app: {
     ...COMMON,
     origin_not_allowed:
-      "Add http://tauri.localhost under Project settings → Allowed origins in the Sanas Console (exactly, no slash at the end), then press Connect again.",
+      "Add http://tauri.localhost under Project settings → Allowed origins in the Sanas Console (exactly, no slash at the end), then press Connect only again.",
     authentication_failed:
-      "Sanas refused the saved key. Paste the key again on the Diagnostics page; if it is still refused, check in the Sanas Console whether it expired or was revoked.",
+      "Sanas refused the saved key. Paste it again from where you saved it (for example your password manager) and press Save key; if it is still refused, check in the Sanas Console whether it expired or was revoked.",
   },
 };
+
+// The app's own text for a saved key that Sanas refuses (src-tauri/src/sanas.rs):
+// it already says what to do.
+const SAYS_WHAT_TO_DO = /refused the saved key/i;
 
 /**
  * An Error with the SDK's message, its code in brackets, and what to do.
@@ -33,7 +37,8 @@ export const HINTS = {
  * when the key was never asked about (no key saved, Sanas unreachable, too
  * many requests): then the message already says what to do, and the key hint
  * would send the person to the Sanas Console for nothing. So the key hint
- * comes only with a refusal (HTTP 400, 401 or 403) in the message.
+ * comes only with a refusal (HTTP 400, 401 or 403) in the message, and not
+ * when the message is the app's own refusal text, which gives the same advice.
  */
 export function describeSdkError(err, { where = "probe" } = {}) {
   const code = err?.code;
@@ -41,7 +46,7 @@ export function describeSdkError(err, { where = "probe" } = {}) {
   const hints = HINTS[where] ?? HINTS.probe;
   let hint = code && hints[code] ? ` ${hints[code]}` : "";
   const status = Number(/HTTP (\d{3})/.exec(message)?.[1]);
-  if (code === "authentication_failed" && ![400, 401, 403].includes(status)) hint = "";
+  if (code === "authentication_failed" && (![400, 401, 403].includes(status) || SAYS_WHAT_TO_DO.test(message))) hint = "";
   const e = new Error(`${message}${code ? ` [${code}]` : ""}.${hint}`);
   e.code = code;
   return e;

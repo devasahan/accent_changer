@@ -67,12 +67,33 @@ struct KeySaved {
 struct AppInfo {
     name: String,
     version: String,
+    /// Which build this is; see `build_stamp`.
+    build: String,
+}
+
+/// The tag or branch and the commit GitHub Actions built this from, such as
+/// "v0.1.0-test.2 1a2b3c4", or "local". Every test build has the same version,
+/// so this is what tells them apart in the copied results.
+fn build_stamp(ref_name: Option<&str>, sha: Option<&str>) -> String {
+    let ref_name = ref_name.map(str::trim).filter(|r| !r.is_empty());
+    let sha = sha.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(7).collect::<String>());
+    match (ref_name, sha) {
+        (Some(r), Some(s)) => format!("{r} {s}"),
+        (Some(r), None) => r.to_string(),
+        (None, Some(s)) => s,
+        (None, None) => "local".to_string(),
+    }
 }
 
 #[tauri::command]
 fn app_info(app: AppHandle) -> AppInfo {
     let info = app.package_info();
-    AppInfo { name: info.name.clone(), version: info.version.to_string() }
+    AppInfo {
+        name: info.name.clone(),
+        version: info.version.to_string(),
+        // Read when this crate is compiled; cargo compiles it again when either changes.
+        build: build_stamp(option_env!("GITHUB_REF_NAME"), option_env!("GITHUB_SHA")),
+    }
 }
 
 #[tauri::command]
@@ -91,8 +112,9 @@ async fn key_set(state: State<'_, AppState>, key: String) -> Result<KeySaved, St
             log::info!("key saved (Sanas accepted it)");
             Ok(KeySaved { checked: "accepted", note: None, tail: tail(&key) })
         }
+        // The Console shows a key only once: it is only for checking expiry or revocation.
         KeyCheck::Refused(status) => Err(format!(
-            "Sanas refused this key (HTTP {status}). Copy it again from the Sanas Console; if it is still refused, check whether it expired or was revoked."
+            "Sanas refused this key (HTTP {status}). Paste it again from where you saved it (for example your password manager); if it is still refused, check in the Sanas Console whether it expired or was revoked."
         )),
         KeyCheck::Unknown(why) => {
             state.keys.set(&key)?;
@@ -120,6 +142,17 @@ async fn sanas_token(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 pub fn run() {
+    // A failed start (WebView2 can't start, say) ends in a panic, and the
+    // installed app has no console to show it on. So panics also go to the log:
+    // %LOCALAPPDATA%\io.github.devasahan.accentchanger\logs\Accent Changer.log.
+    // The log opens while the app is built, before setup runs; a failure before
+    // it opens (the window system itself not starting) still leaves no trace.
+    let print = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("{info}");
+        log::logger().flush();
+        print(info);
+    }));
     tauri::Builder::default()
         // First, so a second launch only brings the running app forward.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -131,10 +164,13 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState { keys: Arc::new(OsKeyStore), broker: TokenBroker::new(sanas::IDENTITY_URL) })
         .on_permission_request(|webview, kind| permission_for(webview.url().ok(), kind))
         .invoke_handler(tauri::generate_handler![app_info, key_status, key_set, key_delete, sanas_token])
         .setup(|app| {
+            // Here rather than before the app starts: the log is open by now, so a
+            // failure to set up the HTTP client is written down. The page, the only
+            // caller of the commands, comes after.
+            app.manage(AppState { keys: Arc::new(OsKeyStore), broker: TokenBroker::new(sanas::IDENTITY_URL) });
             let handle = app.handle().clone();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Accent Changer")
@@ -183,5 +219,25 @@ mod tests {
         assert_eq!(permission_for(other, PermissionKind::Microphone), PermissionResponse::Deny);
         assert_eq!(permission_for(None, PermissionKind::Microphone), PermissionResponse::Deny);
         assert_eq!(permission_for(own, PermissionKind::Camera), PermissionResponse::Deny);
+    }
+
+    #[test]
+    fn the_build_stamp_names_the_tag_or_branch_and_the_commit() {
+        let sha = Some("1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d");
+        assert_eq!(build_stamp(Some("v0.1.0-test.2"), sha), "v0.1.0-test.2 1a2b3c4");
+        assert_eq!(build_stamp(Some("claude/step0plus-step1"), sha), "claude/step0plus-step1 1a2b3c4");
+        assert_eq!(build_stamp(None, None), "local");
+        assert_eq!(build_stamp(Some(""), Some(" ")), "local", "set but empty counts as not set");
+        assert_eq!(build_stamp(Some("main"), None), "main");
+        assert_eq!(build_stamp(None, sha), "1a2b3c4");
+    }
+
+    #[test]
+    fn app_info_has_the_fields_the_page_reads() {
+        let info = AppInfo { name: "Accent Changer".into(), version: "0.1.0".into(), build: "local".into() };
+        assert_eq!(
+            serde_json::to_value(info).unwrap(),
+            serde_json::json!({ "name": "Accent Changer", "version": "0.1.0", "build": "local" })
+        );
     }
 }

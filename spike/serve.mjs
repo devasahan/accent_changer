@@ -485,7 +485,8 @@ async function askForKey() {
     const notes = [doubled && "it was pasted twice, so one copy is used", ignored && `${ignored} control key(s) ignored`].filter(Boolean);
     console.log(`Got a ${value.length}-character key ending in ${tail(value)}${notes.length ? ` (${notes.join("; ")})` : ""}.`);
     if (/\s/.test(value)) {
-      console.log("That key contains spaces: copy it again from the Sanas Console.");
+      // The Console shows a key only once: the copy to go back to is the saved one.
+      console.log("That key contains spaces: copy it again from where you saved it (for example your password manager).");
       continue;
     }
     const verdict = await checkKey({ key: value });

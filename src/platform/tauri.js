@@ -32,4 +32,5 @@ export async function saveKey(raw) {
 
 export const deleteKey = () => call("key_delete");
 
+/** { name, version, build }: build is the CI tag or branch and short commit, or "local". */
 export const appInfo = () => call("app_info");

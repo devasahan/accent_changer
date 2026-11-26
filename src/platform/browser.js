@@ -38,6 +38,7 @@ export async function deleteKey() {
   throw new Error(SERVER_HOLDS_IT);
 }
 
+/** Step 1 already says "Edge dev mode"; build "dev" marks results that came from it. */
 export async function appInfo() {
-  return { name: "Accent Changer (Edge dev mode)", version: "dev" };
+  return { name: "Accent Changer", version: "dev", build: "dev" };
 }

@@ -3,7 +3,8 @@ name = "accent-changer"
 version = "0.1.0"
 description = "Accent Changer: a live US accent for your own interview calls"
 edition = "2021"
-rust-version = "1.80"
+# The highest rust-version among the locked crates (tauri 2.12 and its plugins).
+rust-version = "1.90"
 publish = false
 
 [lib]

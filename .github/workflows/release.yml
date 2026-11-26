@@ -3,6 +3,10 @@
 #   downloadable workflow artifact.
 #   Push a tag like v0.1.0 (or v0.1.0-test.1 for a test build): the installer
 #   is also attached to a GitHub release (a pre-release when the tag has a "-").
+#   Tag a commit whose message has no [skip ci]: GitHub starts no workflow for
+#   a tag pushed on such a commit, and shows nothing. To build that commit
+#   anyway, run it by hand and pick the tag under "Use workflow from": that run
+#   makes the release too.
 name: Release
 
 on:
@@ -18,7 +22,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
+      # The build runs code from every dependency (npm scripts, crate build
+      # scripts and macros). It gets no write token from the git config, and
+      # only a release run puts one in its environment (see tauri-action below).
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -30,12 +39,21 @@ jobs:
       - run: npm ci
       - uses: tauri-apps/tauri-action@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # tauri-action reads this token only to create the release and upload
+          # to it, which only tag runs do; the workflow artifact goes up with the
+          # run's own artifact token. The build runs inside this step, so in a
+          # tag run it can still read the token: only a separate publishing job
+          # would keep it out.
+          GITHUB_TOKEN: ${{ github.ref_type == 'tag' && secrets.GITHUB_TOKEN || '' }}
         with:
           args: --bundles nsis
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: Accent Changer ${{ github.ref_name }}
-          releaseBody: Windows installer (unsigned). SmartScreen may warn when you run it; choose More info, then Run anyway.
+          releaseBody: |
+            Windows installer: the `.exe` file under Assets. It isn't signed, so Edge and Windows don't know it yet.
+
+            - If Edge says the file isn't commonly downloaded: click **…** next to it, then **Keep**, then **Show more**, then **Keep anyway**.
+            - If Windows shows "Windows protected your PC": click **More info**, then **Run anyway**.
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           uploadWorkflowArtifacts: true

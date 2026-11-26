@@ -4,6 +4,8 @@
  * depends on: a secure page, the microphone without a prompt, the key in
  * Windows Credential Manager, and Sanas accepting this app's address.
  * "Copy results" gives a summary with no key, token or device ids in it.
+ * The results live in this page's memory only (nothing is saved), so the
+ * app forgets them when it closes: the page says to copy them before that.
  */
 import { platform } from "./platform/index.js";
 import { configureSanas, connectSanas, disconnectSanas } from "./engines/sanas.js";
@@ -25,11 +27,15 @@ const results = {
 
 configureSanas({ tokenProvider: platform.tokenProvider, where: platform.name === "app" ? "app" : "probe" });
 
+function recordError(message) {
+  results.errors.push({ at: new Date().toISOString(), message });
+}
+
 function setStatus(message, kind = "info") {
   const el = $("status");
   el.textContent = message;
   el.dataset.kind = kind;
-  if (kind === "error") results.errors.push({ at: new Date().toISOString(), message });
+  if (kind === "error") recordError(message);
   renderResults();
 }
 
@@ -54,11 +60,17 @@ function fillList(dl, pairs) {
   );
 }
 
-/** Run a button's action once at a time, errors shown in the status line. */
-function action(id, fn) {
+/**
+ * Run a button's action once at a time, errors shown in the status line.
+ * The button is off while the action runs (data-busy marks that), and
+ * afterwards only if `usable()` says so: an action can leave its own button
+ * off, as Remove key does once the key is gone.
+ */
+function action(id, fn, { usable = () => true } = {}) {
   const button = $(id);
   button.addEventListener("click", async () => {
-    if (button.disabled) return;
+    if (button.dataset.busy) return;
+    button.dataset.busy = "yes";
     button.disabled = true;
     try {
       await fn();
@@ -66,7 +78,8 @@ function action(id, fn) {
       console.error(err);
       setStatus(err?.message ?? String(err), "error");
     } finally {
-      button.disabled = false;
+      delete button.dataset.busy;
+      button.disabled = !usable();
       renderResults();
     }
   });
@@ -86,13 +99,15 @@ async function showApp() {
   results.page = { origin: location.origin, secureContext: window.isSecureContext, browser: browserName() };
   const t0 = performance.now();
   try {
-    results.app = await platform.appInfo();
-    results.app.roundTripMs = Math.round(performance.now() - t0);
+    const info = await platform.appInfo();
+    // Every test build has the same version, so the build (its tag or branch
+    // and commit; "local" or "dev" off CI) tells which one sent the results.
+    results.app = { name: info.name, version: info.version, build: info.build ?? null, roundTripMs: Math.round(performance.now() - t0) };
   } catch (err) {
     results.app = { error: err.message };
   }
   fillList($("appInfo"), [
-    ["Version", results.app.version ? `${results.app.name} ${results.app.version}` : `error: ${results.app.error}`],
+    ["Version", results.app.version ? `${results.app.name} ${results.app.version} (build ${results.app.build ?? "unknown"})` : `error: ${results.app.error}`],
     ["Runs as", platform.name === "app" ? "the installed app" : "Edge dev mode (a browser tab)"],
     ["Page address", results.page.origin],
     ["Secure page", results.page.secureContext ? "yes" : "NO: the microphone and Sanas won't work"],
@@ -166,41 +181,72 @@ action("btnMic", async () => {
 
 // ---------- 3 · key ----------
 
+// Whether Remove key has something to remove: a key the app holds (in Edge
+// dev mode the server holds it, and only the server can drop it).
+let keyRemovable = false;
+
+function updateRemoveButton() {
+  const button = $("btnDeleteKey");
+  button.disabled = Boolean(button.dataset.busy) || !keyRemovable;
+}
+
+/**
+ * Show whether a key is saved. Only `saved` and `heldBy` are refreshed in
+ * the results: what Save key learned (`checked`, `note`) stays, so the
+ * copied results still say whether Sanas accepted the key.
+ */
 async function showKey() {
   try {
     const status = await platform.keyStatus();
-    results.key = { saved: status.saved, heldBy: status.heldBy ?? "credential manager" };
+    const earlier = { ...results.key };
+    delete earlier.error; // the status could be read this time
+    results.key = { ...earlier, saved: status.saved, heldBy: status.heldBy ?? "credential manager" };
+    keyRemovable = status.saved && status.heldBy !== "server";
     $("keyInfo").textContent = status.saved
       ? status.heldBy === "server"
         ? "The dev server holds a key."
         : `A key is saved (ending in ${status.tail.replace("…", "")}).`
       : "No key saved yet.";
-    $("btnDeleteKey").disabled = !status.saved || status.heldBy === "server";
   } catch (err) {
-    results.key = { error: err.message };
+    results.key = { ...results.key, error: err.message };
+    // Also in errors, which keep it: a later read that works drops key.error.
+    recordError(`Could not read the key status: ${err.message}`);
+    // Unknown status: in the app, Remove key stays on, as removing an unreadable key may be the fix.
+    keyRemovable = platform.name === "app";
     $("keyInfo").textContent = `Could not read the key status: ${err.message}`;
   }
+  updateRemoveButton();
 }
 
 action("btnSaveKey", async () => {
   const input = $("key");
   const raw = input.value;
   input.value = ""; // the page doesn't keep it
-  if (!raw.trim()) throw new Error("Paste the key from the Sanas Console into the box first.");
+  if (!raw.trim()) throw new Error("Paste your Sanas key into the box first, from where you saved it (for example your password manager).");
   setStatus("Checking the key with Sanas…");
   const saved = await platform.saveKey(raw);
-  results.key = { saved: true, checked: saved.checked };
   await showKey();
+  // Added after showKey, which keeps it from then on: the copied results say
+  // whether Sanas accepted this key or it was saved unchecked, and why.
+  results.key = { ...results.key, checked: saved.checked, note: saved.note ?? null };
   if (saved.checked === "accepted") setStatus("Sanas accepted the key. It is saved in Windows Credential Manager.", "ok");
-  else setStatus(`Saved, but Sanas could not be asked right now (${saved.note}). Step 4 will tell whether it works.`, "warn");
+  else {
+    const why = saved.note ? ` (${saved.note})` : "";
+    setStatus(`Saved, but Sanas could not be asked right now${why}. Step 4 will tell whether it works.`, "warn");
+  }
 });
 
-action("btnDeleteKey", async () => {
-  await platform.deleteKey();
-  await disconnectSanas();
-  await showKey();
-  setStatus("The key was removed from Windows Credential Manager.", "ok");
-});
+action(
+  "btnDeleteKey",
+  async () => {
+    await platform.deleteKey();
+    await disconnectSanas();
+    results.key = null; // checked and note were about the key that is gone
+    await showKey();
+    setStatus("The key was removed from Windows Credential Manager.", "ok");
+  },
+  { usable: () => keyRemovable },
+);
 
 // ---------- 4 · connect only ----------
 
