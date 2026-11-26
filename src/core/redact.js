@@ -70,12 +70,13 @@ const HEX_ID = /\b[0-9a-f]{64}\b/gi;
 /**
  * A key in standard base64 ("+", "/", "=" padding), which those characters
  * would split into runs too short for LONG_RUN: 32 or more of
- * [A-Za-z0-9+/_~-] (and its padding) with "+", "/" or "~" in it and upper
- * case, lower case and digits mixed. URLs (scheme://…, the first
- * alternative) are passed over whole: their paths are words, numbers and
- * slashes, and the other rules still hide what a URL can carry (passwords,
- * query tokens, JWTs, long ids). Dots and backslashes end a run, so Windows
- * paths and file names stay too.
+ * [A-Za-z0-9+/_~-] with "+", "/", "~" or "=" padding in it and upper case,
+ * lower case and digits mixed. URLs (scheme://…, the first alternative) are
+ * passed over whole: their paths are words, numbers and slashes, and the
+ * other rules still hide what a URL can carry (passwords, query tokens,
+ * JWTs, long ids). Dots and backslashes end a run, so Windows paths and file
+ * names stay too. (A key from random bytes lacks a digit about once in 1500
+ * and then reads as words; LONG_RUN still hides it when it has no "+" or "/".)
  */
 const BASE64_RUN = /(\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s"'<>]*)|[A-Za-z0-9+/_~-]{32,}={0,2}/gi;
 
@@ -83,7 +84,8 @@ const BASE64_RUN = /(\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s"'<>]*)|[A-Za-z0-9+/_~-]{3
 const LONG_RUN = /[A-Za-z0-9_-]{32,}/g;
 
 /** True for a BASE64_RUN match that is a key-like run (not a URL). */
-const isBase64Key = (m, url) => url === undefined && /[+/~]/.test(m) && /[A-Z]/.test(m) && /[a-z]/.test(m) && /[0-9]/.test(m);
+const isBase64Key = (m, url) =>
+  url === undefined && (/[+/~]/.test(m) || m.endsWith("=")) && /[A-Z]/.test(m) && /[a-z]/.test(m) && /[0-9]/.test(m);
 
 function hideField(match, key, quote, sep, value) {
   if (EMPTY_VALUE.test(value)) return match;
@@ -183,9 +185,11 @@ function copy(value, secret, ancestors, depth) {
  * field whose name matches token / apiKey / api_key / secret / password /
  * credential / cookie / deviceId / user_id / group_id / authorization becomes
  * "[redacted]" (unless it is empty: null, "", a boolean), and every other
- * string goes through redact(). Errors become {name, message, ...}, Dates and
- * URLs their JSON text, Maps and Sets arrays; functions are dropped and
- * cycles become "[circular]". The input is not changed.
+ * string goes through redact(), field names too (two names that both become
+ * "[redacted]" are numbered: "[redacted]", "[redacted]#2"). Errors become
+ * {name, message, ...}, Dates and URLs their JSON text, Maps and Sets
+ * arrays; functions are dropped and cycles become "[circular]". The input is
+ * not changed.
  * @param {*} value
  * @returns {*}
  */

@@ -294,6 +294,59 @@ test("short pauses are left alone, long ones catch up, a sluggish VAD loses no w
   }
 });
 
+/** A soft first sound (an "f", an "h"): high-passed noise of RMS `rmsDb`, 10 ms ramps, n samples. */
+function fricative(n, rmsDb, seed) {
+  const rand = rng(seed);
+  const out = new Float32Array(n);
+  let prev = 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const w = rand() * 2 - 1;
+    out[i] = w - prev;
+    prev = w;
+    sum += out[i] * out[i];
+  }
+  const g = 10 ** (rmsDb / 20) / Math.sqrt(sum / n);
+  for (let i = 0; i < n; i++) out[i] *= g * Math.min(1, i / ms(10), (n - i) / ms(10));
+  return out;
+}
+
+test("a soft first sound the VAD calls pause (an h, an f, a breathy start) is never dropped or crossfaded while catching up", () => {
+  // 120-200 ms of fricative 26-31 dB under the vowels before each word: the flag rises only
+  // with the vowel, so for the timeline all of it is pause, longer than the word-start guard.
+  for (const seed of [1, 4, 5]) {
+    const { audio: base, utts } = take({ seed });
+    const audio = Float32Array.from(base);
+    const words = []; // the soft start and the word after it
+    utts.forEach((u, k) => {
+      if (k === 0) return;
+      const len = ms(k % 2 ? 120 : 200);
+      const f = fricative(len, k % 2 ? -46 : -50, 10 * seed + k);
+      for (let i = 0; i < len; i++) audio[u.on - len + i] += f[i];
+      words.push({ on: u.on - len, off: u.off });
+    });
+    const flags = blockFlags(utts, audio.length);
+    const jb = Math.floor((Math.floor((utts[3].on + utts[3].off) / 2) + ms(750)) / BLOCK) - 1;
+    let J = null;
+    const { tl, out, lags } = simulate({
+      audio,
+      flags,
+      step: (b, t) => {
+        if (b !== jb) return;
+        J = t.writePos - ms(750);
+        t.jumpTo(J);
+      },
+    });
+    assert.equal(lags[lags.length - 1], 0, `seed ${seed}: never caught up`);
+    const after = words.filter((w) => w.on > J + FADE);
+    assert.ok(after.length >= 5, `seed ${seed}: ${after.length} words`);
+    locate(out, audio, after, jb * BLOCK).forEach((p, k) => {
+      assert.ok(p >= 0, `seed ${seed}: the word at ${(after[k].on / SR).toFixed(3)} s and its soft start are not in the output whole`);
+    });
+    assert.ok(maxStep(out) <= 2 * maxStep(audio));
+  }
+});
+
 test("never skips speech: without a pause the replay lag stays and the output is the content", () => {
   const { audio } = take({ seed: 3, seconds: 8 });
   const flags = new Uint8Array(audio.length / BLOCK).fill(1);

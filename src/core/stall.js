@@ -81,6 +81,13 @@ const JUMP_SLACK_DB = 1;
 /** Before the user has spoken, converted output louder than this + jumpDb is a jump. */
 const JUMP_QUIET_DB = -50;
 
+/**
+ * Under every frame level (frames are at least SILENCE_DB): where a search for the loudest
+ * frame starts. Not a whole number on purpose: a loop whose running maximum starts at an
+ * integer constant is kept boxed by V8 and allocates for every new maximum.
+ */
+const BELOW_ALL_DB = SILENCE_DB - 0.5;
+
 /** Largest per-frame step of the offset estimate (dB): one odd frame cannot drag it. */
 const OFFSET_STEP_DB = 6;
 
@@ -221,6 +228,8 @@ export class StallDetector {
 
     this._origSum = 0;
     this._convSum = 0;
+    this._frameO = 0.5; // a complete frame's sums, for _frame (doubles from the start)
+    this._frameC = 0.5;
     this._speechCount = 0;
     this._fill = 0;
     this._oZeros = 0; // current digital-silence runs (samples) ...
@@ -283,7 +292,11 @@ export class StallDetector {
         if (++cz >= run) cd += cz === run ? run : 1;
       } else cz = 0;
       if (++fill === len) {
-        this._frame(os, cs, sp, od, cd, delayMs);
+        // The frame's sums go through fields: a double passed to a call is boxed (a heap
+        // allocation) unless the engine inlines the callee.
+        this._frameO = os;
+        this._frameC = cs;
+        this._frame(sp, od, cd, delayMs);
         os = 0;
         cs = 0;
         sp = 0;
@@ -302,7 +315,9 @@ export class StallDetector {
     this._cDropped = cd;
   }
 
-  _frame(origSum, convSum, speechCount, origDropped, convDropped, delayMs) {
+  _frame(speechCount, origDropped, convDropped, delayMs) {
+    const origSum = this._frameO;
+    const convSum = this._frameC;
     const k = this._frames++;
     const slot = k % this.cap;
     const len = this.frameLen;
@@ -409,7 +424,7 @@ export class StallDetector {
 
   /** Loudest converted frame of the span where original frame j is due. */
   _dueMax(j, d) {
-    let cmax = SILENCE_DB;
+    let cmax = BELOW_ALL_DB;
     for (let k = Math.max(0, j + d - this.tol), end = j + d + this.tol; k <= end; k++) {
       const c = this._conv[k % this.cap];
       if (c > cmax) cmax = c;
@@ -584,7 +599,7 @@ export class StallDetector {
 
   _matched(j, cmax) {
     // Level offset: the loudest converted frame of the span against the loudest original frame around j.
-    let omax = SILENCE_DB;
+    let omax = BELOW_ALL_DB;
     for (let i = Math.max(0, j - this.tol), end = j + this.tol; i <= end; i++) {
       const v = this._orig[i % this.cap];
       if (v > omax) omax = v;
@@ -679,9 +694,9 @@ export class StallDetector {
   _checkJump(k, d) {
     let ref;
     if (d >= 0) {
-      ref = k - d >= 0 ? this._orig[(k - d) % this.cap] : SILENCE_DB;
+      ref = k - d >= 0 ? this._orig[(k - d) % this.cap] : BELOW_ALL_DB;
     } else {
-      ref = SILENCE_DB; // D unknown: the loudest original frame it could carry
+      ref = BELOW_ALL_DB; // D unknown: the loudest original frame it could carry
       for (let i = Math.max(0, k - this.searchFrames, k - this.cap + 1); i <= k; i++) {
         const v = this._orig[i % this.cap];
         if (v > ref) ref = v;

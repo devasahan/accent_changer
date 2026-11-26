@@ -449,6 +449,7 @@ test("after a stall, relock() follows the delay while the jitter buffer drains, 
     for (let i = 1; i <= lock; i++) assert.ok(after[i].D <= after[i - 1].D + 10, label);
     assert.ok(offSec <= DRAIN + 6, `seed ${seed}: D more than 40 ms off for ${offSec} s after the voice came back`);
     assert.ok(t.locked && Math.abs(t.delayMs - TO) <= 10, label);
+    assert.ok(t.lipSyncTotalMs() <= TO + 30 + 5, `seed ${seed}: lip sync ${t.lipSyncTotalMs()} ms, not held back by the drain`);
   }
 });
 
@@ -799,10 +800,20 @@ test("after relock() D follows every trusted whole-range estimate, and locks aga
   assert.ok(calls.every(([lo, hi]) => lo === -100 && hi === 1500), "whole-range searches until then");
   assert.deepEqual(step(t).method, "local");
   assert.deepEqual(
-    t.history.slice(5).map((h) => h.ms),
-    [620, 480, 335, 331, 329, 332, 332],
-    "every estimate taken is in the history",
+    t.history.slice(5).map((h) => [h.ms, h.settling]),
+    [
+      [620, true],
+      [480, true],
+      [335, true],
+      [331, true],
+      [329, true],
+      [332, false],
+      [332, false],
+    ],
+    "every estimate taken is in the history, the ones before the lock marked settling",
   );
+  // The passing values D followed are left out of the lip-sync delay (with them it would be 573 ms).
+  assert.equal(t.lipSyncTotalMs(), Math.ceil(percentile([300, 300, 300, 300, 300, 332, 332], 95) + 30));
 });
 
 test("after three untrusted estimates in a row only the whole range is searched, until a trusted one", () => {

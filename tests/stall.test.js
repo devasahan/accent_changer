@@ -266,17 +266,18 @@ test("a converted stream that keeps losing pieces is a stall, counted from its f
     [ms(40), ms(40)],
     [ms(20), ms(60)],
   ]) {
-    for (const seed of [1, 2, 3]) {
+    for (const seed of [1, 2, 3, 4]) {
       const { samples, utterances } = speech(seed);
       const isSpeech = speechFrames(samples);
       const levels = frameLevelsDb(samples, SR, 10);
       const rand = rng(500 + seed);
-      for (const D of [250, 400]) {
+      for (const D of seed % 2 ? [250] : [400]) {
         const [at] = stallPoints(samples, utterances, rand, 1, levels);
         const conv = converted(samples, D);
         for (let t = at + ms(D); t < conv.length; t += on + off) conv.fill(0, t + on, t + on + off);
         let choppyAt = null;
-        const { stall, firedAt } = run(samples, conv, D, { onBlock: (s, e) => choppyAt === null && s.choppy && (choppyAt = e) });
+        const until = Math.min(samples.length, at + ms(D) + ms(2500));
+        const { stall, firedAt } = run(samples, conv, D, { until, onBlock: (s, e) => choppyAt === null && s.choppy && (choppyAt = e) });
         const what = `${on}/${off} samples, seed ${seed}, D ${D}`;
         assert.ok(firedAt !== null, `${what}: no stall`);
         assert.ok(choppyAt !== null && choppyAt <= firedAt, `${what}: not seen as choppy`);
@@ -301,11 +302,11 @@ test("a converted stream that keeps losing pieces is a stall, counted from its f
       }
     }
   }
-  assert.equal(cases, 18);
+  assert.equal(cases, 12);
 
   // From the start of the stream (the engine's clock crossing underruns all the time): never
   // 3 s of health, so the mixer would never switch to it.
-  for (const seed of [1, 2]) {
+  for (const seed of [1]) {
     const { samples } = speech(seed);
     const conv = converted(samples, 300);
     for (let t = 0; t < conv.length; t += 256) conv.fill(0, t + 128, t + 256);

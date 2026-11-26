@@ -361,7 +361,9 @@ export class LatencyTracker {
       this._scores.push(est.score);
       if (this._scores.length > SCORES_KEPT) this._scores.shift();
     }
-    this._history.push(Object.freeze({ atSec: (this._frames * this.hopMs) / 1000, ms: est.ms, score: est.score }));
+    // settling: taken while D followed a delay that had not settled yet (a jitter buffer draining).
+    const settling = !this._locked;
+    this._history.push(Object.freeze({ atSec: (this._frames * this.hopMs) / 1000, ms: est.ms, score: est.score, settling }));
     if (this._history.length > this.maxHistory) this._history.shift();
   }
 
@@ -375,7 +377,11 @@ export class LatencyTracker {
     return this._locked;
   }
 
-  /** Accepted estimates, oldest first: [{ atSec (stream time of the estimate), ms, score }]. A copy. */
+  /**
+   * Accepted estimates, oldest first: [{ atSec (stream time of the estimate),
+   * ms, score, settling }]. `settling`: taken after relock() while the delay
+   * was still settling (D followed it, but it was not locked). A copy.
+   */
   get history() {
     return this._history.slice();
   }
@@ -383,11 +389,15 @@ export class LatencyTracker {
   /**
    * Total delay L for lip-sync mode: the 95th percentile of the accepted
    * delays plus `marginMs`, rounded up to a whole ms, capped at `maxMs` and
-   * never below 0. Null with fewer than 5 accepted estimates.
+   * never below 0. Null with fewer than 5 such estimates. The passing values
+   * D followed while a jitter buffer drained after a stall are left out: the
+   * converted voice was not on air then, and they would hold every later
+   * word back for nothing.
    */
   lipSyncTotalMs({ marginMs = 30, maxMs = 800 } = {}) {
-    if (this._history.length < 5) return null;
-    const p95 = percentile(this._history.map((h) => h.ms), 95);
+    const settled = this._history.filter((h) => !h.settling);
+    if (settled.length < 5) return null;
+    const p95 = percentile(settled.map((h) => h.ms), 95);
     // The epsilon keeps float noise in the interpolation (342.00000000000006) from adding a whole ms.
     return Math.min(maxMs, Math.max(0, Math.ceil(p95 + marginMs - 1e-6)));
   }

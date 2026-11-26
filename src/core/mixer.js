@@ -93,6 +93,7 @@ export class SafetyMixer {
    * @param {number} [options.gainSlewDbPerSec=1] the level correction moves at most this fast while the converted voice is heard
    * @param {number} [options.releaseMs=50] limiter release time constant
    * @param {number} [options.replayLeadMs=30] a stall replay starts this much before the stall start, so its fade-in is over by then
+   *   (and the stall detector's tolMs earlier still: see _decide)
    * @param {number} [options.guessBackMs=100] other faults replay from this much before the converted voice's position
    * @param {number} [options.pauseMarginMs=40] pause checks reach this far either side (D may be off by the stall detector's ±40 ms)
    * @param {number} [options.catchUpHangMs=100] hangover of the speech flag the timeline shortens pauses by
@@ -152,6 +153,13 @@ export class SafetyMixer {
     // replay would take twice as many pauses; its keepPauseMs and word-start guard protect the rest.
     this._flagVad = new Vad({ ...vadOptions, sampleRate, hangMs: catchUpHangMs });
     this._stall = new StallDetector({ ...stallOptions, sampleRate });
+    // The detector places a stall start as if the converted voice came exactly D late, but it
+    // accepts a voice up to tolMs later than D as healthy (a D a jitter buffer has just
+    // outgrown, a stale estimate), and a concealment tail can pass for the voice for a frame
+    // or two: the stop may lie up to that much before stallStartSample. A replay that starts
+    // that much earlier repeats a few tens of ms when D is right, and never loses the words
+    // after the stop when it is not.
+    this._stallMargin = this._stall.tol * this._stall.frameLen;
     this._policy = new FaultPolicy({ ...faultOptions, mode });
     this._timeline = new OriginalTimeline({ historyMs, ...timelineOptions, sampleRate });
     // Content this new may hold a word the Vad has not flagged yet (attack plus a frame).
@@ -217,6 +225,7 @@ export class SafetyMixer {
     this._xStep = this._toOwnStep;
     this._gainDb = 0; // the converted voice's level correction
     this._gainLin = 1;
+    this._gainFrom = 1; // ... and its value at the start of the block being rendered
     this._limG = 1;
     this._setLipSync(lipSyncMs);
     this._applyPending();
@@ -382,7 +391,9 @@ export class SafetyMixer {
       if (x - x === 0) so += x * x;
       sc += c * c;
       if (++fill === hop) {
-        this._envelope(so, sc);
+        this._hopO = so; // through fields: a double passed to a call is boxed unless the callee is inlined
+        this._hopC = sc;
+        this._envelope();
         so = 0;
         sc = 0;
         fill = 0;
@@ -408,9 +419,10 @@ export class SafetyMixer {
       if (this._bad || stall.badOutput) {
         this._fault("bad-output", this._bad ? "non-finite samples" : "level burst", this._convPos() - this._guessBack);
       } else if (stall.stalled) {
-        // Where the converted voice stopped, a little earlier so the replay's fade-in is over by
-        // then; or where the listener is, if the delay line has not played that far yet.
-        this._fault("stall", "converted voice stopped", Math.min(this._convPos(), stall.stallStartSample - this._lead));
+        // Where the converted voice stopped, earlier by the uncertainty of that point and the
+        // replay's fade-in; or where the listener is, if the delay line has not played that far yet.
+        const from = stall.stallStartSample - this._stallMargin - this._lead;
+        this._fault("stall", "converted voice stopped", Math.min(this._convPos(), from));
       }
     } else if (stall.stalled || stall.badOutput) {
       stall.reset(); // not on the air: nothing to switch, but the converted voice must prove itself again
@@ -421,9 +433,9 @@ export class SafetyMixer {
 
   _render(origOut, convOut, out, n) {
     this._timeline.read(origOut, this._Ls);
-    const g0 = this._gainLin;
+    this._gainFrom = this._gainLin;
     this._updateGain(n);
-    if (this._x > 0 || this._xTarget === 1) this._readConv(convOut, n, g0, this._gainLin);
+    if (this._x > 0 || this._xTarget === 1) this._readConv(convOut, n);
     else this._cdLeft = 0; // unheard: a move of the delay line needs no crossfade
     this._mix(origOut, convOut, out, n);
     this._outAt += n;
@@ -608,8 +620,10 @@ export class SafetyMixer {
     }
   }
 
-  /** The converted voice at the next n output times: through the delay line, gain ramping g0 -> g1. */
-  _readConv(out, n, g0, g1) {
+  /** The converted voice at the next n output times: through the delay line, gain ramping from _gainFrom to _gainLin. */
+  _readConv(out, n) {
+    const g0 = this._gainFrom;
+    const g1 = this._gainLin;
     const ring = this._cring;
     const cap = this._ccap;
     const t0 = this._outAt;
@@ -687,8 +701,10 @@ export class SafetyMixer {
 
   // ---- envelopes and events -----------------------------------------------
 
-  /** One hop of both inputs done: a level over the last two hops (as envelopeDb with winMs = 2 hops). */
-  _envelope(so, sc) {
+  /** One hop of both inputs done (its sums in _hopO, _hopC): a level over the last two hops (as envelopeDb with winMs = 2 hops). */
+  _envelope() {
+    const so = this._hopO;
+    const sc = this._hopC;
     if (this._havePrev) {
       const win = 2 * this._hop;
       const k = this._envN++;

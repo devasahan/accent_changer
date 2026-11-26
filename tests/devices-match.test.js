@@ -159,6 +159,93 @@ test("findCableInput: the real CABLE Input entry, never a pseudo-device", () => 
   assert.ok(findCableInput([twice[0]]), "the numbered one when it is the only one");
 });
 
+test("Windows in another language: 'Standard - …', 'Par défaut - …' pseudo-devices are read like 'Default - …'", () => {
+  // Chromium writes the word for "Default"/"Communications" in Windows' display language, then " - ".
+  for (const [def, comm] of [
+    ["Standard", "Kommunikation"],
+    ["Par défaut", "Communications"],
+    ["Predeterminado", "Comunicaciones"],
+    ["Значение по умолчанию", "Связь"],
+  ]) {
+    const inputs = [
+      mic("default", `${def} - Headset Microphone (Jabra EVOLVE 20 MS)`),
+      mic("communications", `${comm} - Headset Microphone (Jabra EVOLVE 20 MS)`),
+      ...INPUTS.slice(2),
+    ];
+    assert.equal(pickMic(inputs).deviceId, ID.jabra, `${def}: Windows' default, not the first in the list`);
+    // Saved from the pseudo-device; Windows' default has moved to the laptop's array since.
+    const moved = [mic("default", `${def} - Microphone Array (Realtek(R) Audio)`), ...INPUTS.slice(2)];
+    assert.equal(pickMic(moved, { deviceId: "default", label: `${def} - Headset Microphone (Jabra EVOLVE 20 MS)` }).deviceId, ID.jabra, def);
+    assert.equal(pickMic(moved).deviceId, ID.array, `${def}: the new default`);
+    // The cable as Windows' default devices, and as the app's microphone.
+    const warnings = feedbackWarnings({
+      micLabel: `${def} - CABLE Output (VB-Audio Virtual Cable)`,
+      defaultInputLabel: `${def} - CABLE Output (VB-Audio Virtual Cable)`,
+      defaultOutputLabel: `${def} - CABLE Input (VB-Audio Virtual Cable)`,
+    });
+    assert.equal(warnings.length, 3, def);
+    const outputs = [out("default", `${def} - CABLE Input (VB-Audio Virtual Cable)`), ...OUTPUTS.slice(2)];
+    assert.equal(findCableInput(outputs).deviceId, ID.cableIn, def);
+  }
+  // A device whose own name has " - " in it is only cut at the first one.
+  const dashed = [mic("default", "Standard - Mic - USB (C-Media(R) Audio)"), mic(ID.array, "Mic - USB (C-Media(R) Audio)")];
+  assert.equal(pickMic([...dashed, mic(ID.jabra, "Headset Microphone (Jabra EVOLVE 20 MS)")]).deviceId, ID.array);
+});
+
+test("two identical headsets: Windows' default is found by its exact label, '(2- …)' included", () => {
+  const twins = [
+    mic("default", "Default - Headset Microphone (2- Jabra EVOLVE 20 MS)"),
+    mic("communications", "Communications - Headset Microphone (Jabra EVOLVE 20 MS)"),
+    mic(ID.jabra, "Headset Microphone (Jabra EVOLVE 20 MS)"),
+    mic(ID.jabra2, "Headset Microphone (2- Jabra EVOLVE 20 MS)"),
+  ];
+  assert.equal(pickMic(twins).deviceId, ID.jabra2);
+  assert.equal(pickMic(twins.slice(1)).deviceId, ID.jabra, "the communications device, un-numbered");
+  assert.equal(pickMic(twins, { deviceId: "default", label: "Standard - Headset Microphone (2- Jabra EVOLVE 20 MS)" }).deviceId, ID.jabra2);
+});
+
+test("voice changers and voice filters are virtual microphones too", () => {
+  const virtual = [
+    "Microphone (Voicemod Virtual Audio Device (WDM))",
+    "Microphone (NVIDIA Broadcast)",
+    "Microphone (NVIDIA RTX Voice)",
+    "Wave Link Stream (Elgato Wave:3)",
+    "Microphone (Microsoft Teams Audio)",
+    "Microphone (MorphVOX Audio)",
+    "Line 1 (Virtual Audio Cable)",
+    "Voice.ai Audio Cable (Voice.ai)",
+  ];
+  for (const label of virtual) {
+    assert.ok(VIRTUAL_MIC.test(label), label);
+    // Windows' default microphone is the voice changer: the real headset instead, never the changer.
+    const inputs = [mic("default", `Default - ${label}`), mic(hexId(), label), mic(ID.jabra, "Headset Microphone (Jabra EVOLVE 20 MS)")];
+    assert.equal(pickMic(inputs).deviceId, ID.jabra, label);
+  }
+  for (const label of ["Microphone (Elgato Wave:3)", "Microphone (Virtual Desktop Audio)", "Microphone (Yeti Stereo Microphone)", "Microphone (Shure MV7)"]) {
+    assert.ok(!VIRTUAL_MIC.test(label), label);
+  }
+});
+
+test("a cable renamed in Windows' sound settings is still the cable", () => {
+  // Windows lets the user rename an endpoint; the driver's name in brackets stays.
+  const renamedIn = out(ID.cableIn, "Accent Out (VB-Audio Virtual Cable)");
+  assert.equal(findCableInput([...OUTPUTS.slice(0, 4), renamedIn]).deviceId, ID.cableIn);
+  assert.equal(findCableInput([out(hexId(), "CABLE Input (2- VB-Audio Virtual Cable)"), renamedIn]).deviceId, ID.cableIn, "the un-numbered one");
+  assert.ok(isCableOutput("Interview Mic (VB-Audio Virtual Cable)"));
+  assert.ok(isCableInput("Accent Out (VB-Audio Virtual Cable)"));
+  assert.deepEqual(usableMics([mic(hexId(), "Interview Mic (VB-Audio Virtual Cable)")]), []);
+  const warnings = feedbackWarnings({
+    micLabel: "Interview Mic (VB-Audio Virtual Cable)",
+    defaultInputLabel: "Default - Interview Mic (VB-Audio Virtual Cable)",
+    defaultOutputLabel: "Standard - Accent Out (VB-Audio Virtual Cable)",
+  });
+  assert.equal(warnings.length, 3);
+  // Still not the 16-channel endpoint, and not VB-Audio's other cables.
+  assert.equal(findCableInput([out(hexId(), "CABLE In 16 Ch (VB-Audio Virtual Cable)")]), null);
+  assert.equal(findCableInput([out(hexId(), "CABLE-A Input (VB-Audio Cable A)")]), null);
+  assert.ok(!isCableInput("CABLE Output (VB-Audio Virtual Cable)") && !isCableOutput("CABLE Input (VB-Audio Virtual Cable)"));
+});
+
 test("feedbackWarnings: set-ups that loop the audio back, in plain English", () => {
   const fine = { micLabel: "Headset Microphone (Jabra EVOLVE 20 MS)", defaultInputLabel: "Default - Headset Microphone (Jabra EVOLVE 20 MS)", defaultOutputLabel: "Default - Headset Earphone (Jabra EVOLVE 20 MS)" };
   assert.deepEqual(feedbackWarnings(fine), []);

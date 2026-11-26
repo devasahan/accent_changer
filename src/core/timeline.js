@@ -10,6 +10,11 @@
  * starts: the speech flag comes from a VAD and rises some 40 ms after a word's
  * first sound, so the last `guardMs` of a pause (and the newest `guardMs` of
  * an ongoing one) is dropped only when it is as quiet as the pause itself.
+ * Nor does it drop, or land a skip in, anything louder than the pause's own
+ * quiet (its quietest 10 ms, +6 dB): a word whose first sound is soft (an
+ * "h", an "f", a breathy start) may stay under the VAD's threshold for a
+ * hundred ms or more, a whole syllable's soft tail too, and the flag calls
+ * all of it pause.
  * The other way round (the target lag grew, lip sync switched on) it holds
  * back: the voice stops in a pause and later goes on from the same sample, so
  * silence goes in and speech is never repeated or split. Nothing clicks: a
@@ -28,6 +33,7 @@ const HOLD = 2; // not reading: silence (before the first read, in a hold, or ou
 const MAX_FADES = 4; // read heads still fading out at once (one per jump within fadeMs)
 const RUN_CAP = 4096; // speech/pause runs remembered: one per flag change, far more than the history needs
 const QUIET_FLOOR = 0.001; // -60 dBFS peak: quieter than this is never a word worth keeping
+const CHUNK_MS = 10; // the quiet level of a pause is that of its quietest chunk this long
 const SOFT_STEP = 0.002; // -54 dBFS: a jump in level this small is inaudible, so such content may start without a fade
 
 export class OriginalTimeline {
@@ -58,11 +64,22 @@ export class OriginalTimeline {
     this.minPauseSamples = n(minPauseMs);
     this.guardSamples = n(guardMs);
     this.minSkipSamples = Math.max(1, n(minSkipMs));
-    this._refLen = Math.max(this.fadeSamples, n(50)); // pause content a quiet check compares with
     // The history plus room for blocks in flight and fades.
     this._cap = this.historySamples + Math.max(n(500), 4 * this.fadeSamples);
     this._ring = new Float32Array(this._cap);
     this._writePos = 0;
+    // Peak |x| of each CHUNK_MS chunk of content (chunk c is [c * chunkLen, (c + 1) * chunkLen)).
+    this._chunkLen = Math.max(1, n(CHUNK_MS));
+    this._chunkN = Math.ceil(this._cap / this._chunkLen) + 2;
+    this._chunks = new Float32Array(this._chunkN);
+    this._chunkCount = 0; // complete chunks
+    this._chunkPeak = 0; // peak of the chunk being written
+    this._chunkFill = 0;
+    // How far the pause under the read head stays quiet (see _quietEnd), worked out once per read().
+    this._qeReads = -1;
+    this._qeRun = -1;
+    this._qeFrom = 0;
+    this._qeEnd = 0;
     // Speech flags as runs: [start of run k, start of run k+1) has flag k; the last run is open.
     this._runStart = new Float64Array(RUN_CAP);
     this._runFlag = new Uint8Array(RUN_CAP);
@@ -128,12 +145,25 @@ export class OriginalTimeline {
     }
     const ring = this._ring;
     const cap = this._cap;
+    const len = this._chunkLen;
     let idx = this._writePos % cap;
+    let peak = this._chunkPeak;
+    let fill = this._chunkFill;
     for (let i = 0; i < n; i++) {
-      const v = block[i];
-      ring[idx] = v - v === 0 ? v : 0; // NaN and ±Infinity never enter the timeline
+      let v = block[i];
+      if (v - v !== 0) v = 0; // NaN and ±Infinity never enter the timeline
+      ring[idx] = v;
       if (++idx === cap) idx = 0;
+      if (v < 0) v = -v;
+      if (v > peak) peak = v;
+      if (++fill === len) {
+        this._chunks[this._chunkCount++ % this._chunkN] = peak;
+        peak = 0;
+        fill = 0;
+      }
     }
+    this._chunkPeak = peak;
+    this._chunkFill = fill;
     this._writePos += n;
     this._guardOverrun();
   }
@@ -273,6 +303,10 @@ export class OriginalTimeline {
       S = quiet ? reach : safe;
     }
     if (S <= 0) return;
+    // Only quiet content is dropped, and the landing's fade-in is over before any sound.
+    const loudAt = this._quietEnd(k, rs, re, pos);
+    if (loudAt < re && S > loudAt - pos - F) S = loudAt - pos - F;
+    if (S <= 0) return;
     if (open && S < this.minSkipSamples && S < excess) return; // the pause is still growing: skip later, in one go
     const hard = this._softAt(pos + S);
     if (!hard && open) {
@@ -293,7 +327,8 @@ export class OriginalTimeline {
    * stop is touched, so a word starting there comes out whole after the
    * silence. A word must not have started just before it, though: the
    * pause goes on for guardMs past here (a word would have been flagged by
-   * then), or that stretch is as quiet as the pause.
+   * then), or that stretch is as quiet as the pause; and the content here is
+   * quiet (a hold inside a soft onset would split it).
    */
   _tryHold() {
     const pos = this._pos;
@@ -302,6 +337,7 @@ export class OriginalTimeline {
     const rs = this._start(k);
     const open = k === this._runCount - 1;
     const re = open ? this._writePos : this._start(k + 1);
+    if (this._quietEnd(k, rs, re, pos) <= pos) return;
     if (re - pos < this.guardSamples) {
       if (this._checkedAt === this._reads) return;
       this._checkedAt = this._reads;
@@ -390,14 +426,65 @@ export class OriginalTimeline {
 
   /**
    * Is the end of a pause ([zoneFrom, to), where the VAD may not have flagged
-   * a starting word yet) no louder than the pause before it (+6 dB)?
+   * a starting word yet) no louder than the pause before it: its quietest
+   * chunk, +6 dB (see _quietLimit)? Not merely as loud as the stretch just
+   * before the zone: a soft first sound that has gone on for a while is that
+   * loud too.
    */
   _zoneQuiet(rs, zoneFrom, to) {
     const oldest = this._writePos - this._cap;
     const from = Math.max(rs, zoneFrom, oldest);
     if (to <= from) return true;
-    const ref = this._peak(Math.max(rs, from - this._refLen, oldest), from);
-    return this._peak(from, to) <= Math.max(QUIET_FLOOR, 2 * ref);
+    return this._peak(from, to) <= this._quietLimit(rs, from);
+  }
+
+  /**
+   * The loudest peak that still counts as the quiet of the pause [rs, re):
+   * twice (+6 dB) the peak of its quietest complete chunk, never under
+   * QUIET_FLOOR (also when no chunk lies wholly inside). A chunk of digital
+   * silence (a dropout) makes it QUIET_FLOOR: stricter, so that pause gives
+   * back less, but a soft sound in it is never taken for its quiet.
+   */
+  _quietLimit(rs, re) {
+    const len = this._chunkLen;
+    const c1 = Math.min(Math.floor(re / len), this._chunkCount); // chunks [c0, c1) lie inside
+    let m = Infinity;
+    for (let c = Math.max(Math.ceil(rs / len), this._chunkCount - this._chunkN + 1); c < c1; c++) {
+      const v = this._chunks[c % this._chunkN];
+      if (v < m) m = v;
+    }
+    return m === Infinity ? QUIET_FLOOR : Math.max(QUIET_FLOOR, 2 * m);
+  }
+
+  /**
+   * Where content stops being quiet at or after pos, in pause run k ([rs,
+   * re)): the start of the chunk before the first one louder than the
+   * pause's quiet (_quietLimit: a sound rising out of the quiet starts in
+   * the chunk before it shows), or re. At most once per read() call: within
+   * one call the head only moves forward and nothing is written, so the
+   * answer stands.
+   */
+  _quietEnd(k, rs, re, pos) {
+    if (this._qeReads === this._reads && this._qeRun === k && pos >= this._qeFrom) return this._qeEnd;
+    const len = this._chunkLen;
+    const limit = this._quietLimit(rs, re);
+    let end = re;
+    for (let c = Math.floor(pos / len); c * len < re; c++) {
+      if (c <= this._chunkCount - this._chunkN) {
+        end = Math.max(rs, c * len); // too old to tell: not quiet
+        break;
+      }
+      const peak = c < this._chunkCount ? this._chunks[c % this._chunkN] : this._chunkPeak; // the chunk being written
+      if (peak > limit) {
+        end = Math.max(rs, (c - 1) * len);
+        break;
+      }
+    }
+    this._qeReads = this._reads;
+    this._qeRun = k;
+    this._qeFrom = pos;
+    this._qeEnd = end;
+    return end;
   }
 
   /** Peak |x| of content [from, to). */

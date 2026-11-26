@@ -50,6 +50,69 @@ test("API keys: sk_/pk_ keys and any run of 32 or more key characters", () => {
   for (const line of ["task_force_alpha", "disk_usage_percent_high", "-".repeat(60), "_".repeat(40)]) assert.equal(redact(line), line);
 });
 
+test("keys in standard base64: '+', '/' and '=' do not split a key into visible pieces", () => {
+  // A 32-byte secret in base64 is 44 characters; LONG_RUN alone saw runs shorter than 32 between
+  // the '+' and '/' and left more than half of such keys partly or wholly visible.
+  const key = "q7Wz/9Kd+3LmNp2Rs8Tv4Xy6Ab1Cd5Ef7Gh9Ij+Kl0M=";
+  assert.equal(scrubbed(`key=${key}`, [key.slice(0, 8), key.slice(9, 20), key.slice(-8)]), `key=${REDACTED}`);
+  assert.equal(redact(`apikey value ${key}`), `apikey value ${REDACTED}`);
+  assert.equal(redact(`{"value":"${key}","n":1}`), `{"value":"${REDACTED}","n":1}`);
+  const B64 = `${B62}+/`;
+  let tried = 0;
+  for (let n = 0; n < 600; n++) {
+    const k = pick(B64, n % 2 ? 43 : 86) + (n % 2 ? "=" : "==");
+    // Upper case, lower case and digits mixed is what tells a key from words and paths
+    // (a key from random bytes lacks a digit about once in 1500).
+    if (!/[A-Z]/.test(k) || !/[a-z]/.test(k) || !/[0-9]/.test(k)) continue;
+    tried++;
+    assert.equal(redact(`Sanas refused the key ${k} (HTTP 401)`), `Sanas refused the key ${REDACTED} (HTTP 401)`, k);
+  }
+  assert.ok(tried > 590, `${tried} keys`);
+  // URLs, Windows paths, file names and slash-separated words stay.
+  for (const line of [
+    "https://github.com/AccentChanger/accent_changer/releases/tag/v1.2.3",
+    "update: https://github.com/obsproject/obs-studio/releases/download/30.2.3/OBS-Studio-30.2.3-Windows-Installer.exe",
+    "C:\\Program Files\\WindowsApps\\OBSProject.OBSStudio_30.2.3.0_x64__qyxnjnmr4kv5c\\bin\\64bit\\obs64.exe",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "keys: AudioVolumeUp/AudioVolumeDown/AudioVolumeMute/MediaPlayPause",
+    "at LatencyTracker.update (http://tauri.localhost/assets/index-AbC123dEf456.js:12:345)",
+  ]) {
+    assert.equal(redact(line), line);
+  }
+});
+
+test("header, kebab-case and camel-case field names: redact() on text hides what redactObject() hides", () => {
+  assert.equal(redact("X-Api-Key: Ab12Cd34Ef56"), `X-Api-Key: ${REDACTED}`);
+  assert.equal(redact("x-auth-token=t0k"), `x-auth-token=${REDACTED}`);
+  const data = {
+    sanasUserId: "u1",
+    sanasGroupId: "g7",
+    authToken: "tok-1",
+    "user-id": "u-77",
+    "group-id": "g-12",
+    "x-api-key": "Ab12Cd34Ef56",
+    endpointUserId: "e1",
+    authorizationPassword: "pw",
+    clientSecret: "s",
+    sessionCookie: "c1",
+    label: "Headset Microphone (Jabra EVOLVE 20 MS)",
+  };
+  const hidden = JSON.parse(redact(JSON.stringify(data)));
+  assert.deepEqual(hidden, redactObject(data));
+  assert.equal(hidden.label, data.label);
+  for (const [k, v] of Object.entries(data)) if (k !== "label") assert.equal(hidden[k], REDACTED, `${k}: ${v}`);
+  // Names that only contain those words, and settings names, stay.
+  for (const line of ["max_tokens=512", "user_identity=me", "secret_santa=yes", "keyExpiresOn: 2027-01-01", "hotkeyOwn: Ctrl+Alt+B", "tokenSaved: true"]) {
+    assert.equal(redact(line), line);
+  }
+});
+
+test("a password in a URL is hidden up to the last '@' before the host", () => {
+  assert.equal(redact("proxy https://alice:p@ssw0rd@proxy.example.test:8080/"), `proxy https://${REDACTED}@proxy.example.test:8080/`);
+  assert.equal(redact("wss://u:a@b@c@sanas.example/ws next"), `wss://${REDACTED}@sanas.example/ws next`);
+  assert.equal(redact("mail me at https://example.test/team@sanas"), "mail me at https://example.test/team@sanas", "an '@' in the path");
+});
+
 test("device ids (64 hex) and UUIDs", () => {
   assert.equal(scrubbed(`mic ${DEVICE_ID} opened`, [DEVICE_ID]), `mic ${REDACTED} opened`);
   assert.equal(redact(`{"deviceId":"${DEVICE_ID}"}`), `{"deviceId":"${REDACTED}"}`);
@@ -126,6 +189,10 @@ test("large and odd inputs stay fast (no quadratic search)", () => {
     "sk-".repeat(100000),
     "token=".repeat(50000),
     "2026-11-26T10:15:30.123Z D = 312 ms user_id=u1 Bearer abcdefgh12345\n".repeat(10000),
+    "a-".repeat(100000), // the field names' prefixes ("x-api-key")
+    "x-api-".repeat(40000),
+    "Ab1+/".repeat(40000), // one long base64-like run
+    "http://a".repeat(30000), // URLs passed over by the base64 rule
   ];
   const t0 = performance.now();
   for (const s of inputs) redact(s);
@@ -206,7 +273,13 @@ test("redactObject: empty values stay visible, odd values are copied safely", ()
   assert.equal(Object.getPrototypeOf(proto), Object.prototype);
   assert.deepEqual(Object.keys(proto), ["__proto__"]);
   assert.equal({}.polluted, undefined);
-  // A key that is itself a secret is scrubbed too.
+  // A key that is itself a secret is scrubbed too; two such keys do not overwrite each other.
   assert.deepEqual(Object.keys(redactObject({ [DEVICE_ID]: "Jabra" })), [REDACTED]);
+  const other = pick("0123456789abcdef", 64);
+  assert.deepEqual(redactObject({ [DEVICE_ID]: "Jabra", [other]: "Realtek", [`${REDACTED}#2`]: "taken" }), {
+    [REDACTED]: "Jabra",
+    [`${REDACTED}#2`]: "Realtek",
+    [`${REDACTED}#2#2`]: "taken",
+  });
   for (const v of [undefined, null, 3, "plain", true]) assert.equal(redactObject(v), v);
 });
