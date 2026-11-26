@@ -11,6 +11,7 @@ import {
   originReport,
   portFromArgs,
   runOriginCheck,
+  skippedCheck,
   startSpikeServer,
 } from "../spike/serve.mjs";
 
@@ -360,4 +361,18 @@ test("the server shares the origin check with the page, without the token", asyn
     assert.ok(!after.body.includes("secret-token"), "the token stays in the server");
     assert.ok(!after.body.includes("g%2F1"), "no project ids either");
   });
+});
+
+test("a skipped address check names the real reason, and the advice fits it", () => {
+  const refused = skippedCheck({ refused: true, status: 401 });
+  assert.match(refused.reason, /refused the key \(HTTP 401\)/);
+  assert.match(refused.next, /Fix the key/);
+  const noIds = skippedCheck({ ok: true, session: null });
+  assert.match(noIds.reason, /no user or group id/);
+  assert.doesNotMatch(noIds.next, /start the server again/i, "a restart gives the same answer");
+  for (const verdict of [{ unknown: true, message: "no answer within 15 s" }, null, undefined]) {
+    const unknown = skippedCheck(verdict);
+    assert.match(unknown.reason, /could not be checked/);
+    assert.match(unknown.next, /Start the server again/);
+  }
 });

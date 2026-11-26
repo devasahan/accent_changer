@@ -59,9 +59,26 @@ async function main() {
   // "Fake Audio Input 2" plays as another app's microphone would: 250 ms late.
   // Every microphone gets a volume the test can turn down: silence (you stop
   // talking, and the "app" falls silent 250 ms later).
+  // window.__noise(sec) plays a short noise into "Fake Audio Input 1" only (a cough or a
+  // knock on the headset that the other app leaves out). window.__group, when set, is
+  // the groupId every microphone reports (one physical device behind two names).
   await context.addInitScript(() => {
     const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     window.__micGains = [];
+    window.__noiseInto = [];
+    window.__noise = (sec = 0.5, amp = 0.3) => {
+      for (const { ctx, out } of window.__noiseInto) {
+        if (ctx.state === "closed") continue;
+        const n = Math.round(sec * ctx.sampleRate);
+        const buffer = ctx.createBuffer(1, n, ctx.sampleRate);
+        const d = buffer.getChannelData(0);
+        for (let i = 0; i < n; i++) d[i] = amp * (Math.random() * 2 - 1) * Math.sin((Math.PI * i) / n);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(out);
+        src.start();
+      }
+    };
     navigator.mediaDevices.getUserMedia = async (constraints) => {
       const stream = await original(constraints);
       const id = constraints?.audio?.deviceId?.exact;
@@ -70,15 +87,18 @@ async function main() {
       const source = ctx.createMediaStreamSource(stream);
       const out = ctx.createMediaStreamDestination();
       const gain = ctx.createGain();
-      window.__micGains.push(gain);
+      window.__micGains.push({ label, gain });
       if (/Fake Audio Input 2/.test(label)) {
         const delay = ctx.createDelay(1);
         delay.delayTime.value = 0.25;
         source.connect(gain).connect(delay).connect(out);
       } else {
         source.connect(gain).connect(out);
+        if (/Fake Audio Input 1/.test(label)) window.__noiseInto.push({ ctx, out });
       }
       const track = out.stream.getAudioTracks()[0];
+      const settings = track.getSettings.bind(track);
+      track.getSettings = () => ({ ...settings(), ...(window.__group ? { groupId: window.__group } : {}) });
       const stop = track.stop.bind(track);
       track.stop = () => {
         stop();
@@ -105,7 +125,8 @@ async function main() {
   const waitRuns = (n, timeout) => page.waitForFunction((k) => window.__spike.state.runs.length >= k, n, { timeout });
   const waitIdle = (timeout) => page.waitForFunction(() => window.__spike.state.mode === "idle", null, { timeout });
   const lastRun = () => spike(() => window.__spike.state.runs.at(-1));
-  const micVolume = (v) => spike((x) => window.__micGains.forEach((g) => (g.gain.value = x)), v);
+  const micVolume = (v, only = "") =>
+    spike(([x, which]) => window.__micGains.filter((m) => m.label.includes(which)).forEach((m) => (m.gain.gain.value = x)), [v, only]);
 
   try {
     await page.goto(`${base}/spike/`);
@@ -114,6 +135,11 @@ async function main() {
     await page.waitForFunction(() => /app can load/.test(document.querySelector("#originInfo").textContent), null, { timeout: 5000 });
     check(true, "the page shows the server's Sanas address check");
     check((await page.locator("#longMinutes").getAttribute("max")) === "90", "the long run allows 90 minutes");
+    check(await page.locator("#blindWords").isDisabled(), "the blind-listener boxes stay closed while there is no run to rate");
+    check(
+      (await page.locator("#btnRun").isDisabled()) && /Record the script first/.test(await page.locator("#runInfo").textContent()),
+      "Run says it needs a recording first",
+    );
 
     await page.selectOption("#engine", "mock");
     await page.fill("#mockDelay", String(MOCK_DELAY_MS));
@@ -153,12 +179,56 @@ async function main() {
     check((await page.locator("#utts li").count()) === run.utterances.length, "one rating row per utterance");
     check((await openSessions()) === 0, "the run's session is closed afterwards");
 
+    // 1b · headphones remembered from an earlier sitting are plugged in after the page opened:
+    // once step 1 shows them, the sound plays there too
+    const sinkFollows = await spike(async () => {
+      const s = window.__spike.state;
+      const out = document.querySelector("#out");
+      const headphones = [...out.options].map((o) => o.value).find(Boolean);
+      if (!headphones || typeof s.ctx?.setSinkId !== "function") return { skipped: true };
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const calls = [];
+      const setSink = s.ctx.setSinkId.bind(s.ctx);
+      s.ctx.setSinkId = (id) => {
+        calls.push(id);
+        return setSink(id).catch(() => {});
+      };
+      const md = navigator.mediaDevices;
+      const enumerate = md.enumerateDevices.bind(md);
+      out.value = "";
+      out.dispatchEvent(new Event("change"));
+      localStorage.setItem("accentChanger.out", headphones);
+      md.enumerateDevices = async () => (await enumerate()).filter((d) => d.deviceId !== headphones);
+      md.dispatchEvent(new Event("devicechange"));
+      await wait(300);
+      const before = out.value;
+      md.enumerateDevices = enumerate;
+      md.dispatchEvent(new Event("devicechange"));
+      await wait(300);
+      const after = out.value;
+      out.value = "";
+      out.dispatchEvent(new Event("change"));
+      localStorage.removeItem("accentChanger.out");
+      await wait(100);
+      s.ctx.setSinkId = setSink;
+      return { before, after, headphones, calls };
+    });
+    check(
+      !sinkFollows.skipped && sinkFollows.before === "" && sinkFollows.after === sinkFollows.headphones && sinkFollows.calls.includes(sinkFollows.headphones),
+      "headphones that appear later are used, not only shown",
+      JSON.stringify(sinkFollows),
+    );
+
     // 4 · rate and play
     check((await page.locator("#score").textContent()) === "–" && (await lastRun()).rating.score10 === null, "a run nobody rated is unrated, not 0/10");
     check((await page.locator("#utts li").first().locator("input[type=checkbox]").count()) === 4, "each line has four boxes, “sounds American” included");
-    await page.locator("#utts li").first().locator("input[type=checkbox]").first().click();
+    check((await page.locator("#runInfo").textContent()) !== "" && !/Record the script first/.test(await page.locator("#runInfo").textContent()), "the hint goes once there is a recording");
+    const boxes = page.locator("#utts li").first().locator("input[type=checkbox]");
+    await boxes.first().click();
     check((await page.locator("#score").textContent()) === "0.0", "one box alone doesn't count the line");
-    await page.locator("#utts li").first().locator("input[type=checkbox]").evaluateAll((boxes) => boxes.slice(1).forEach((b) => b.click()));
+    await boxes.evaluateAll((all) => all.slice(1, 3).forEach((b) => b.click()));
+    check((await page.locator("#score").textContent()) === "0.0", "natural, your voice and every word right without “sounds American” don't count the line either");
+    await boxes.nth(3).click();
     const score = Number(await page.locator("#score").textContent());
     check(score > 0, "ticking all four boxes on a line raises the score", `${score}`);
     const stored = await spike(() => window.__spike.state.runs[0].rating);
@@ -310,19 +380,34 @@ async function main() {
     await page.click("#btnRead");
     await waitIdle(5000);
     check(/same as yours/.test(await status()), "Read the script refuses your own microphone as the other one", await status());
-    expectErrors = false;
     const inputs = await page.locator("#mic option").evaluateAll((os) => os.map((o) => ({ value: o.value, label: o.textContent })));
     const one = inputs.find((o) => /Fake Audio Input 1/.test(o.label));
     const two = inputs.find((o) => /Fake Audio Input 2/.test(o.label));
     await page.selectOption("#mic", one.value);
     await page.selectOption("#pairDevice", two.value);
+    // Windows lists the default device twice: "Default - Headset" and "Headset".
+    const realName = await page.locator("#pairDevice option:checked").textContent();
+    await page.locator("#pairDevice option:checked").evaluate((o, name) => (o.textContent = `Default - ${name}`), one.label);
+    await page.click("#btnRead");
+    await waitIdle(5000);
+    check(/same as yours/.test(await status()), "it also refuses your microphone under its “Default - …” name", await status());
+    await page.locator("#pairDevice option:checked").evaluate((o, name) => (o.textContent = name), realName);
+    // Two names, one physical device: the same groupId.
+    await spike(() => (window.__group = "one-headset"));
+    await page.click("#btnRead");
+    await waitIdle(5000);
+    check(/same as yours/.test(await status()) && (await spike(() => window.__spike.state.runs.length)) === runsBeforeRead, "and two names for one device (same group)", await status());
+    await spike(() => (window.__group = ""));
+    expectErrors = false;
     await page.dblclick("#btnRead");
     await page.waitForFunction(() => window.__spike.state.mode === "read", null, { timeout: 10000 });
     check(await page.locator("#btnStopRead").isEnabled(), "Stop is available while reading");
     let readLevel = -60;
+    let otherLevel = -60;
     for (let i = 0; i < 30; i++) {
       await page.waitForTimeout(300);
       readLevel = Math.max(readLevel, await page.locator("#readLevelA").evaluate((m) => m.value));
+      otherLevel = Math.max(otherLevel, await page.locator("#readLevelB").evaluate((m) => m.value));
     }
     // Like a person: stop talking, then press Stop. The page keeps listening for the app's last words.
     await micVolume(0);
@@ -335,11 +420,32 @@ async function main() {
     check(read.kind === "read" && read.ok && read.engine === two.label, "the read-aloud run is analysed like a Sanas run", JSON.stringify({ kind: read.kind, ok: read.ok, reason: read.reason, engine: read.engine }));
     check(Math.abs(read.delayMs - 250) < 60 && read.utterances.length >= 3, "it measures the other app's 250 ms delay, the right way round", `${read.delayMs} ms, ${read.utterances.length} lines`);
     check(read.gapCount === 0 && read.durationSec >= 12, "and no gap at the end: Stop waits 3 s for the app's last words", JSON.stringify({ gaps: read.gaps, sec: read.durationSec }));
-    check(readLevel > -60, "the level meters move while reading", String(readLevel));
+    check(readLevel > -60 && otherLevel > -60, "both level meters move while reading (you, and the other app)", `${readLevel} / ${otherLevel}`);
     check(read.settings.engine === "device" && read.settings.device === two.label, "it keeps the device it measured");
     check(/read aloud/.test(await page.locator("#runs tbody tr").last().textContent()), "the table marks it as read aloud");
     check((await page.locator("#utts li").count()) === read.utterances.length, "its lines are ready to rate");
     check(/Rating run \d+ \(Fake Audio Input 2\)/.test(await page.locator("#rateFor").textContent()), "and the page says which run is rated");
+
+    // 7b' · the other app stays silent (not running): a failed run with nothing to rate
+    const runsBeforeSilent = await spike(() => window.__spike.state.runs.length);
+    await page.click("#btnRead");
+    await page.waitForFunction(() => window.__spike.state.mode === "read", null, { timeout: 10000 });
+    await micVolume(0, "Fake Audio Input 2");
+    await page.waitForTimeout(6000);
+    await page.click("#btnStopRead");
+    await waitIdle(15000);
+    await micVolume(1);
+    const silentApp = await lastRun();
+    check(
+      (await spike(() => window.__spike.state.runs.length)) === runsBeforeSilent + 1 && !silentApp.ok && /stayed silent/.test(silentApp.reason ?? ""),
+      "an app that stays silent gives a failed run that says so",
+      JSON.stringify({ ok: silentApp.ok, reason: silentApp.reason }),
+    );
+    check(
+      /stayed silent/.test(await status()) && (await page.locator("#status").getAttribute("data-kind")) === "error" && (await page.locator("#blindWords").isDisabled()),
+      "shown as an error, with the blind-listener boxes closed",
+      await status(),
+    );
 
     // 4b · switch back to run 1 and score its blind-listener test
     check(await page.locator("#rateRunLabel").isVisible(), "the run picker appears once two runs have audio");
@@ -377,6 +483,26 @@ async function main() {
       JSON.stringify({ kind: watch.kind, ok: watch.ok, delay: watch.delayMedianMs, reason: watch.reason }),
     );
     check(/long check/.test(await page.locator("#runs tbody tr").last().textContent()), "the table marks it as a long check");
+
+    // 7d · its quiet test: you knock the headset 9 s before you talk again; the app leaves the knock out
+    await page.click("#btnWatch");
+    await page.waitForFunction(() => window.__spike.state.mode === "watch", null, { timeout: 10000 });
+    await page.waitForTimeout(7000);
+    await micVolume(0);
+    await page.waitForTimeout(13000);
+    await spike(() => window.__noise(0.5));
+    await page.waitForTimeout(9000);
+    await micVolume(1);
+    await page.waitForTimeout(10000);
+    await page.click("#btnStopWatch");
+    await waitIdle(10000);
+    const knock = await lastRun();
+    check(
+      knock.silenceLongestSec >= 15 && knock.convertedBackAfterSec !== null && knock.convertedBackAfterSec <= 6,
+      "a knock on the headset before you talk again doesn't make the app look late",
+      JSON.stringify({ silence: knock.silenceLongestSec, resumed: knock.speechResumedAtSec, after: knock.convertedBackAfterSec, speech: knock.speechAtSec, sound: knock.speechSoundSec, heard: knock.heardAtSec }),
+    );
+    check(/came back at once/.test(await status()), "and the page says it came back at once", await status());
 
     // 4c · only the newest runs keep their sound: runs with nothing to rate go first
     const kept = await spike(() => {
@@ -457,8 +583,21 @@ async function main() {
     await page.fill("#script", "My own first line.\nMy own second line.");
     await page.fill("#model", "AT5.2_Feminine");
     await page.selectOption("#rate", "48000");
+    const leave = new Promise((resolve) =>
+      page.once("dialog", async (d) => {
+        const type = d.type();
+        await d.accept();
+        resolve(type);
+      }),
+    );
     await page.reload();
+    const asked = await Promise.race([leave, new Promise((r) => setTimeout(() => r("no question"), 3000))]);
+    check(asked === "beforeunload", "the page asks before you leave it with runs that aren't saved", asked);
     await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    check(
+      (await page.locator("#btnRun").isDisabled()) && /Record the script first/.test(await page.locator("#runInfo").textContent()),
+      "a reopened page says Run needs the script recorded again",
+    );
     check(
       (await page.locator("#script").inputValue()) === "My own first line.\nMy own second line." &&
         (await page.locator("#model").inputValue()) === "AT5.2_Feminine" &&

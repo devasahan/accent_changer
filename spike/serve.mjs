@@ -526,17 +526,24 @@ async function askForKey() {
     const verdict = await checkKey({ key: value });
     if (verdict.ok) {
       console.log("Sanas accepted the key. It is kept in this window's memory only.");
-      return { key: value, session: verdict.session };
+      return { key: value, session: verdict.session, verdict };
     }
     if (verdict.refused) {
       console.log(`Sanas refused this key (HTTP ${verdict.status}). Paste it again: once, then Enter.`);
       continue;
     }
     console.log(`Could not check the key with Sanas (${verdict.message}). Using it anyway; the page will say if it is refused.`);
-    return { key: value, session: null };
+    return { key: value, session: null, verdict };
   }
   console.log("Sanas refused the key three times. Check it in the Sanas Console (expired? revoked?), then start the server again.");
   return { key: "", session: null };
+}
+
+/** Why the address check could not run with this key check's verdict, and what to do. */
+export function skippedCheck(verdict) {
+  if (verdict?.refused) return { reason: `Sanas refused the key (HTTP ${verdict.status})`, next: "Fix the key, then start the server again." };
+  if (verdict?.ok && !verdict.session) return { reason: "Sanas's answer about the key had no user or group id", next: "Write this in your notes." };
+  return { reason: "the key could not be checked with Sanas when the server started", next: "Start the server again to run it." };
 }
 
 function portHelp(port, err) {
@@ -577,17 +584,18 @@ async function main() {
   }
   const fromEnv = (process.env.SANAS_API_KEY ?? "").trim();
   let session = null;
+  let verdict = null;
   if (fromEnv) {
     console.log(`Using the key from the SANAS_API_KEY environment variable (${tail(fromEnv)}).`);
     console.log("To paste another key instead, open a new window, run  Remove-Item Env:SANAS_API_KEY  (PowerShell), and start the server again.");
-    const verdict = await checkKey({ key: fromEnv });
+    verdict = await checkKey({ key: fromEnv });
     if (verdict.ok) console.log("Sanas accepted that key.");
     else if (verdict.refused) console.log(`Sanas refused that key (HTTP ${verdict.status}).`);
     else console.log(`Could not check the key with Sanas (${verdict.message}).`);
     key = fromEnv;
     session = verdict.ok ? verdict.session : null;
   } else {
-    ({ key, session } = await askForKey());
+    ({ key, session, verdict = null } = await askForKey());
   }
   if (session) {
     console.log("");
@@ -597,9 +605,9 @@ async function main() {
     console.log(originCheck.conclusion);
     console.log("(The page saves this check in its results JSON.)");
   } else if (key) {
-    const reason = "the key could not be checked with Sanas when the server started";
-    originCheck = { ran: false, reason };
-    console.log(`Address check skipped: ${reason}. Start the server again to run it.`);
+    const skip = skippedCheck(verdict);
+    originCheck = { ran: false, reason: skip.reason };
+    console.log(`Address check skipped: ${skip.reason}. ${skip.next}`);
   }
   console.log("");
   console.log(`Accent Changer spike is running. Open  http://localhost:${server.port}/spike/  in Microsoft Edge or Chrome.`);
