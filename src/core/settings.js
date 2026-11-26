@@ -239,8 +239,8 @@ export function validateSettings(input) {
     cableLabel: text("cableLabel"),
     modelName: modelName(src.modelName, errors),
     voiceType: voiceType(src.voiceType, errors),
-    sampleRate: DEFAULTS.sampleRate,
-    mode: DEFAULTS.mode,
+    sampleRate: sampleRate(src.sampleRate, errors),
+    mode: mode(src.mode, errors),
     hotkeyOwn: hotkey(src.hotkeyOwn, "hotkeyOwn", errors),
     hotkeyConvert: hotkey(src.hotkeyConvert, "hotkeyConvert", errors),
     startWithWindows: bool(src.startWithWindows, "startWithWindows", DEFAULTS.startWithWindows),
@@ -249,15 +249,6 @@ export function validateSettings(input) {
     obsPath: text("obsPath"),
   };
 
-  if (!absent(src.sampleRate)) {
-    if (SAMPLE_RATES.includes(src.sampleRate)) settings.sampleRate = src.sampleRate;
-    else errors.push(`sampleRate must be 16000 or 48000; using ${DEFAULTS.sampleRate}.`);
-  }
-  if (!absent(src.mode)) {
-    const mode = typeof src.mode === "string" ? src.mode.trim().toLowerCase() : "";
-    if (MODES.includes(mode)) settings.mode = mode;
-    else errors.push(`mode must be "interview" or "practice"; using "${DEFAULTS.mode}".`);
-  }
   if (settings.hotkeyOwn === settings.hotkeyConvert) {
     errors.push(`hotkeyOwn and hotkeyConvert are the same keys; using ${DEFAULTS.hotkeyOwn} and ${DEFAULTS.hotkeyConvert}.`);
     settings.hotkeyOwn = DEFAULTS.hotkeyOwn;
@@ -302,6 +293,21 @@ function modelName(value, errors) {
   } else if (MODEL_NAME.test(name)) return name;
   else errors.push(`modelName must be a model name from the Sanas Console, like AT5.2; using ${DEFAULTS.modelName}.`);
   return DEFAULTS.modelName;
+}
+
+function sampleRate(value, errors) {
+  if (absent(value)) return DEFAULTS.sampleRate;
+  if (SAMPLE_RATES.includes(value)) return value;
+  errors.push(`sampleRate must be 16000 or 48000; using ${DEFAULTS.sampleRate}.`);
+  return DEFAULTS.sampleRate;
+}
+
+function mode(value, errors) {
+  if (absent(value)) return DEFAULTS.mode;
+  const m = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (MODES.includes(m)) return m;
+  errors.push(`mode must be "interview" or "practice"; using "${DEFAULTS.mode}".`);
+  return DEFAULTS.mode;
 }
 
 function voiceType(value, errors) {

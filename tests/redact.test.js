@@ -118,6 +118,22 @@ test("ordinary log lines are unchanged", () => {
   assert.equal(redact(lines.join("\n")), lines.join("\n"), "multi-line text too");
 });
 
+test("large and odd inputs stay fast (no quadratic search)", () => {
+  // Each of these took 15-30 s with unbounded patterns; now a few ms each.
+  const inputs = [
+    "x." + "a.".repeat(100000), // a long dotted text (URL scheme search)
+    "eyJ".repeat(100000), // "eyJ" over and over inside one run
+    "sk-".repeat(100000),
+    "token=".repeat(50000),
+    "2026-11-26T10:15:30.123Z D = 312 ms user_id=u1 Bearer abcdefgh12345\n".repeat(10000),
+  ];
+  const t0 = performance.now();
+  for (const s of inputs) redact(s);
+  const ms = performance.now() - t0;
+  assert.ok(ms < 2000, `${ms.toFixed(0)} ms`);
+  assert.equal(redact("eyJ".repeat(20)), REDACTED, "the run itself is still hidden");
+});
+
 test("anything that is not text is made text first", () => {
   assert.equal(redact(null), "");
   assert.equal(redact(undefined), "");

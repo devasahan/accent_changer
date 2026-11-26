@@ -19,8 +19,8 @@
 /** What every secret is replaced with. */
 export const REDACTED = "[redacted]";
 
-/** "user:password@" in a URL. */
-const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi;
+/** "user:password@" in a URL. Bounded lengths: a long dotted text must not make the search quadratic. */
+const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/@:]{1,256}:[^\s/@]{1,256}@/gi;
 
 /** An Authorization header or field, in any quoting: the credentials after the scheme. */
 const AUTH_HEADER =
@@ -41,8 +41,12 @@ const FIELD =
 /** Values that say a field is empty: nothing to hide, and worth seeing in a report. */
 const EMPTY_VALUE = /^(?:null|undefined|true|false|""|''|\\"\\")$/i;
 
-/** A JSON Web Token: base64url header "eyJ…" (it starts with {"), payload, signature. */
-const JWT = /eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*/g;
+/**
+ * A JSON Web Token: base64url header "eyJ…" (it starts with {"), payload,
+ * signature. Only where a token can start: inside a longer run it is caught
+ * by LONG_RUN, and trying every "eyJ" in a run would make the search quadratic.
+ */
+const JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*/g;
 
 /** Secret and publishable API keys (sk_live_…, pk_test_…). */
 const PREFIXED_KEY = /\b(?:sk|pk)[_-][A-Za-z0-9_-]{8,}/g;

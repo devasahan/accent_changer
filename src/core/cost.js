@@ -316,7 +316,8 @@ const OWN = new Set(["own-manual", "own-fault"]);
  * the converted voice and the app is waiting for it to be healthy, so only
  * the silence rule applies there. Hanging up never touches the meeting mic
  * (it carries the own voice meanwhile); tell the mixer first (own or off) so
- * the hang-up does not count as a fault. Convert reconnects.
+ * the hang-up does not count as a fault, and reconnect only on Convert. The
+ * answer stays true while nothing changes: ask while a call is up, act once.
  * @param {object} now
  * @param {string} now.state the mixer's state ("off" | "connecting" | "converting" | "own-manual" | "own-fault")
  * @param {number|null} now.ownSinceMs when the current own-voice state began (or the call connected, if later)
