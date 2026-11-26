@@ -5,11 +5,14 @@
   --muted: #5f5f5a;
   --line: #deded8;
   --accent: #1f6f5c;
+  /* Button labels on --accent: 6.0:1 here, 8.1:1 in dark mode (white would be 2.1:1 there). */
+  --on-accent: #ffffff;
   --warn: #8a5a00;
   --error: #a4262c;
   color-scheme: light dark;
 }
 
+/* WebView2 follows the Windows theme, so the app gets this on a laptop in dark mode. */
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161615;
@@ -18,6 +21,7 @@
     --muted: #a5a59f;
     --line: #383834;
     --accent: #5cc4a6;
+    --on-accent: #0b1f1a;
     --warn: #e0b050;
     --error: #ff7b80;
   }
@@ -61,14 +65,16 @@ input {
 }
 button {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: 0;
   border-radius: 6px;
   padding: 6px 14px;
   cursor: pointer;
 }
 button.quiet { background: transparent; color: var(--accent); border: 1px solid var(--line); }
-button:disabled { opacity: 0.4; cursor: default; }
+/* Grey rather than faded: fading drops the label to under 2:1 in light mode;
+   --muted on --line stays at 4.7:1 in both themes. */
+button:disabled { background: var(--line); color: var(--muted); cursor: default; }
 
 .row { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 8px 0; }
 .hint { color: var(--muted); font-size: 0.9rem; }

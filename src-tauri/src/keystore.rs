@@ -78,16 +78,24 @@ pub fn tail(key: &str) -> String {
 }
 
 /// A pasted key, trimmed; an error a person can act on when it can't be a key.
+/// The Sanas Console shows a key only once, so the advice is to paste it again
+/// from where the person saved it, never to copy it from the Console.
 pub fn clean_key(raw: &str) -> Result<String, String> {
     let key = raw.trim();
     if key.is_empty() {
-        return Err("Paste the key from the Sanas Console first.".into());
+        return Err("Paste the key first, from where you saved it (for example your password manager).".into());
     }
     if key.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("That key contains spaces or invisible characters: copy it again from the Sanas Console.".into());
+        return Err(
+            "That key contains spaces or invisible characters: paste it again from where you saved it (for example your password manager)."
+                .into(),
+        );
     }
     if key.chars().count() < 16 {
-        return Err("That is too short for a Sanas API key: copy the whole key from the Sanas Console.".into());
+        return Err(
+            "That is too short for a Sanas API key: paste the whole key again from where you saved it (for example your password manager)."
+                .into(),
+        );
     }
     Ok(key.to_string())
 }
@@ -120,5 +128,14 @@ mod tests {
         assert!(clean_key("sk_test 1234567890abcdef").is_err());
         assert!(clean_key("sk_\u{16}1234567890abcdef").is_err());
         assert!(clean_key("short").is_err());
+    }
+
+    #[test]
+    fn clean_key_errors_send_the_person_to_their_saved_copy() {
+        for raw in ["", "sk_test 1234567890abcdef", "short"] {
+            let err = clean_key(raw).unwrap_err();
+            assert!(err.contains("from where you saved it"), "{err}");
+            assert!(!err.contains("Console"), "the Console shows a key only once: {err}");
+        }
     }
 }

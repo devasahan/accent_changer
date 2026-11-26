@@ -40,7 +40,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - name: Frontend into dist/ (the Rust build embeds it)
+      - name: Frontend into dist/ (the Rust build below embeds it)
         run: node scripts/copy-frontend.mjs
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,9 +48,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # tauri/custom-protocol, as `tauri build` adds it for the installer. Without
+      # it tauri compiles in dev mode: the page comes from devUrl, nothing from
+      # dist/ is embedded and the CSP isn't processed, so CI would never compile
+      # what the installer ships.
       - name: Clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --features tauri/custom-protocol -- -D warnings
       - name: Tests
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --features tauri/custom-protocol

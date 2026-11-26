@@ -10,7 +10,8 @@
 <body>
   <header>
     <h1>Accent Changer · Diagnostics</h1>
-    <p>This test build checks that the app works on your laptop. Do steps 1 to 4, then press <strong>Copy results</strong> and send them with your notes. It uses no Sanas minutes.</p>
+    <p>This test build checks that the app works on your laptop. It uses no Sanas minutes.</p>
+    <p>Do steps 1 to 4, then press <strong>Copy results</strong> and paste them into your message <strong>before you close the app</strong>: it forgets them when it closes. After you open it again, press <strong>Check the microphone</strong> and <strong>Connect only</strong> once more, then copy the results again and paste them under the first ones.</p>
     <p id="status" role="status" data-kind="info">Loading…</p>
   </header>
   <main>
@@ -30,11 +31,11 @@
       <h2>3 · Sanas key</h2>
       <p id="keyInfo" class="hint"></p>
       <div class="row">
-        <label>API key from the Sanas Console (paste it once)
+        <label>Sanas API key (paste it once, from your password manager)
           <input id="key" type="password" autocomplete="off" spellcheck="false">
         </label>
         <button id="btnSaveKey" type="button">Save key</button>
-        <button id="btnDeleteKey" type="button" class="quiet">Remove key</button>
+        <button id="btnDeleteKey" type="button" class="quiet" disabled>Remove key</button>
       </div>
       <p class="hint">The key is checked with Sanas, then kept in Windows Credential Manager. It is never shown again, and never saved in a file.</p>
     </section>
@@ -48,6 +49,7 @@
 
     <section>
       <h2>5 · Copy results</h2>
+      <p class="hint">The app keeps the results only while it is open.</p>
       <p class="row">
         <button id="btnCopy" type="button">Copy results</button>
         <span id="copyInfo" class="hint"></span>
