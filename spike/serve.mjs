@@ -52,8 +52,18 @@ export const CSP = [
 ].join("; ");
 
 // The app's own CSP, from the Tauri config: Edge dev mode serves the app's
-// pages (src/) under exactly the policy they get inside the app.
-export const APP_CSP = JSON.parse(readFileSync(path.join(ROOT, "src-tauri", "tauri.conf.json"), "utf8")).app.security.csp;
+// pages (src/) under exactly the policy they get inside the app. Without a
+// readable config (a partial copy of the repo), they get the probe's policy:
+// the probe page itself never depends on it.
+export const APP_CSP = (() => {
+  try {
+    const csp = JSON.parse(readFileSync(path.join(ROOT, "src-tauri", "tauri.conf.json"), "utf8")).app?.security?.csp;
+    if (typeof csp === "string" && csp.trim()) return csp;
+  } catch {
+    // missing or malformed: fall through
+  }
+  return CSP;
+})();
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", ...headers });
@@ -335,12 +345,17 @@ const allowsOrigin = (headers, origin) => {
   return value === "*" || value === origin;
 };
 
-/** Browsers need Authorization listed by name: a "*" there does not cover it. */
-const allowsAuthorization = (headers) =>
-  (headers.get("access-control-allow-headers") ?? "")
-    .split(",")
-    .map((h) => h.trim().toLowerCase())
-    .includes("authorization");
+/**
+ * How a preflight answer lets the Authorization header through: "named"
+ * (listed by name), "wildcard" (a "*": Chromium, so Edge and WebView2,
+ * accept that for requests without credentials, like the SDK's; the spec
+ * and Firefox don't), or null (not at all).
+ */
+function authorizationVia(headers) {
+  const names = (headers.get("access-control-allow-headers") ?? "").split(",").map((h) => h.trim().toLowerCase());
+  if (names.includes("authorization")) return "named";
+  return names.includes("*") ? "wildcard" : null;
+}
 
 /**
  * Ask Sanas for the project's entitlements the way a page on `origin` would
@@ -383,8 +398,12 @@ export async function checkOrigin({ origin, session, fetchImpl = globalThis.fetc
     } else if (!res.ok || !body?.data) {
       result.note = `Sanas answered HTTP ${res.status}`;
     } else {
-      const preflightOk = pre.ok && allowsOrigin(pre.headers, origin) && allowsAuthorization(pre.headers);
+      const via = authorizationVia(pre.headers);
+      const preflightOk = pre.ok && allowsOrigin(pre.headers, origin) && via !== null;
       result.verdict = preflightOk && allowsOrigin(res.headers, origin) ? "accepted" : "no-cors";
+      if (result.verdict === "accepted" && via === "wildcard") {
+        result.note = "accepted via Access-Control-Allow-Headers: * (Edge and WebView2 allow this; stricter browsers would not)";
+      }
     }
   } catch (err) {
     result.note = err?.name === "TimeoutError" ? `no answer within ${timeoutMs / 1000} s` : "could not reach portal-api.sanas.ai";
@@ -423,6 +442,7 @@ export function originReport(results, pageOrigin) {
   const page = by.get(pageOrigin);
   const control = by.get(CONTROL_ORIGIN);
   const appOk = APP_ORIGINS.filter((o) => by.get(o)?.verdict === "accepted");
+  const appVerdicts = APP_ORIGINS.map((o) => by.get(o)?.verdict);
   let conclusion;
   let appReady = null; // true / false when the check could tell, null when it couldn't
   if (page?.verdict === "refused") {
@@ -434,9 +454,15 @@ export function originReport(results, pageOrigin) {
   } else if (appOk.length) {
     appReady = true;
     conclusion = `Good: the app can load its page from ${appOk.join(" and ")}.`;
-  } else {
+  } else if (appVerdicts.every((v) => v === "refused")) {
     appReady = false;
     conclusion = `Sanas refused both app addresses. Add exactly  ${APP_ORIGINS.join("  and  ")}  under Allowed origins (no slash at the end). If the Console won't save them, say so in your results notes.`;
+  } else if (appVerdicts.every((v) => v === "refused" || v === "no-cors")) {
+    appReady = false;
+    conclusion =
+      "Sanas answers the app addresses, but without the CORS headers a browser there needs; adding them again won't help. Say so in your results notes.";
+  } else {
+    conclusion = "Inconclusive: Sanas could not be asked about the app addresses (see the lines above). Start the server again to retry.";
   }
   return { lines, conclusion, appReady };
 }
@@ -570,6 +596,10 @@ async function main() {
     for (const line of originCheck.lines) console.log(line);
     console.log(originCheck.conclusion);
     console.log("(The page saves this check in its results JSON.)");
+  } else if (key) {
+    const reason = "the key could not be checked with Sanas when the server started";
+    originCheck = { ran: false, reason };
+    console.log(`Address check skipped: ${reason}. Start the server again to run it.`);
   }
   console.log("");
   console.log(`Accent Changer spike is running. Open  http://localhost:${server.port}/spike/  in Microsoft Edge or Chrome.`);

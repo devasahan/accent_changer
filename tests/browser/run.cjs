@@ -56,6 +56,38 @@ async function main() {
     ],
   });
   const context = await browser.newContext({ acceptDownloads: true });
+  // "Fake Audio Input 2" plays as another app's microphone would: 250 ms late.
+  // Every microphone gets a volume the test can turn down: silence (you stop
+  // talking, and the "app" falls silent 250 ms later).
+  await context.addInitScript(() => {
+    const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    window.__micGains = [];
+    navigator.mediaDevices.getUserMedia = async (constraints) => {
+      const stream = await original(constraints);
+      const id = constraints?.audio?.deviceId?.exact;
+      const label = id ? (await navigator.mediaDevices.enumerateDevices()).find((d) => d.deviceId === id)?.label ?? "" : "";
+      const ctx = new AudioContext({ sampleRate: 48000 });
+      const source = ctx.createMediaStreamSource(stream);
+      const out = ctx.createMediaStreamDestination();
+      const gain = ctx.createGain();
+      window.__micGains.push(gain);
+      if (/Fake Audio Input 2/.test(label)) {
+        const delay = ctx.createDelay(1);
+        delay.delayTime.value = 0.25;
+        source.connect(gain).connect(delay).connect(out);
+      } else {
+        source.connect(gain).connect(out);
+      }
+      const track = out.stream.getAudioTracks()[0];
+      const stop = track.stop.bind(track);
+      track.stop = () => {
+        stop();
+        stream.getTracks().forEach((t) => t.stop());
+        ctx.close().catch(() => {});
+      };
+      return out.stream;
+    };
+  });
   const page = await context.newPage();
   const problems = [];
   let expectErrors = false;
@@ -73,6 +105,7 @@ async function main() {
   const waitRuns = (n, timeout) => page.waitForFunction((k) => window.__spike.state.runs.length >= k, n, { timeout });
   const waitIdle = (timeout) => page.waitForFunction(() => window.__spike.state.mode === "idle", null, { timeout });
   const lastRun = () => spike(() => window.__spike.state.runs.at(-1));
+  const micVolume = (v) => spike((x) => window.__micGains.forEach((g) => (g.gain.value = x)), v);
 
   try {
     await page.goto(`${base}/spike/`);
@@ -121,9 +154,13 @@ async function main() {
     check((await openSessions()) === 0, "the run's session is closed afterwards");
 
     // 4 · rate and play
-    await page.locator("#utts li").first().locator("input[type=checkbox]").evaluateAll((boxes) => boxes.forEach((b) => b.click()));
+    check((await page.locator("#score").textContent()) === "–" && (await lastRun()).rating.score10 === null, "a run nobody rated is unrated, not 0/10");
+    check((await page.locator("#utts li").first().locator("input[type=checkbox]").count()) === 4, "each line has four boxes, “sounds American” included");
+    await page.locator("#utts li").first().locator("input[type=checkbox]").first().click();
+    check((await page.locator("#score").textContent()) === "0.0", "one box alone doesn't count the line");
+    await page.locator("#utts li").first().locator("input[type=checkbox]").evaluateAll((boxes) => boxes.slice(1).forEach((b) => b.click()));
     const score = Number(await page.locator("#score").textContent());
-    check(score > 0, "ticking all three boxes on a line raises the score", `${score}`);
+    check(score > 0, "ticking all four boxes on a line raises the score", `${score}`);
     const stored = await spike(() => window.__spike.state.runs[0].rating);
     check(stored.score10 === score && stored.perUtterance[0].natural, "the rating is stored with run 1", JSON.stringify(stored).slice(0, 200));
     check(/Rating run 1/.test(await page.locator("#rateFor").textContent()), "the page says which run is being rated");
@@ -144,12 +181,51 @@ async function main() {
     const live = await lastRun();
     check(live.kind === "live" && live.ok, "live run recorded", liveText);
     check(
-      Number.isFinite(live.quietLongestSec) && typeof live.convertedAfterQuiet === "boolean" && "speechAfterLastConversionSec" in live,
-      "the live run keeps what the idle test needs",
-      JSON.stringify({ q: live.quietLongestSec, c: live.convertedAfterQuiet, s: live.speechAfterLastConversionSec }),
+      live.speechAtSec.length > 0 && live.heardAtSec.length > 0 && Number.isFinite(live.silenceLongestSec) && live.silenceLongestSec < 10,
+      "the live run keeps both timelines for the quiet test",
+      JSON.stringify({ speech: live.speechAtSec, heard: live.heardAtSec, silence: live.silenceLongestSec }),
     );
     check(live.delayMs >= MOCK_DELAY_MS && live.delayMs < MOCK_DELAY_MS + 150, "live delay measured from the microphone", `${live.delayMs} ms`);
     check((await openSessions()) === 0, "Stop closed the live session");
+
+    // 5a · the quiet test: 14 s of silence, then speech. The converted voice comes back...
+    const quietCall = async ({ engineGoesQuiet }) => {
+      await page.click("#btnLive");
+      await page.waitForFunction(() => window.__spike.state.mode === "live", null, { timeout: 10000 });
+      await page.waitForTimeout(4000);
+      await micVolume(0);
+      await page.waitForTimeout(14000);
+      if (engineGoesQuiet) await spike(() => (window.__spike.state.live.handle.fromEngine.mediaStream.getAudioTracks()[0].enabled = false));
+      await micVolume(1);
+      await page.waitForTimeout(10000);
+      await page.click("#btnStopLive");
+      await waitIdle(10000);
+      return lastRun();
+    };
+    const back = await quietCall({ engineGoesQuiet: false });
+    check(
+      back.silenceLongestSec >= 12 && back.silenceLongestSec <= 20 && back.convertedBackAfterSec !== null && back.convertedBackAfterSec <= 6,
+      "quiet test: the converted voice comes back at once after a silence",
+      JSON.stringify({ silence: back.silenceLongestSec, resumed: back.speechResumedAtSec, after: back.convertedBackAfterSec }),
+    );
+    check(/came back at once/.test(await status()), "and the page says so", await status());
+    // ...or it doesn't: the call stays up but nothing is converted any more.
+    const gone = await quietCall({ engineGoesQuiet: true });
+    check(
+      gone.silenceLongestSec >= 12 && gone.speechResumedAtSec !== null && gone.convertedBackAfterSec === null,
+      "quiet test: speech after the silence with nothing converted is told apart from silence",
+      JSON.stringify({ silence: gone.silenceLongestSec, resumed: gone.speechResumedAtSec, after: gone.convertedBackAfterSec }),
+    );
+    check(/did not come back/.test(await status()) && (await page.locator("#status").getAttribute("data-kind")) === "warn", "and the page warns", await status());
+    // Nothing converted at all while you speak: not "no speech detected".
+    await page.click("#btnLive");
+    await page.waitForFunction(() => window.__spike.state.mode === "live", null, { timeout: 10000 });
+    await spike(() => (window.__spike.state.live.handle.fromEngine.mediaStream.getAudioTracks()[0].enabled = false));
+    await page.waitForTimeout(8000);
+    await page.click("#btnStopLive");
+    await waitIdle(10000);
+    const mute = await lastRun();
+    check(!mute.ok && mute.reason === "you spoke, but no converted speech came back", "a muted engine while you speak is reported as such", mute.reason);
 
     // 5b · Stop while live is still connecting: nothing may stay open
     await page.fill("#mockConnect", "3000");
@@ -243,14 +319,22 @@ async function main() {
     await page.dblclick("#btnRead");
     await page.waitForFunction(() => window.__spike.state.mode === "read", null, { timeout: 10000 });
     check(await page.locator("#btnStopRead").isEnabled(), "Stop is available while reading");
-    await page.waitForTimeout(9000);
-    const readLevel = await page.locator("#readLevelA").evaluate((m) => m.value);
+    let readLevel = -60;
+    for (let i = 0; i < 30; i++) {
+      await page.waitForTimeout(300);
+      readLevel = Math.max(readLevel, await page.locator("#readLevelA").evaluate((m) => m.value));
+    }
+    // Like a person: stop talking, then press Stop. The page keeps listening for the app's last words.
+    await micVolume(0);
+    await page.waitForTimeout(400);
     await page.click("#btnStopRead");
     await waitIdle(15000);
+    await micVolume(1);
     const read = await lastRun();
     check((await spike(() => window.__spike.state.runs.length)) === runsBeforeRead + 1, "a double click on Read the script made one run");
     check(read.kind === "read" && read.ok && read.engine === two.label, "the read-aloud run is analysed like a Sanas run", JSON.stringify({ kind: read.kind, ok: read.ok, reason: read.reason, engine: read.engine }));
-    check(Math.abs(read.delayMs) < 1000 && read.utterances.length >= 3, "it has a delay and lines", `${read.delayMs} ms, ${read.utterances.length} lines`);
+    check(Math.abs(read.delayMs - 250) < 60 && read.utterances.length >= 3, "it measures the other app's 250 ms delay, the right way round", `${read.delayMs} ms, ${read.utterances.length} lines`);
+    check(read.gapCount === 0 && read.durationSec >= 12, "and no gap at the end: Stop waits 3 s for the app's last words", JSON.stringify({ gaps: read.gaps, sec: read.durationSec }));
     check(readLevel > -60, "the level meters move while reading", String(readLevel));
     check(read.settings.engine === "device" && read.settings.device === two.label, "it keeps the device it measured");
     check(/read aloud/.test(await page.locator("#runs tbody tr").last().textContent()), "the table marks it as read aloud");
@@ -262,14 +346,77 @@ async function main() {
     await page.selectOption("#rateRun", "1");
     check(/Rating run 1/.test(await page.locator("#rateFor").textContent()), "picking run 1 rates run 1 again");
     check((await page.locator("#utts li").first().locator("input[type=checkbox]").first().isChecked()), "run 1 kept its ticks");
+    check(await page.locator("#blindWords").isEnabled(), "the blind-listener boxes are open for a run with lines");
     await page.fill("#blindWords", "4");
+    await page.fill("#blindUs", "3");
     await page.fill("#blindVoice", "9");
-    await page.locator("#blindVoice").blur();
-    const blind = await spike(() => window.__spike.state.runs[0].rating.blind);
-    check(blind && blind.allWordsRight === 4 && blind.soundsLikeYou === 5 && blind.lines === 5, "blind-listener counts are stored with run 1 (capped at 5)", JSON.stringify(blind));
-    check((await page.locator("#blindVoice").inputValue()) === "5", "the capped count is shown");
+    let blind = await spike(() => window.__spike.state.runs[0].rating.blind);
+    check(
+      blind && blind.lines === 5 && blind.allWordsRight === 4 && blind.soundsAmerican === 3 && blind.soundsLikeYou === null,
+      "blind-listener counts are stored with run 1; a count above the lines played is not",
+      JSON.stringify(blind),
+    );
+    check(/from 0 to the number of lines played/.test(await page.locator("#blindInfo").textContent()), "and the page says why, instead of changing it");
+    await page.fill("#blindVoice", "5");
+    blind = await spike(() => window.__spike.state.runs[0].rating.blind);
+    check(blind.soundsLikeYou === 5 && /Saved with run 1/.test(await page.locator("#blindInfo").textContent()), "a corrected count is saved");
     await page.selectOption("#rateRun", String(runsBeforeRead + 1));
     check((await page.locator("#blindWords").inputValue()) === "", "the read-aloud run has its own blind-listener counts");
+
+    // 7c · long check of another app's microphone (the interview rehearsal)
+    await page.click("#btnWatch");
+    await page.waitForFunction(() => window.__spike.state.mode === "watch", null, { timeout: 10000 });
+    check((await page.locator("#btnRun").isDisabled()) && (await page.locator("#btnStopWatch").isEnabled()), "the long check holds the page until Stop");
+    await page.waitForTimeout(10000);
+    await page.click("#btnStopWatch");
+    await waitIdle(10000);
+    const watch = await lastRun();
+    check(
+      watch.kind === "watch" && watch.ok && Math.abs(watch.delayMedianMs - 250) < 60 && watch.speechAtSec.length > 0,
+      "the long check follows the other app's delay",
+      JSON.stringify({ kind: watch.kind, ok: watch.ok, delay: watch.delayMedianMs, reason: watch.reason }),
+    );
+    check(/long check/.test(await page.locator("#runs tbody tr").last().textContent()), "the table marks it as a long check");
+
+    // 4c · only the newest runs keep their sound: runs with nothing to rate go first
+    const kept = await spike(() => {
+      const s = window.__spike.state;
+      const before = s.keepAudioRuns;
+      const saved = new Map(s.audio);
+      const lastBefore = s.last;
+      s.keepAudioRuns = 2;
+      s.audio.clear();
+      const fake = (number, ok) => ({
+        number,
+        analysis: { ok, utterances: [], delayMs: 0 },
+        run: { engine: "x", kind: "script", settings: { engine: "mock" }, rating: { rated: false, perUtterance: [], blind: null }, reason: ok ? null : "x" },
+      });
+      s.audio.set(1, fake(1, true));
+      s.audio.set(2, fake(2, false));
+      const quiet = window.__spike.keepAudio(fake(3, true));
+      const afterFailed = [...s.audio.keys()];
+      const warned = window.__spike.keepAudio(fake(4, true));
+      const afterGood = [...s.audio.keys()];
+      s.keepAudioRuns = before;
+      s.audio.clear();
+      saved.forEach((v, k) => s.audio.set(k, v));
+      s.last = lastBefore;
+      window.__spike.refreshRating();
+      return { afterFailed, afterGood, quiet, warned };
+    });
+    check(
+      kept.afterFailed.join() === "1,3" && kept.quiet === "" && kept.afterGood.join() === "3,4" && /Run 1's sound was let go/.test(kept.warned),
+      "a run with nothing to rate goes before a good one, and losing a good one is said in the status",
+      JSON.stringify(kept),
+    );
+    await page.selectOption("#rateRun", "1");
+
+    // 8a · a server that stopped answering must not block saving the results
+    await page.route("**/origin-check", () => {});
+    const hung = page.waitForEvent("download", { timeout: 5000 }).then(() => true, () => false);
+    await page.click("#btnSaveJson");
+    check(await hung, "the results still download when the server doesn't answer");
+    await page.unroute("**/origin-check");
 
     // 8 · downloads
     const [jsonDl] = await Promise.all([page.waitForEvent("download"), page.click("#btnSaveJson")]);
@@ -278,7 +425,7 @@ async function main() {
     const text = fs.readFileSync(jsonPath, "utf8");
     const results = JSON.parse(text);
     const runCount = await spike(() => window.__spike.state.runs.length);
-    check(results.schema === 3 && results.runs.length === runCount && runCount >= 6, "results JSON has every run", `${results.runs.length} of ${runCount}`);
+    check(results.schema === 3 && results.runs.length === runCount && runCount >= 10, "results JSON has every run", `${results.runs.length} of ${runCount}`);
     check(results.originCheck?.appReady === true && Array.isArray(results.pairs) && results.pairs.length === 1, "it holds the address check and the quick check");
     check(results.runs[0].rating?.perUtterance.length === results.runs[0].utterances.length, "each script run carries its own rating");
     check(
@@ -305,6 +452,19 @@ async function main() {
     expectErrors = false;
     await waitIdle(5000);
     check(await page.locator("#btnRun").isEnabled(), "page stays usable after the error");
+
+    // Part 2 opens the page again days later: your script and settings come back
+    await page.fill("#script", "My own first line.\nMy own second line.");
+    await page.fill("#model", "AT5.2_Feminine");
+    await page.selectOption("#rate", "48000");
+    await page.reload();
+    await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    check(
+      (await page.locator("#script").inputValue()) === "My own first line.\nMy own second line." &&
+        (await page.locator("#model").inputValue()) === "AT5.2_Feminine" &&
+        (await page.locator("#rate").inputValue()) === "48000",
+      "the page remembers your script, model name and sample rate",
+    );
   } catch (err) {
     check(false, "scenario finished", err.stack || err.message);
     await page.screenshot({ path: path.join(OUT, "failure.png"), fullPage: true }).catch(() => {});

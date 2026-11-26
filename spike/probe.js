@@ -19,10 +19,19 @@ const TAIL_SEC = 2.5; // keep recording after the script ends, to catch the dela
 const DELAY_LIMIT_MS = 380; // GO needs a median at or under this (spike/FINDINGS.md)
 const LONG_MAX_MIN = 90; // the README asks for one 65-minute run
 const READ_MAX_SEC = 300; // "Read the script" stops by itself after 5 minutes
-const KEEP_AUDIO_RUNS = 6; // runs whose audio stays playable here (25-50 MB each)
+const READ_TAIL_SEC = 3; // after Stop, "Read the script" listens this long for the app's last words
+const KEEP_AUDIO_RUNS = 6; // runs whose sound stays playable here (25-50 MB each)
 const SPEECH_DB = -45; // a level above this counts as speech for the live and read hints
 // Other apps' virtual microphones: never picked as your "real" microphone by default.
 const VIRTUAL_MIC = /cable output|krisp|sanas|voicemeeter|steam streaming/i;
+const SAME_MIC =
+  "Pick the other app's microphone (for example “Krisp Microphone”) as the other microphone in step 7: it is now the same as yours.";
+const RATINGS = [
+  ["natural", "sounds natural"],
+  ["voice", "still my voice"],
+  ["words", "every word right"],
+  ["american", "sounds American"],
+];
 const NO_AUDIO = /no converted audio/;
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -30,15 +39,17 @@ const round = (v, digits = 0) => (Number.isFinite(v) ? Number(v.toFixed(digits))
 
 const state = {
   ctx: null,
-  mode: "idle", // idle | busy | recording | running | starting | live | long | pair | read
+  mode: "idle", // idle | busy | recording | running | starting | live | long | pair | read | watch
   recording: null,
   recordingSession: null,
   runs: [],
   last: null, // the run being rated and played: { ref, sig, analysis, sampleRate, run, number }
-  audio: new Map(), // run number → the same, for the newest KEEP_AUDIO_RUNS runs with audio
+  audio: new Map(), // run number → the same, for the runs whose sound is still kept
+  keepAudioRuns: KEEP_AUDIO_RUNS,
   pairs: [], // step 7 quick checks
   pairChosen: false, // the other-microphone choice was made by hand
   read: null, // step 7 "Read the script" while it records
+  watch: null, // step 7 "Long check" while it runs
   originCheck: null, // the server's check of which page addresses Sanas accepts
   live: null,
   liveStart: null, // AbortController while live is starting
@@ -51,7 +62,17 @@ const state = {
   log: [],
   playing: null,
 };
-window.__spike = { state, results: () => buildResults(), openSessions: () => state.sessions.size };
+window.__spike = {
+  state,
+  results: () => buildResults(),
+  openSessions: () => state.sessions.size,
+  // for the browser test
+  keepAudio: (e) => keepAudio(e),
+  refreshRating: () => {
+    renderRateChoices();
+    renderUtterances();
+  },
+};
 
 // ---------- status, log, buttons ----------
 
@@ -88,6 +109,8 @@ const BUTTONS = {
   btnPair: () => state.mode === "idle",
   btnRead: () => state.mode === "idle",
   btnStopRead: () => state.mode === "read",
+  btnWatch: () => state.mode === "idle",
+  btnStopWatch: () => state.mode === "watch",
   btnSaveJson: () => true,
   btnSaveWav: () => Boolean(state.last || state.recording),
 };
@@ -125,6 +148,31 @@ function action(id, mode, fn) {
     }
   });
 }
+
+// ---------- settings this browser remembers ----------
+// Part 2 runs days after Part 1 on a freshly opened page: your own script, the
+// model name, the sample rate and your device choices come back. (Per browser,
+// on this PC only; nothing is sent anywhere.)
+
+const STORE = "accentChanger.";
+
+function remember(key, value) {
+  try {
+    localStorage.setItem(STORE + key, value);
+  } catch {
+    // storage blocked: the page still works, it just won't remember
+  }
+}
+
+function recall(key) {
+  try {
+    return localStorage.getItem(STORE + key);
+  } catch {
+    return null;
+  }
+}
+
+const usingExampleScript = () => $("script").value.trim() === DEFAULT_SCRIPT.trim();
 
 // ---------- audio plumbing ----------
 
@@ -393,7 +441,12 @@ async function listDevices() {
     const options = list.map((d, i) => new Option(d.label || `${d.kind} ${i + 1}`, d.deviceId));
     if (defaultLabel) options.unshift(new Option(defaultLabel, ""));
     select.replaceChildren(...options);
-    if ([...select.options].some((o) => o.value === previous)) select.value = previous;
+    const has = (value) => value != null && [...select.options].some((o) => o.value === value);
+    if (has(previous) && (previous !== "" || !has(recall(select.id)))) select.value = previous;
+    else if (has(recall(select.id))) {
+      select.value = recall(select.id);
+      if (select.id === "pairDevice") state.pairChosen = true;
+    }
   };
   const inputs = devices.filter((d) => d.kind === "audioinput");
   fill($("mic"), inputs);
@@ -430,6 +483,9 @@ action("btnConnect", "busy", async () => {
 
 $("out").addEventListener("change", () => applySink());
 $("pairDevice").addEventListener("change", () => (state.pairChosen = true));
+for (const id of ["mic", "out", "pairDevice", "model", "rate"]) $(id).addEventListener("change", () => remember(id, $(id).value));
+$("model").addEventListener("input", () => remember("model", $("model").value));
+$("script").addEventListener("input", () => remember("script", $("script").value));
 $("engine").addEventListener("change", refreshButtons);
 navigator.mediaDevices?.addEventListener?.("devicechange", () => listDevices().catch(() => {}));
 
@@ -457,7 +513,10 @@ action("btnRecord", "busy", async () => {
   }
   state.recordingSession = session;
   state.mode = "recording";
-  setStatus("Recording: read the script, then press Stop.");
+  setStatus(
+    "Recording: read the script, then press Stop." +
+      (usingExampleScript() ? " (This is the example script: for the real test, put your own words in the box first.)" : ""),
+  );
 });
 
 action("btnStopRecord", "busy", async () => {
@@ -619,7 +678,7 @@ function renderRuns() {
       const spread = r.ok ? `${Math.round(r.delayMedianMs ?? NaN)} / ${Math.round(r.delayP95Ms ?? NaN)}` : "–";
       const cells = [
         String(i + 1),
-        r.kind === "script" ? r.engine : `${r.engine} (${r.kind === "read" ? "read aloud" : r.kind})`,
+        r.kind === "script" ? r.engine : `${r.engine} (${{ read: "read aloud", watch: "long check" }[r.kind] ?? r.kind})`,
         r.settings.engine === "sanas" ? `${r.settings.sampleRate / 1000} kHz` : "–",
         r.ok ? String(Math.round(r.delayMs)) : r.reason ?? "failed",
         r.kind === "long" && r.ok ? `${spread} (max ${Math.round(r.delayMaxMs ?? NaN)})` : spread,
@@ -655,21 +714,18 @@ action("btnRun", "running", async () => {
     setStatus(`Sending the recording through ${engine.name} at live speed…`);
     const result = await runOnce({ handle, ctx, onProgress: (p) => ($("runProgress").value = p) });
     const summary = summarize(result, { kind: "script", engine: engine.name, warmupMs: handle.warmupMs }, cfg);
-    summary.rating = {
-      score10: null,
-      perUtterance: summary.utterances.map(() => ({ natural: false, voice: false, words: false })),
-    };
+    summary.rating = newRating(summary.utterances.length);
     state.runs.push(summary);
-    keepAudio({ ref: result.ref, sig: result.sig, analysis: result.analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length });
+    const letGo = keepAudio({ ref: result.ref, sig: result.sig, analysis: result.analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length });
     renderRuns();
     $("runProgress").value = 1;
     const n = state.runs.length;
     if (result.droppedReason) {
-      setStatus(`Run ${n}: ${engine.name} dropped the call partway (${result.droppedReason}). Its numbers cover only the part before the drop.`, "error");
-    } else if (!summary.ok) setStatus(`Run ${n} finished, but: ${summary.reason}.`, "error");
+      setStatus(`Run ${n}: ${engine.name} dropped the call partway (${result.droppedReason}). Its numbers cover only the part before the drop.${letGo}`, "error");
+    } else if (!summary.ok) setStatus(`Run ${n} finished, but: ${summary.reason}.${letGo}`, "error");
     else {
       $("runInfo").textContent = `Delay ${Math.round(summary.delayMs)} ms, ${summary.gapCount} gap(s).`;
-      setStatus(`Run ${n} done: delay ${Math.round(summary.delayMs)} ms. Listen and rate below.${note}`, note ? "warn" : "ok");
+      setStatus(`Run ${n} done: delay ${Math.round(summary.delayMs)} ms. Listen and rate below.${note}${letGo}`, note || letGo ? "warn" : "ok");
     }
   } finally {
     await handle.stop();
@@ -709,18 +765,39 @@ async function play(samples) {
   refreshButtons();
 }
 
-/** Keep a run's audio playable (the newest KEEP_AUDIO_RUNS runs) and rate it next. */
+/** A new run's rating: nothing ticked, and not rated until a box is ticked. */
+function newRating(lines) {
+  return {
+    rated: false,
+    score10: null,
+    perUtterance: Array.from({ length: lines }, () => Object.fromEntries(RATINGS.map(([key]) => [key, false]))),
+    blind: null,
+  };
+}
+
+/**
+ * Keep a run's sound playable and rate it next. Only the newest few runs keep
+ * their sound (memory): runs with nothing to rate go first. Returns a warning
+ * for the status line when a run that could still be rated or played to
+ * the blind listener had to go, else "".
+ */
 function keepAudio(entry) {
   state.audio.set(entry.number, entry);
-  for (const number of state.audio.keys()) {
-    if (state.audio.size <= KEEP_AUDIO_RUNS) break;
-    state.audio.delete(number);
-    log(`Run ${number}: its audio was let go to save memory (its numbers and ratings stay).`);
+  let warning = "";
+  while (state.audio.size > state.keepAudioRuns) {
+    const others = [...state.audio.values()].filter((e) => e !== entry);
+    const victim = others.find((e) => !e.analysis?.ok) ?? others[0];
+    state.audio.delete(victim.number);
+    if (victim.analysis?.ok) {
+      warning = ` Run ${victim.number}'s sound was let go to save memory: it can no longer be played for rating or the blind test (its numbers and ratings stay).`;
+      log(warning.trim());
+    } else log(`Run ${victim.number} (nothing to rate) was let go to save memory.`);
   }
   stopPlayback();
   state.last = entry;
   renderRateChoices();
   renderUtterances();
+  return warning;
 }
 
 function runLabel(entry) {
@@ -744,23 +821,39 @@ $("rateRun").addEventListener("change", () => {
   renderUtterances();
 });
 
-/** A blind-listener count: a whole number from 0 to 5, or null when empty. */
-function blindCount(id) {
+const BLIND = [
+  ["blindWords", "allWordsRight"],
+  ["blindVoice", "soundsLikeYou"],
+  ["blindUs", "soundsAmerican"],
+];
+
+/** A whole number typed in a box: null when empty, NaN when it isn't one. */
+function wholeNumber(id) {
   const raw = $(id).value.trim();
-  if (raw === "" || !Number.isFinite(Number(raw))) return null;
-  return Math.min(5, Math.max(0, Math.round(Number(raw))));
+  if (raw === "") return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : NaN;
 }
 
-for (const id of ["blindWords", "blindVoice"]) {
-  $(id).addEventListener("input", () => {
-    const rating = state.last?.run.rating;
-    if (rating) rating.blind = { lines: 5, allWordsRight: blindCount("blindWords"), soundsLikeYou: blindCount("blindVoice") };
-  });
-  $(id).addEventListener("change", () => {
-    const n = blindCount(id);
-    $(id).value = n == null ? "" : String(n);
-  });
+/** Store the blind listener's counts with the run being rated; say what is wrong instead of changing it. */
+function saveBlind() {
+  const rating = state.last?.run.rating;
+  if (!rating) return;
+  const lines = wholeNumber("blindLines");
+  let problem = Number.isNaN(lines) || lines === 0 ? "“Lines played” must be a whole number, like 5." : "";
+  const blind = { lines: problem ? null : lines };
+  for (const [id, key] of BLIND) {
+    const n = wholeNumber(id);
+    const bad = Number.isNaN(n) || (n != null && (blind.lines == null || n > blind.lines));
+    if (bad && !problem) problem = "Each count must be a whole number from 0 to the number of lines played.";
+    blind[key] = bad ? null : n;
+  }
+  rating.blind = blind;
+  $("blindInfo").textContent = problem || `Saved with run ${state.last.number}.`;
+  $("blindInfo").dataset.kind = problem ? "warn" : "";
 }
+
+for (const id of ["blindLines", ...BLIND.map(([id]) => id)]) $(id).addEventListener("input", saveBlind);
 
 function slice(samples, startSec, endSec, sampleRate) {
   const a = Math.max(0, Math.round(startSec * sampleRate));
@@ -771,8 +864,9 @@ function slice(samples, startSec, endSec, sampleRate) {
 function updateScore() {
   const rating = state.last?.run.rating;
   const list = rating?.perUtterance ?? [];
-  const good = list.filter((r) => r.natural && r.voice && r.words).length;
-  if (rating) rating.score10 = list.length ? round((good / list.length) * 10, 1) : null;
+  const good = list.filter((r) => RATINGS.every(([key]) => r[key])).length;
+  // A run nobody rated stays unrated ("–"), not 0 out of 10.
+  if (rating) rating.score10 = rating.rated && list.length ? round((good / list.length) * 10, 1) : null;
   $("score").textContent = rating?.score10 == null ? "–" : rating.score10.toFixed(1);
 }
 
@@ -780,9 +874,10 @@ function renderUtterances() {
   const list = $("utts");
   const last = state.last;
   const blind = last?.run.rating?.blind;
-  $("blindWords").value = blind?.allWordsRight ?? "";
-  $("blindVoice").value = blind?.soundsLikeYou ?? "";
-  $("blindWords").disabled = $("blindVoice").disabled = !last?.run.rating;
+  $("blindLines").value = blind?.lines ?? 5;
+  for (const [id, key] of BLIND) $(id).value = blind?.[key] ?? "";
+  $("blindInfo").textContent = "";
+  for (const id of ["blindLines", ...BLIND.map(([id]) => id)]) $(id).disabled = !last?.analysis?.ok || !last.run.rating;
   if (!last?.analysis?.ok) {
     list.replaceChildren();
     $("rateFor").textContent = last ? `Run ${last.number} has nothing to rate: ${last.run.reason ?? "no result"}.` : "";
@@ -809,12 +904,13 @@ function renderUtterances() {
       conv.textContent = "▶ converted";
       conv.addEventListener("click", () => play(slice(last.sig, u.startSec + lagSec - 0.15, u.endSec + lagSec + 0.25, sampleRate)));
       row.append(label, orig, conv);
-      for (const [key, text] of [["natural", "sounds natural"], ["voice", "still my voice"], ["words", "every word right"]]) {
+      for (const [key, text] of RATINGS) {
         const box = document.createElement("input");
         box.type = "checkbox";
         box.checked = run.rating.perUtterance[i]?.[key] ?? false;
         box.addEventListener("change", () => {
           run.rating.perUtterance[i][key] = box.checked;
+          run.rating.rated = true;
           updateScore();
         });
         const lab = document.createElement("label");
@@ -831,6 +927,96 @@ function renderUtterances() {
 action("btnPlayOrig", null, () => play(state.last.ref));
 action("btnPlayConv", null, () => play(state.last.sig));
 action("btnStopPlay", null, () => stopPlayback());
+
+// ---------- following a call (Live, and step 7's long check) ----------
+
+const clock = (secs) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, "0")}`;
+
+/**
+ * Follows a call while you talk. Every 3 s it looks at the last 12 s of your
+ * microphone and of the converted voice: when converted speech follows
+ * yours, it notes the delay. It also notes when your microphone had speech,
+ * so the quiet test can tell "you were silent" from "nothing came back".
+ * Only the last 12 s are kept, so it can run for an hour.
+ */
+function followCall(ctx, rec) {
+  const t0 = performance.now();
+  const f = { t0, delays: [], heard: [], speech: [], last: null };
+  f.tick = () => {
+    const [ref, sig] = rec.recent(12);
+    const secs = round((performance.now() - t0) / 1000, 1);
+    const est = ref.length > ctx.sampleRate * 4 ? estimateDelay(ref, sig, ctx.sampleRate) : null;
+    f.last = est && est.score >= 0.3 ? est : null;
+    if (f.last) {
+      f.delays.push(f.last.lagMs);
+      f.heard.push(secs);
+    }
+    const last3 = Math.round(ctx.sampleRate * 3);
+    if (ref.length >= last3 && rmsDb(ref.subarray(ref.length - last3)) > SPEECH_DB) f.speech.push(secs);
+    return secs;
+  };
+  return f;
+}
+
+/**
+ * The quiet test: your longest silence in the call (from the start, between
+ * stretches of speech, or until the end), and how many seconds after you
+ * spoke again converted speech came back (null: it didn't, or you stayed
+ * silent until the end).
+ */
+function quietTest(speech, heard, endSec) {
+  let silence = 0;
+  let resumedAt = null;
+  let previous = 0;
+  for (const t of speech) {
+    if (t - previous > silence) {
+      silence = t - previous;
+      resumedAt = t;
+    }
+    previous = t;
+  }
+  if (endSec - previous > silence) {
+    silence = endSec - previous;
+    resumedAt = null;
+  }
+  const back = resumedAt == null ? null : heard.find((t) => t >= resumedAt) ?? null;
+  return {
+    silenceLongestSec: round(silence, 1),
+    speechResumedAtSec: resumedAt,
+    convertedBackAfterSec: back == null ? null : round(back - resumedAt, 1),
+  };
+}
+
+/** What a followed call saves: delays, the quiet test, and both timelines (seconds). */
+function callSummary(f) {
+  const endSec = round((performance.now() - f.t0) / 1000, 1);
+  return {
+    ok: f.delays.length > 0,
+    reason: f.delays.length ? null : f.speech.length ? "you spoke, but no converted speech came back" : "no speech detected",
+    durationSec: endSec,
+    ...quietTest(f.speech, f.heard, endSec),
+    heardAtSec: f.heard,
+    speechAtSec: f.speech,
+    delayMs: round(median(f.delays), 1),
+    delayMedianMs: round(median(f.delays), 1),
+    delayP95Ms: round(percentile(f.delays, 95), 1),
+    delayMaxMs: f.delays.length ? round(Math.max(...f.delays), 1) : null,
+    gapCount: null,
+    longestGapMs: null,
+  };
+}
+
+/** The quiet test in words, when there was a silence of 10 s or more followed by speech. */
+function quietNote(s) {
+  if (s.speechResumedAtSec == null || s.silenceLongestSec < 10) return { text: "", bad: false };
+  const quiet = s.silenceLongestSec >= 90 ? `${(s.silenceLongestSec / 60).toFixed(1)} min` : `${Math.round(s.silenceLongestSec)} s`;
+  if (s.convertedBackAfterSec == null) {
+    return { text: ` Quiet test: after ${quiet} of silence you spoke, but the converted voice did not come back.`, bad: true };
+  }
+  const late = s.convertedBackAfterSec > 6;
+  const when = late ? `only ${Math.round(s.convertedBackAfterSec)} s after you spoke again` : "at once";
+  return { text: ` Quiet test: after ${quiet} of silence the converted voice came back ${when}.`, bad: late };
+}
 
 // ---------- 5 · live ----------
 
@@ -881,25 +1067,13 @@ action("btnLive", "starting", async () => {
   handle.fromEngine.connect(rec.node, 0, 1);
   rec.start();
   const stats = watchStats();
-  const t0 = performance.now();
-  const delays = [];
-  // For the idle test (stay quiet for 15 minutes, then speak): when converted
-  // speech followed yours, and when your microphone last had speech.
-  const track = { heard: [], lastSpeechSec: null };
+  const follow = followCall(ctx, rec);
   const timer = setInterval(() => {
-    const [ref, sig] = rec.recent(12);
-    const est = ref.length > ctx.sampleRate * 4 ? estimateDelay(ref, sig, ctx.sampleRate) : null;
-    const secs = (performance.now() - t0) / 1000;
-    if (est && est.score >= 0.3) {
-      delays.push(est.lagMs);
-      track.heard.push(round(secs, 1));
-    }
-    const last3 = Math.round(ctx.sampleRate * 3);
-    if (ref.length >= last3 && rmsDb(ref.subarray(ref.length - last3)) > SPEECH_DB) track.lastSpeechSec = round(secs, 1);
+    const secs = follow.tick();
     const link = handle.droppedReason ? `dropped (${handle.droppedReason})` : handle.getState();
-    $("liveInfo").textContent = `${secs.toFixed(0)} s · ${handle.engine} ${link} · delay ${est && est.score >= 0.3 ? `${Math.round(est.lagMs)} ms` : "– (speak)"}`;
+    $("liveInfo").textContent = `${clock(secs)} · ${handle.engine} ${link} · delay ${follow.last ? `${Math.round(follow.last.lagMs)} ms` : "– (speak)"}`;
   }, 3000);
-  state.live = { cfg, mic, micNode, handle, rec, stats, timer, t0, delays, track };
+  state.live = { cfg, mic, micNode, handle, rec, stats, timer, follow };
   state.mode = "live";
   setStatus(`Live: speak. Press Stop when done.${note}`, note ? "warn" : "ok");
 });
@@ -915,6 +1089,7 @@ action("btnStopLive", null, async () => {
   refreshButtons();
   try {
     clearInterval(l.timer);
+    l.follow.tick(); // one last look, so a short final stretch of speech counts
     await l.rec.stop();
     l.rec.dispose();
     l.micNode.disconnect();
@@ -923,58 +1098,26 @@ action("btnStopLive", null, async () => {
     const dropped = l.handle.droppedReason;
     await l.handle.stop();
     state.live = null;
-    const endSec = round((performance.now() - l.t0) / 1000, 1);
-    const quiet = longestQuiet(l.track.heard, endSec);
-    const lastHeard = l.track.heard.at(-1);
-    state.runs.push({
+    const summary = {
       at: new Date().toISOString(),
       kind: "live",
       engine: l.handle.engine,
       settings: l.cfg,
-      ok: l.delays.length > 0,
-      reason: l.delays.length ? null : "no speech detected",
       dropped: dropped ?? null,
-      durationSec: endSec,
-      quietLongestSec: quiet.sec,
-      convertedAfterQuiet: quiet.resumed,
-      speechAfterLastConversionSec:
-        l.track.lastSpeechSec != null && lastHeard != null ? round(Math.max(0, l.track.lastSpeechSec - lastHeard), 1) : null,
-      delayMs: round(median(l.delays), 1),
-      delayMedianMs: round(median(l.delays), 1),
-      delayP95Ms: round(percentile(l.delays, 95), 1),
-      delayMaxMs: l.delays.length ? round(Math.max(...l.delays), 1) : null,
-      gapCount: null,
-      longestGapMs: null,
+      ...callSummary(l.follow),
       webrtc: roundStats(webrtc),
       warmupMs: l.handle.warmupMs,
-    });
+    };
+    state.runs.push(summary);
     renderRuns();
-    const quietNote =
-      quiet.sec >= 300
-        ? ` Longest stretch without converted speech: ${(quiet.sec / 60).toFixed(1)} min; converted speech ${quiet.resumed ? "came back after it" : "did not come back after it"}.`
-        : "";
-    if (dropped) setStatus(`Live stopped. ${l.handle.engine} had dropped the call (${dropped}).${quietNote}`, "warn");
-    else setStatus(`Live stopped.${quietNote}`, quietNote && !quiet.resumed ? "warn" : "ok");
+    const quiet = quietNote(summary);
+    if (dropped) setStatus(`Live stopped. ${l.handle.engine} had dropped the call (${dropped}).${quiet.text}`, "warn");
+    else if (!summary.ok) setStatus(`Live stopped: ${summary.reason}.${quiet.text}`, "warn");
+    else setStatus(`Live stopped.${quiet.text}`, quiet.bad ? "warn" : "ok");
   } finally {
     state.mode = "idle";
   }
 });
-
-/**
- * The longest stretch without converted speech in a live call (`heard`:
- * seconds when converted speech followed yours), and whether converted
- * speech came back after it.
- */
-function longestQuiet(heard, endSec) {
-  let best = { sec: 0, resumed: false };
-  let previous = 0;
-  for (const t of heard) {
-    if (t - previous > best.sec) best = { sec: round(t - previous, 1), resumed: true };
-    previous = t;
-  }
-  if (endSec - previous > best.sec) best = { sec: round(endSec - previous, 1), resumed: false };
-  return best;
-}
 
 // ---------- 6 · long stability run ----------
 
@@ -1212,13 +1355,42 @@ action("btnPair", "pair", async () => {
   setStatus(r.ok ? "Measured." : `Could not measure: ${reason}.`, r.ok ? "ok" : "warn");
 });
 
+const plainLabel = (label) => label.replace(/^(default|communications) - /i, "").trim().toLowerCase();
+
+/** True when step 7's other microphone is your own one (by id, or by name under "Default - …"). */
+function sameMicChoice() {
+  const label = (id) => plainLabel($(id).selectedOptions[0]?.textContent ?? "");
+  return $("pairDevice").value === $("mic").value || label("pairDevice") === label("mic");
+}
+
+/** Your microphone and the other one for step 7, refused when both are one physical device. */
+async function openOtherApp() {
+  if (sameMicChoice()) throw new Error(SAME_MIC);
+  const p = await openPair();
+  const group = (stream) => stream.getAudioTracks()[0]?.getSettings().groupId;
+  if (group(p.a) && group(p.a) === group(p.b)) {
+    closePair(p);
+    throw new Error(SAME_MIC);
+  }
+  return p;
+}
+
+/** The settings a step-7 run saves: which devices it compared. */
+function deviceSettings(p) {
+  return {
+    engine: "device",
+    device: p.otherLabel,
+    viaCable: p.viaCable,
+    micLabel: $("mic").selectedOptions[0]?.textContent ?? "",
+    outputLabel: $("out").selectedOptions[0]?.textContent ?? "",
+    defaultOutputRate: state.defaultOutputRate,
+  };
+}
+
 // "Read the script": the whole script read aloud, measured like a Sanas run.
 action("btnRead", "busy", async () => {
-  if ($("pairDevice").value === $("mic").value) {
-    throw new Error("Pick the other app's microphone (for example “Krisp Microphone”) as the other microphone in step 7: it is now the same as yours.");
-  }
   const ctx = await ensureCtx();
-  const p = await openPair();
+  const p = await openOtherApp();
   const r = { ...p, youSpoke: false, otherHeard: false, autoStopped: false };
   try {
     r.na = ctx.createMediaStreamSource(p.a);
@@ -1231,14 +1403,7 @@ action("btnRead", "busy", async () => {
     closePair(p);
     throw err;
   }
-  r.cfg = {
-    engine: "device",
-    device: p.otherLabel,
-    viaCable: p.viaCable,
-    micLabel: $("mic").selectedOptions[0]?.textContent ?? "",
-    outputLabel: $("out").selectedOptions[0]?.textContent ?? "",
-    defaultOutputRate: state.defaultOutputRate,
-  };
+  r.cfg = deviceSettings(p);
   r.rec.start();
   r.t0 = performance.now();
   r.timer = setInterval(() => {
@@ -1258,7 +1423,10 @@ action("btnRead", "busy", async () => {
   }, 200);
   state.read = r;
   state.mode = "read";
-  setStatus(`Recording your microphone and “${p.otherLabel}”. Read the whole script aloud, then press Stop.`);
+  setStatus(
+    `Recording your microphone and “${p.otherLabel}”. Read the whole script aloud, with about a second of pause between lines, then press Stop.` +
+      (usingExampleScript() ? " (This is the example script: for the real comparison, put your own words in step 2's box first.)" : ""),
+  );
 });
 
 action("btnStopRead", "busy", async () => {
@@ -1268,6 +1436,9 @@ action("btnStopRead", "busy", async () => {
   clearInterval(r.timer);
   let recorded;
   try {
+    // Like the Sanas runs: keep listening a moment for the app's last words.
+    $("readInfo").textContent = "Finishing: listening 3 more seconds for the app's last words…";
+    await sleep(READ_TAIL_SEC * 1000);
     recorded = await r.rec.stop();
   } finally {
     r.rec.dispose();
@@ -1291,12 +1462,9 @@ action("btnStopRead", "busy", async () => {
       ? `“${r.otherLabel}” stayed silent`
       : "your microphone picked up no speech";
   }
-  summary.rating = {
-    score10: null,
-    perUtterance: summary.utterances.map(() => ({ natural: false, voice: false, words: false })),
-  };
+  summary.rating = newRating(summary.utterances.length);
   state.runs.push(summary);
-  keepAudio({ ref, sig, analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length });
+  const letGo = keepAudio({ ref, sig, analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length });
   renderRuns();
   const n = state.runs.length;
   if (!analysis.ok) {
@@ -1304,13 +1472,89 @@ action("btnStopRead", "busy", async () => {
     const hint = NO_AUDIO.test(analysis.reason ?? "")
       ? " Is that app running, with your headset as its microphone and accent conversion on?"
       : " Check that your headset microphone is picked in step 1.";
-    setStatus(`Run ${n}: could not measure: ${summary.reason}.${hint}`, "error");
+    setStatus(`Run ${n}: could not measure: ${summary.reason}.${hint}${letGo}`, "error");
     return;
   }
   const seconds = ref.length / ctx.sampleRate;
   $("readInfo").textContent = `${r.otherLabel}: ${Math.round(summary.delayMs)} ms later than your microphone, ${summary.gapCount} gap(s).`;
-  const short = seconds < 30 ? " It was short: read the whole script (about a minute) so the numbers mean something." : "";
-  setStatus(`Run ${n} (${r.otherLabel}, read aloud): delay ${Math.round(summary.delayMs)} ms. Rate it in step 4.${short}`, short ? "warn" : "ok");
+  const scriptLines = $("script").value.split("\n").filter((l) => l.trim()).length;
+  const merged =
+    summary.utterances.length < scriptLines * 0.7
+      ? ` Step 4 shows ${summary.utterances.length} lines for a script of ${scriptLines}: read it again with about a second of pause between lines.`
+      : "";
+  const short = seconds < 30 ? " It was short: read the whole script so the numbers mean something." : "";
+  setStatus(
+    `Run ${n} (${r.otherLabel}, read aloud): delay ${Math.round(summary.delayMs)} ms. Rate it in step 4.${short}${merged}${letGo}`,
+    short || merged || letGo ? "warn" : "ok",
+  );
+});
+
+// "Long check": another app's microphone followed like a Live call, for up to 90 minutes,
+// during a full-length test call (nothing is recorded beyond the last 12 s).
+action("btnWatch", "busy", async () => {
+  const ctx = await ensureCtx();
+  const p = await openOtherApp();
+  const w = { ...p, autoStopped: false };
+  try {
+    w.na = ctx.createMediaStreamSource(p.a);
+    w.nb = ctx.createMediaStreamSource(p.b);
+    w.rec = makeRecorder(ctx, 2);
+    w.na.connect(w.rec.node, 0, 0);
+    w.nb.connect(w.rec.node, 0, 1);
+  } catch (err) {
+    closePair(p);
+    throw err;
+  }
+  w.cfg = deviceSettings(p);
+  w.rec.start();
+  w.follow = followCall(ctx, w.rec);
+  w.timer = setInterval(() => {
+    const secs = w.follow.tick();
+    $("watchInfo").textContent = `${clock(secs)} · ${w.follow.last ? `delay ${Math.round(w.follow.last.lagMs)} ms` : "– (speak)"}`;
+    if (secs >= LONG_MAX_MIN * 60 && !w.autoStopped) {
+      w.autoStopped = true;
+      $("btnStopWatch").click();
+    }
+  }, 3000);
+  state.watch = w;
+  state.mode = "watch";
+  setStatus(`Long check: following your microphone and “${p.otherLabel}”. Leave it running through your test call, then press Stop.`);
+});
+
+action("btnStopWatch", "busy", async () => {
+  const w = state.watch;
+  if (!w) return;
+  state.watch = null;
+  clearInterval(w.timer);
+  w.follow.tick(); // one last look
+  try {
+    await w.rec.stop();
+  } finally {
+    w.rec.dispose();
+    w.na.disconnect();
+    w.nb.disconnect();
+    closePair(w);
+  }
+  const summary = {
+    at: new Date().toISOString(),
+    kind: "watch",
+    engine: w.otherLabel,
+    settings: w.cfg,
+    dropped: null,
+    autoStopped: w.autoStopped,
+    ...callSummary(w.follow),
+    webrtc: null,
+    warmupMs: null,
+  };
+  if (!summary.ok && summary.speechAtSec.length) summary.reason = `you spoke, but “${w.otherLabel}” stayed silent`;
+  state.runs.push(summary);
+  renderRuns();
+  const quiet = quietNote(summary);
+  const head = summary.ok
+    ? `Long check done: ${clock(summary.durationSec)}, delay median ${Math.round(summary.delayMedianMs)} ms, max ${Math.round(summary.delayMaxMs)} ms.`
+    : `Long check: ${summary.reason}.`;
+  $("watchInfo").textContent = head;
+  setStatus(`${head}${quiet.text}`, !summary.ok || quiet.bad ? "warn" : "ok");
 });
 
 // ---------- 8 · save ----------
@@ -1378,10 +1622,17 @@ action("btnSaveWav", null, () => {
 /** The server's check of which page addresses Sanas accepts (it runs when the key is accepted). */
 async function loadOriginCheck() {
   try {
-    const res = await fetch("/origin-check", { cache: "no-store" });
+    // A server that stopped answering must not hold up saving the results.
+    const res = await fetch("/origin-check", { cache: "no-store", signal: AbortSignal.timeout(1500) });
     if (!res.ok) return;
     const check = await res.json();
-    if (!check?.ran) return;
+    if (!check?.ran) {
+      if (check?.reason) {
+        state.originCheck = check;
+        $("originInfo").textContent = `Sanas address check skipped: ${check.reason}.`;
+      }
+      return;
+    }
     if (state.originCheck?.at !== check.at) log(`Sanas address check: ${check.conclusion}`);
     state.originCheck = check;
     $("originInfo").textContent = `Sanas address check for the app: ${check.conclusion}`;
@@ -1398,7 +1649,9 @@ window.addEventListener("pagehide", () => {
   disconnectSanas();
 });
 
-$("script").value = DEFAULT_SCRIPT;
+$("script").value = recall("script") || DEFAULT_SCRIPT;
+if (recall("model")) $("model").value = recall("model");
+if ([...$("rate").options].some((o) => o.value === recall("rate"))) $("rate").value = recall("rate");
 if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
   setStatus(
     `Open this page as http://localhost:${location.port || "8080"}/spike/ (not by IP address or as a file): the browser only allows the microphone there.`,
