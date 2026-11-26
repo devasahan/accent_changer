@@ -137,10 +137,12 @@ export class Vad {
     const frameEnd = ++this._frames * this.frameLen;
 
     // Noise floor: starts at the first sound heard (a floor that started at -100 would take
-    // 15 s to climb to a -45 dB room), falls at once, rises slowly through speech.
+    // 15 s to climb to a -45 dB room) but no higher than minDb (when that first sound is
+    // already the voice, a floor at speech level would hide the first sentence); then it
+    // falls at once and rises slowly, through speech too.
     if (meanSquare > DIGITAL_SILENCE) {
       if (!this._floorSet) {
-        this._floor = Math.max(FLOOR_MIN_DB, level);
+        this._floor = Math.max(FLOOR_MIN_DB, Math.min(level, this.minDb));
         this._floorSet = true;
       } else if (level < this._floor) {
         this._floor = Math.max(FLOOR_MIN_DB, level);
@@ -162,7 +164,7 @@ export class Vad {
       this._peakHold = this.peakHoldFrames;
     } else if (loud) {
       if (this._peakHold > 0) this._peakHold--;
-      else this._peak -= this.peakDecayDb;
+      else if (this._peak - this.peakDecayDb > level) this._peak -= this.peakDecayDb;
     }
 
     if (speech) {
