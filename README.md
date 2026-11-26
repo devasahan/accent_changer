@@ -15,7 +15,8 @@ Results so far: [spike/FINDINGS.md](spike/FINDINGS.md).
 1. **Part 1, now:** test Sanas cloud with this page. It takes about 2 hours of your time over 2–3 sittings, plus about 1 h 20 min of runs you don't need to watch, and about $1 of Sanas credit.
 2. **Part 2, 5–6 days before your interview** (about 2 hours): try Krisp and the Sanas desktop app with the same page, and ask a friend for a short blind listening test.
 3. **Your interview:** follow [INTERVIEW.md](INTERVIEW.md) with the app that passes its bar. Our own app can't be ready in time.
-4. **Send me the results file** after every sitting.
+4. **When I say the app's test build is ready** (about 15 minutes, any day): [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes) below.
+5. **Send me the results file** after every sitting.
 
 Two rules for every sitting:
 
@@ -134,6 +135,26 @@ Do Part 2 in **one sitting, without reloading the page**. The page keeps the sou
 6. **Download results (JSON)** and send it to me.
 
 Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to use, and how to set it up. I'll also tell you from your results.
+
+## Session A2: try the app's test build (about 15 minutes)
+
+When I tell you the test build is ready:
+
+1. **In the Sanas Console,** check that Allowed origins has `http://tauri.localhost` (Part 1 added it).
+2. **Download the installer** from the link I send: the `.exe` file under **Assets**.
+3. **Install it:** double-click the file.
+   - If Windows shows "Windows protected your PC": click **More info**, then **Run anyway**. The app isn't signed, so Windows doesn't know it yet.
+   - If you see **"Smart App Control blocked"**: stop here and tell me. Do not turn Smart App Control off.
+4. **Open Accent Changer** from the Start menu. The Diagnostics page opens.
+5. Do the four steps on the page:
+   1. Look at step 1: "Secure page" should say yes.
+   2. **Check the microphone.** Note whether Windows or the app asked for permission.
+   3. **Paste your Sanas key** once and press **Save key**. It is checked with Sanas and kept in Windows Credential Manager.
+   4. Press **Connect only.** It uses no Sanas minutes.
+6. **Close the app and open it again.** Press Check the microphone once more, and note whether anything asked for permission this time.
+7. Press **Copy results** and paste them into your message, with your notes.
+
+To uninstall later: Windows Settings → Apps → Installed apps → Accent Changer → Uninstall. To remove the key too, open the app first and press **Remove key**.
 
 ## Troubleshooting
 
