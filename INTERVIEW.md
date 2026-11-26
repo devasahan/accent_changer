@@ -55,31 +55,44 @@ Email the recruiter, for example: "I sometimes use a real-time AI accent-convers
 
 ## 4. Rehearsal (a day or two before, about an hour)
 
-Hold a test meeting as long as the interview, on the interview's platform, with the app, OBS and video on. A friend plays the interviewer. Plug in the charger and set Power mode to **Best performance** (Windows Settings → System → Power), as on the day.
+Hold a test meeting as long as the interview, on the interview's platform, with the app, OBS and video on. A friend plays the interviewer. Plug in the charger and set Power mode to **Best performance** (Windows 11: Windows Settings → System → **Power & battery** → Power mode; Windows 10: click the battery icon at the right of the taskbar and drag the slider to **Best performance**), as on the day.
 
 1. Before the call, open the test page (as in Part 1) in its own tab and start step 7's **Long check**, with the app's microphone as the other microphone. If the meeting runs in the browser, open it in a new tab (Ctrl+T).
-2. In the call, stay silent for 15 minutes while your friend talks, then answer. Your friend tells you whether your converted voice was there from your first word after the silence, and whether anything sounded wrong. (A free Zoom account ends a meeting after 40 minutes: start it again and keep the long check running.)
+2. In the call, stay silent for 15 minutes while your friend talks (not even a "yes" or a laugh), then answer. Your friend tells you whether your converted voice was there from your first word after the silence, and whether anything sounded wrong. (A free Zoom account ends a meeting after 40 minutes: start it again and keep the long check running.)
 3. Near the end, note the usual CPU Utilization in Task Manager.
-4. After the call, press **Stop** on the long check. Type the CPU % and your friend's answers in the page's **Notes** box, then **Download results (JSON)** and send me the file.
-5. Practise the emergency steps in section 6 once, then undo them: pick the app's microphone again, and turn the OBS delay back on (the eye next to Video Delay (Async)).
+4. Then, still in the call, practise the emergency steps in section 6 once, in order: the voice steps first, then the video step. After each switch, your friend tells you what they see and hear. Then undo them, in this order:
+   1. In the meeting app, pick the app's microphone and the camera **OBS Virtual Camera** again. This frees the webcam for OBS; the picture comes back in the next step.
+   2. If you closed OBS, start it again and click **Start Virtual Camera**.
+   3. Right-click the webcam source → **Filters**, and click the crossed-out eye next to Video Delay (Async) so it is open: the delay is on again.
+
+   Your friend checks that your video and your converted voice are back.
+5. After the call, press **Stop** on the long check. Type the CPU % and your friend's answers in the page's **Notes** box, then **Download results (JSON)** and send me the file.
 
 **Use the app in the interview only if all of these hold:**
 
-- After Stop, the page did not say the converted voice came back late or did not come back.
-- Your friend heard your converted voice from your first word after the silence, and nothing sounded wrong, at any point in the call. (If your own accent came back late in the call, a daily limit may have run out.)
+- After Stop, the page said "Quiet test: after 15.0 min of silence the converted voice came back at once." It says this next to the long check's **Stop** button and at the top of the page. It may say more than 15 minutes; it must say at least 14. A shorter silence, or no quiet test at all, means something broke your silence: start the **Long check** again, stay silent for 15 minutes, then talk for a minute, press **Stop** and download the results again. If you can, do this in a call with your friend, so they can check your first words again. If it happens again, move the microphone a little to the side of your mouth and turn the headphones down.
+- Your friend heard your converted voice from your first word after the silence, and nothing sounded wrong at any point in the call, apart from the practice in step 4. (If your own accent came back late in the call, before that practice, a daily limit may have run out.)
 - The CPU near the end was about 60 % or less.
 
-Otherwise use the other app if it passed section 1 and its own rehearsal, or do the interview without a tool.
+Otherwise switch to the other app if it passed section 1:
+
+1. Quit the first app (its tray icon → **Quit**) and start the other one, set up as in section 3, step 1.
+2. In the meeting app, pick the other app's microphone.
+3. In OBS, right-click the webcam source → **Filters**, click **Video Delay (Async)** and change its delay to the other app's Delay ms from Part 2. Don't add a second delay.
+4. Check the lip sync again (section 3, step 4), then give the other app its own rehearsal.
+
+If it didn't pass, or there isn't time for all that, do the interview without a tool.
 
 ## 5. On the day
 
-1. Plug in the charger and set Power mode to **Best performance**. Use a cable to the internet if you can.
+1. Plug in the charger and set Power mode to **Best performance** (as in section 4). Use a cable to the internet if you can.
 2. Start the app and OBS's virtual camera. Keep your own check short (a minute): the trial's daily minutes count.
 3. On the meeting's pre-join screen, check that:
    - the microphone is the app's;
    - its level moves when you speak;
+   - the camera is **OBS Virtual Camera**, not your webcam;
    - the video shows you, filling the picture;
-   - in OBS, the delay is on: the eye next to Video Delay (Async) shows.
+   - in OBS, the delay is on: right-click the webcam source → **Filters**. The eye next to Video Delay (Async) is open, not crossed out. A crossed-out eye means the delay is off: click it.
 4. Share one window, never the whole screen.
 5. **Always say it once at the start, even if the recruiter agreed:** "Before we start: I use a real-time AI accent-conversion tool on my microphone. The words are my own. I'm happy to turn it off if you prefer." If they prefer it off, do section 6's voice steps at once.
 
@@ -89,7 +102,7 @@ Otherwise use the other app if it passed section 1 and its own rehearsal, or do 
   1. Switch the meeting's microphone back to your headset:
      - in Zoom, the **^** next to Mute;
      - in Teams or Meet, the arrow next to the microphone button.
-  2. Then in OBS, open **Filters** on the webcam source and click the eye next to Video Delay (Async) to turn the delay off. Your voice is no longer late, so the video mustn't be either.
+  2. Then in OBS, right-click the webcam source → **Filters**, and click the eye next to Video Delay (Async) so it is crossed out: the delay is off. Your voice is no longer late, so the video mustn't be either.
 - **The video freezes or goes black:** close OBS (File → Exit), then pick your webcam in the meeting app.
   - Don't pick the webcam while OBS runs: OBS is holding it.
   - If you can, also switch your voice to the headset (above), so your lips and voice match again.

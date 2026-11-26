@@ -21,7 +21,7 @@ Results so far: [spike/FINDINGS.md](spike/FINDINGS.md).
 Two rules for every sitting:
 
 - **Download results (JSON) before you close the page.** Runs, ratings and notes live only in the open page. Each file has its own time stamp, so send all of them.
-- **Keep the page open in its own tab until you have downloaded.** Don't reload it, and open other sites (Zoom, Meet) in a new tab (Ctrl+T). The page remembers your script text, model name, sample rate and devices, but not your recording, runs, ratings or notes. If you try to leave it, Edge asks "Leave site?": choose **Cancel**.
+- **Keep the page open in its own tab until you have downloaded.** Don't reload it, and open other sites (Zoom, Meet) in a new tab (Ctrl+T). The page remembers your script text, model name, sample rate and devices, but not your recording, runs, ratings or notes. Once it holds any of them, Edge asks "Leave site?" or "Reload site?" every time you leave or reload the page, even right after a download. If a step is still running, choose **Cancel**. If you changed anything since you last downloaded the results (a run, a rating, a blind-test count or a note), choose **Cancel** and download first. Otherwise choose **Leave** (or **Reload**).
 
 The free trials last 7 days each. Starting them 5–6 days before the interview means they still run on interview day.
 
@@ -70,9 +70,9 @@ The free trials last 7 days each. Starting them 5–6 days before the interview 
    9. **Quiet test:**
       1. Press Start live again.
       2. Stay silent for 15 minutes; leave the room.
-      3. Come back, put the headset on, and start reading the script right away. Read for about a minute, then press Stop.
+      3. Come back, sit down and put the headset on. Count to ten in your head, without a sound. Then read the script aloud for about a minute, and press Stop.
 
-      The page then says whether your converted voice came back at once. A cough or a knock on the headset doesn't count as speaking.
+      The page then says, next to the Stop button and at the top of the page, how long you were silent and whether your converted voice came back at once, for example: "Quiet test: after 15.0 min of silence the converted voice came back at once." It should say about 15 min. If it says less than 14 min, or nothing about a quiet test, something broke the silence: do the quiet test again. A cough, or putting the headset on, doesn't count as speaking. If it says late, write in Notes whether you made a noise, breathed on the microphone, or skipped the count to ten, before you started reading.
    10. **Stability:** set Minutes to **65** and press Start (about $0.60). Leave the PC plugged in and awake; you don't need to watch it.
    11. **Download results (JSON)** and send me the file. It has no audio. It holds:
        - the measurements, your ratings and your notes;
@@ -92,7 +92,7 @@ The free trials last 7 days each. Starting them 5–6 days before the interview 
 
 If a card is needed, set a reminder to cancel.
 
-Do Part 2 in **one sitting, without reloading the page**. The page keeps the sound of only the last 6 runs, and only while it stays open; your friend listens to all of them at the end.
+Do Part 2 in **one sitting, without reloading the page**. The page keeps the sound of only the last 6 runs, and only while it stays open; your friend listens to them at the end.
 
 1. **Install and start both trials:**
    - **Sanas desktop app:** go to [sanas.ai/get-sanas](https://www.sanas.ai/get-sanas). For the number of agents choose 0–49, then **Start your 7-day trial**. Install it.
@@ -118,20 +118,20 @@ Do Part 2 in **one sitting, without reloading the page**. The page keeps the sou
       - A delay far below the app's own claim (Krisp says about 200 ms) is a warning sign.
    5. Rate the run in step 4.
    6. **Write down the app's delay** (Delay ms, in step 3's table) in the Notes box and on paper: OBS needs it later. A red number in that table fails the bar in INTERVIEW.md.
-   7. **CPU check,** with the charger plugged in and Power mode on **Best performance** (Windows Settings → System → Power), as on the interview day:
+   7. **CPU check,** with the charger plugged in and Power mode on **Best performance**, as on the interview day. Set it while plugged in: on Windows 11, Windows Settings → System → **Power & battery** → Power mode; on Windows 10, click the battery icon at the right of the taskbar and drag the slider to **Best performance**. Then:
       1. Open zoom.us/test **in a new tab** (Ctrl+T), join the test call with video, and pick the app's microphone in Zoom.
       2. Talk for 2 minutes.
       3. Note the usual **Utilization** in Task Manager → Performance → CPU, not a short spike.
       4. Turn the app's accent conversion off and note it again.
 
       Write both in Notes, for example "Krisp: 35 % (off: 25 %)".
-5. **Blind test with a friend** (about 15 minutes). Ask a friend who knows your voice and who was out of the room while you read. Start with an app run, not the Sanas cloud run. For each run, in turn:
+5. **Blind test with a friend** (about 15 minutes). Ask a friend who knows your voice and who was out of the room while you read. Play three runs: the Sanas cloud run and one read-aloud run of each app. If you read an app more than once (or did the Sanas cloud run twice), the picker shows those runs under the same app name: play only the last one, the one with the highest Run number. Start with an app run, not the Sanas cloud run. For each of the three runs, in turn:
    1. Pick the run in step 4 under **Run to rate and play**.
    2. Play 5 lines with the small **▶ converted** buttons, not the big ▶ Converted button (that one plays the whole run). Use lines 1–5 for the first run you play, 6–10 for the second, and 11–15 for the third. Don't show the script.
    3. Your friend says what they heard, whether it sounds like you, and whether it sounds American.
    4. Enter **Lines played**, then the counts: every word right, sound like you, sound American.
 
-   Do the blind test before redoing any run, and check that the picker still lists all three runs.
+   Do the blind test before redoing any run, and check that the picker still lists the three runs you will play.
 6. **Download results (JSON)** and send it to me.
 
 Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to use, and how to set it up. I'll also tell you from your results.
@@ -190,7 +190,7 @@ To uninstall later: Windows Settings → Apps → Installed apps (Windows 10: Ap
 | "Sanas answered, but no audio connection came up" | A firewall or VPN is blocking WebRTC (UDP). Try without the VPN, or on another network. |
 | A run reports "dropped the call" | The connection to Sanas broke during the run. Note the time; if it happens again, try another network. |
 | Run (step 3) or Start (step 6) is grey | Record the script first (step 2). A reopened page has the text but no recording. |
-| Edge asks "Leave site?" | Choose **Cancel**, then download the results first. Leaving loses the runs, ratings and recording. |
+| Edge asks "Leave site?" or "Reload site?" | It asks every time, even right after a download. If a step is still running, choose **Cancel**. If you changed anything since you last downloaded the results (a run, a rating, a blind-test count or a note), choose **Cancel** and download them first: leaving loses the runs, ratings, notes and recording. Otherwise choose **Leave** (or **Reload**). |
 | Step 4 shows far fewer lines than your script has | You paused too briefly between lines: record or read again with about one second of pause. |
 | Step 7: the other microphone "is silent" or "stayed silent" | The app must be running, with your headset as its microphone and accent conversion on. Some apps convert only while a call app uses their microphone: the page counts as one. |
 | Accent Changer (the test build) doesn't open, or closes at once | Send me its log file: see [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes), step 4. |
