@@ -136,6 +136,87 @@ test("anything that looks like a key, token or password is dropped and reported,
   assert.ok(pasted.errors[0].includes("Credential Manager") && !pasted.errors[0].includes(secret), pasted.errors[0]);
 });
 
+test("a key pasted into the OBS path or a device label is not kept either; ordinary paths and labels are", () => {
+  const secret = "sk_live_DO_NOT_SAVE_1234567890";
+  const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1In0.abcdefghijklmnopqrstuvwxyz012345678901234";
+  const base64Key = "q7Wz/9Kd+3LmNp2Rs8Tv4Xy6Ab1Cd5Ef7Gh9Ij+Kl0M=";
+  for (const [name, value] of [
+    ["obsPath", secret],
+    ["obsPath", `C:\\obs\\${jwt}`],
+    ["obsPath", base64Key],
+    ["micLabel", `Bearer ${jwt}`],
+    ["micLabel", secret],
+    ["cableLabel", secret],
+    ["cableLabel", `CABLE Input ${base64Key}`],
+  ]) {
+    const r = withSettings({ [name]: value });
+    assert.equal(r.settings[name], "", `${name}: ${value}`);
+    assert.equal(r.errors.length, 1, `${name}: ${value}`);
+    assert.ok(r.errors[0].startsWith(`${name} looks like an API key`) && r.errors[0].includes(SECRET_MESSAGE), r.errors[0]);
+    for (const part of [secret, jwt.slice(-20), base64Key.slice(5, 20)]) assert.ok(!r.errors[0].includes(part), `no value in: ${r.errors[0]}`);
+    assert.equal(r.ready, true);
+  }
+  // Ordinary paths (backslashes or forward slashes, a Microsoft Store install, a portable copy) and labels stay.
+  for (const obsPath of [
+    "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",
+    "C:/Program Files/obs-studio/bin/64bit/obs64.exe",
+    "C:\\Program Files\\WindowsApps\\OBSProject.OBSStudio_30.2.3.0_x64__qyxnjnmr4kv5c\\bin\\64bit\\obs64.exe",
+    "D:\\Tools\\OBS-Studio-30.2.3-Portable\\bin\\64bit\\obs64.exe",
+    "\\\\studio-pc\\Shared\\OBS\\bin\\64bit\\obs64.exe",
+  ]) {
+    const r = withSettings({ obsPath });
+    assert.deepEqual(r.errors, [], obsPath);
+    assert.equal(r.settings.obsPath, obsPath);
+  }
+  for (const label of [
+    "Default - Headset Microphone (Jabra EVOLVE 20 MS)",
+    "Microphone Array (Realtek(R) Audio)",
+    "Microphone (HD Pro Webcam C920) (046d:082d)",
+    "Headset (WH-1000XM4 Hands-Free AG Audio)",
+    "CABLE Input (VB-Audio Virtual Cable)",
+  ]) {
+    const r = withSettings({ micLabel: label, cableLabel: label });
+    assert.deepEqual(r.errors, [], label);
+    assert.equal(r.settings.micLabel, label);
+  }
+  // Device ids are 64 hex digits, which redact() hides in logs: as settings they are kept.
+  assert.deepEqual(validateSettings(complete()).settings.micDeviceId, complete().micDeviceId);
+});
+
+test("the known names in other capitalisations are unknown names, not keys", () => {
+  // "API keys are kept in Windows Credential Manager" would tell the user a key was in their file.
+  for (const name of ["HotkeyOwn", "hotkeyown", "HOTKEYCONVERT", "KeyExpiresOn"]) {
+    const r = withSettings({ [name]: "Ctrl+Alt+K", budget: { ...complete().budget, [name]: "2027-01-01" } });
+    assert.deepEqual(r.errors, [], name);
+    assert.deepEqual(r.settings, complete(), `${name} is dropped quietly, like any unknown name`);
+  }
+  assert.equal(withSettings({ ApiKey: "x" }).errors.length, 1, "a real key-like name is still reported");
+});
+
+test("hotkeys that would take a shortcut from Windows or other apps are refused", () => {
+  // A hotkey is global: the meeting app, its chat and every other app stop seeing it.
+  for (const taken of ["Ctrl+C", "Ctrl+V", "Ctrl+X", "Ctrl+Z", "Ctrl+Y", "Ctrl+A", "Ctrl+S", "ctrl+b", "Alt+F", "Win+L", "Super+D", "Shift+1", "Alt+F4", "Alt+Tab", "Alt+Space", "Ctrl+Esc", "Ctrl+Alt+Del", "Ctrl+Shift+Esc"]) {
+    assert.equal(normalizeHotkey(taken), null, taken);
+  }
+  // Two modifiers with a letter, or a key that no app needs, are fine.
+  for (const [given, canonical] of [
+    ["Ctrl+Alt+V", "Ctrl+Alt+V"],
+    ["Ctrl+Shift+C", "Ctrl+Shift+C"],
+    ["Alt+Win+L", "Alt+Super+L"],
+    ["Ctrl+F9", "Ctrl+F9"],
+    ["Alt+F5", "Alt+F5"],
+    ["Ctrl+Space", "Ctrl+Space"],
+  ]) {
+    assert.equal(normalizeHotkey(given), canonical, given);
+  }
+  const paste = withSettings({ hotkeyOwn: "Ctrl+V", hotkeyConvert: "Alt+F4" });
+  assert.equal(paste.settings.hotkeyOwn, "Ctrl+Alt+B");
+  assert.equal(paste.settings.hotkeyConvert, "Ctrl+Alt+N");
+  assert.equal(paste.errors.length, 2);
+  assert.match(paste.errors[0], /^hotkeyOwn must be keys no other app needs: .*Ctrl\+V would be taken .*two of Ctrl, Alt, Shift and Win.*using Ctrl\+Alt\+B\.$/);
+  assert.match(paste.errors[1], /^hotkeyConvert must be keys no other app needs: .*Alt\+F4 would be taken .*Windows uses it.*using Ctrl\+Alt\+N\.$/);
+});
+
 test("voiceType must be masculine or feminine for ready", () => {
   for (const [value, expected] of [
     ["masculine", "masculine"],
