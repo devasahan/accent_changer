@@ -141,14 +141,15 @@ Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to u
 When I tell you the test build is ready:
 
 1. **In the Sanas Console,** check that Allowed origins has `http://tauri.localhost` (Part 1 added it).
-2. **Download the installer:** open the link I send, a page on GitHub (sign in to GitHub if it asks: GitHub lets only signed-in people download these files). Scroll down to **Artifacts** and click **windows-x64-nsis**. Edge saves the file `windows-x64-nsis.zip`.
+2. **Download the installer:** on your laptop, open the link I send in Edge. It is a page on GitHub: if you see **Sign in** at the top right, sign in first, because GitHub lets only signed-in people download these files. Then scroll down to **Artifacts** and click **windows-x64-nsis** (if it isn't there, or nothing downloads, tell me). Edge saves the file `windows-x64-nsis.zip`.
    - If Edge says the file isn't commonly downloaded: click **…** next to it, then **Keep**, then **Show more**, then **Keep anyway**. The app is new and isn't signed, so Edge doesn't know it yet.
 3. **Unzip and install it:**
-   1. In Edge's list of downloads, click the folder icon next to the file (**Show in folder**).
-   2. Right-click `windows-x64-nsis.zip` → **Extract All…** → **Extract**.
+   1. In Edge's list of downloads (Ctrl+J opens it), click the folder icon next to the file (**Show in folder**).
+   2. Right-click the highlighted file (its name starts with `windows-x64-nsis`) → **Extract All…** → **Extract**. (No **Extract All…**? Unzip it the way you unzipped this project's code, then open the new folder.)
    3. In the folder that opens, double-click **Accent Changer_0.1.0_x64-setup**, the installer and the only file there.
    - If Windows shows "Windows protected your PC": click **More info**, then **Run anyway**. For the same reason, Windows doesn't know the app yet.
    - If you see **"Smart App Control blocked"**: stop here and tell me. Do not turn Smart App Control off.
+   - If Edge or Windows Security says it found a threat: stop here and tell me.
 4. **Open Accent Changer** from the Start menu. The Diagnostics page opens.
    - If no window opens, or it closes at once: copy the line below, press **Windows key + R**, paste the line and press Enter:
 
@@ -166,9 +167,9 @@ When I tell you the test build is ready:
 7. **Close the app** (the X at the top right) **and open it again** from the Start menu. Press **Check the microphone** and **Connect only** once more. Don't paste the key again: this time Connect only checks that the saved key still works after a restart. Note whether anything asked for permission this time.
 8. **Press Copy results again** and paste them under the first ones, with your notes.
 
-**A newer test build, later:** close Accent Changer, then download and install the new one as in steps 2 and 3, from the new link I send. Use the newest download at the top of Edge's list: your Downloads folder may still have the old zip and its folder, with almost the same names (the new ones end in "(1)"). If the installer says Accent Changer "is already installed", keep the option it has already chosen and press **Next**. Then do steps 4 to 8 again, but don't paste the key again (step 5.3): it is still saved, and step 3 of the page says "A key is saved". In step 1 of the page, check that the build is the one I named.
+**A newer test build, later:** close Accent Changer, then download and install the new one as in steps 2 and 3, from the new link I send. Use the zip you just downloaded: your Downloads folder may still have older zips and their folders, with almost the same names (a newer zip's name may end in a number, such as "(1)" or "(2)"). If Windows asks whether to replace a file, choose **Replace the file in the destination**. If the installer says Accent Changer "is already installed", keep the option it has already chosen and press **Next**. Then do steps 4 to 8 again, but don't paste the key again (step 5.3): it is still saved, and step 3 of the page says "A key is saved". In step 1 of the page, check that the build is the one I named. If it isn't, stop and tell me.
 
-To uninstall later: Windows Settings → Apps → Installed apps → Accent Changer → Uninstall. To remove the key too, open the app first and press **Remove key**.
+To uninstall later: Windows Settings → Apps → Installed apps (Windows 10: Apps & features) → Accent Changer → Uninstall (in Windows 11, under its **…** button). To remove the key too, open the app first and press **Remove key**.
 
 ## Troubleshooting
 
