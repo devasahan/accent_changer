@@ -179,7 +179,7 @@ To uninstall later: Windows Settings → Apps → Installed apps → Accent Chan
 | Server: "Sanas refused this page's own address" or "refused both app addresses" | Add the addresses under Allowed origins exactly as listed in Part 1 (no slash at the end), then restart the server. |
 | Server: "Address check skipped" or "Inconclusive" | Do what that line says: "could not be checked" needs a restart of the server, a refused key needs a working key. If it stays like that, write it in your notes. |
 | The server stopped answering | In the classic window, press Esc (a click inside it pauses the server). |
-| Page: "Origin not allowed" | In the Sanas Console, Allowed origins must contain exactly `http://localhost:8080` for the test page, or `http://tauri.localhost` for the app (Session A2): no slash at the end, and `localhost` rather than an IP. |
+| Page or app: "Origin … is not allowed for this group" | In the Sanas Console, Allowed origins must contain exactly `http://localhost:8080` for the test page, or `http://tauri.localhost` for the app (Session A2): no slash at the end, and `localhost` rather than an IP. |
 | "Model not entitled" | Copy the exact model name from the Console, including any suffix. |
 | "The browser blocked the microphone for this page" | Click the icon left of the address bar → Permissions for this site → Microphone → Allow, then reload. The setting is per port: after `--port 8090`, allow it again. |
 | "Windows blocked the microphone" or no microphones listed | Windows Settings → Privacy & security → Microphone: allow access, including "Let desktop apps access your microphone", then reload the page. |
