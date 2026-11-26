@@ -56,11 +56,12 @@ async function main() {
     ],
   });
   const context = await browser.newContext({ acceptDownloads: true });
-  // "Fake Audio Input 2" plays as another app's microphone would: 250 ms late.
+  // "Fake Audio Input 2" plays as another app's microphone would: 250 ms late
+  // (window.__appDelay, in seconds, when set before the page opens it).
   // Every microphone gets a volume the test can turn down: silence (you stop
   // talking, and the "app" falls silent 250 ms later).
-  // window.__noise(sec) plays a short noise into "Fake Audio Input 1" only (a cough or a
-  // knock on the headset that the other app leaves out). window.__group, when set, is
+  // window.__noise(sec) plays a short noise into "Fake Audio Input 1" only (a cough, or
+  // putting the headset on, that the other app leaves out). window.__group, when set, is
   // the groupId every microphone reports (one physical device behind two names).
   await context.addInitScript(() => {
     const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
@@ -90,7 +91,7 @@ async function main() {
       window.__micGains.push({ label, gain });
       if (/Fake Audio Input 2/.test(label)) {
         const delay = ctx.createDelay(1);
-        delay.delayTime.value = 0.25;
+        delay.delayTime.value = window.__appDelay ?? 0.25;
         source.connect(gain).connect(delay).connect(out);
       } else {
         source.connect(gain).connect(out);
@@ -259,10 +260,11 @@ async function main() {
     check((await openSessions()) === 0, "Stop closed the live session");
 
     // 5a · the quiet test: talk, 14 s of silence, then speech. The converted voice comes back...
+    // (10 s of talk first hold about 5 s of sound, well over the 3 s a stretch needs to count as talk.)
     const quietCall = async ({ engineGoesQuiet }) => {
       await page.click("#btnLive");
       await page.waitForFunction(() => window.__spike.state.mode === "live", null, { timeout: 10000 });
-      await page.waitForTimeout(7000);
+      await page.waitForTimeout(10000);
       await micVolume(0);
       await page.waitForTimeout(14000);
       if (engineGoesQuiet) await spike(() => (window.__spike.state.live.handle.fromEngine.mediaStream.getAudioTracks()[0].enabled = false));
@@ -287,6 +289,12 @@ async function main() {
       JSON.stringify({ silence: gone.silenceLongestSec, resumed: gone.speechResumedAtSec, after: gone.convertedBackAfterSec }),
     );
     check(/did not come back/.test(await status()) && (await page.locator("#status").getAttribute("data-kind")) === "warn", "and the page warns", await status());
+    const liveLine = await page.locator("#liveInfo").textContent();
+    check(
+      liveLine === (await status()) && /Quiet test: after \d+ s of silence you spoke, but the converted voice did not come back\./.test(liveLine),
+      "next to Live's Stop button too",
+      liveLine,
+    );
     // Nothing converted at all while you speak: not "no speech detected".
     await page.click("#btnLive");
     await page.waitForFunction(() => window.__spike.state.mode === "live", null, { timeout: 10000 });
@@ -484,13 +492,14 @@ async function main() {
     );
     check(/long check/.test(await page.locator("#runs tbody tr").last().textContent()), "the table marks it as a long check");
 
-    // 7d · its quiet test: you knock the headset 9 s before you talk again; the app leaves the knock out
+    // 7d · its quiet test: you put the headset on (2 s of rustle and knocks: over the old 1-s bar for talk,
+    // under the 3-s one) and talk 9 s later; the app leaves the handling out
     await page.click("#btnWatch");
     await page.waitForFunction(() => window.__spike.state.mode === "watch", null, { timeout: 10000 });
     await page.waitForTimeout(7000);
     await micVolume(0);
     await page.waitForTimeout(13000);
-    await spike(() => window.__noise(0.5));
+    await spike(() => window.__noise(2));
     await page.waitForTimeout(9000);
     await micVolume(1);
     await page.waitForTimeout(10000);
@@ -499,10 +508,16 @@ async function main() {
     const knock = await lastRun();
     check(
       knock.silenceLongestSec >= 15 && knock.convertedBackAfterSec !== null && knock.convertedBackAfterSec <= 6,
-      "a knock on the headset before you talk again doesn't make the app look late",
+      "putting the headset on before you talk again doesn't make the app look late",
       JSON.stringify({ silence: knock.silenceLongestSec, resumed: knock.speechResumedAtSec, after: knock.convertedBackAfterSec, speech: knock.speechAtSec, sound: knock.speechSoundSec, heard: knock.heardAtSec }),
     );
     check(/came back at once/.test(await status()), "and the page says it came back at once", await status());
+    const watchLine = await page.locator("#watchInfo").textContent();
+    check(
+      /^Long check done: .* Quiet test: after \d+ s of silence the converted voice came back at once\.$/.test(watchLine),
+      "next to the long check's Stop button too",
+      watchLine,
+    );
 
     // 4c · only the newest runs keep their sound: runs with nothing to rate go first
     const kept = await spike(() => {
@@ -536,6 +551,43 @@ async function main() {
       JSON.stringify(kept),
     );
     await page.selectOption("#rateRun", "1");
+
+    // 4d · red marks in step 3's table (INTERVIEW: "a red number fails its line"): a delay between the two
+    // bars (380 and 500 ms) is within an app's bar when it was read aloud, not red, and over a Sanas run's bar
+    // (the Mock here), red. Both runs aim at the middle: the fake microphones start 0-30 ms apart, and
+    // the Mock adds about 45 ms.
+    const delayCell = () => page.locator("#runs tbody tr:last-child td:nth-child(4)");
+    const between = (ms) => ms > 380 && ms < 500; // where the two bars disagree
+    await spike(() => (window.__appDelay = 0.43));
+    await page.click("#btnRead");
+    await page.waitForFunction(() => window.__spike.state.mode === "read", null, { timeout: 10000 });
+    await page.waitForTimeout(9000);
+    await micVolume(0);
+    await page.waitForTimeout(400);
+    await page.click("#btnStopRead");
+    await waitIdle(15000);
+    await micVolume(1);
+    await spike(() => (window.__appDelay = 0.25));
+    const slowApp = await lastRun();
+    const slowAppClass = await delayCell().getAttribute("class");
+    check(
+      slowApp.kind === "read" && slowApp.ok && Math.abs(slowApp.delayMs - 430) < 60 && between(slowApp.delayMs) && slowAppClass !== "bad",
+      "an app read aloud at about 440 ms is not marked red",
+      JSON.stringify({ kind: slowApp.kind, ok: slowApp.ok, delayMs: slowApp.delayMs, class: slowAppClass }),
+    );
+    const runsBeforeSlow = await spike(() => window.__spike.state.runs.length);
+    await page.fill("#mockDelay", "390");
+    await page.click("#btnRun");
+    await waitRuns(runsBeforeSlow + 1, 40000);
+    await waitIdle(10000);
+    await page.fill("#mockDelay", String(MOCK_DELAY_MS));
+    const slowSanas = await lastRun();
+    const slowSanasClass = await delayCell().getAttribute("class");
+    check(
+      slowSanas.kind === "script" && slowSanas.ok && between(slowSanas.delayMs) && slowSanasClass === "bad",
+      "a Sanas run at about 440 ms is marked red",
+      JSON.stringify({ kind: slowSanas.kind, ok: slowSanas.ok, delayMs: slowSanas.delayMs, class: slowSanasClass }),
+    );
 
     // 8a · a server that stopped answering must not block saving the results
     await page.route("**/origin-check", () => {});
@@ -583,16 +635,25 @@ async function main() {
     await page.fill("#script", "My own first line.\nMy own second line.");
     await page.fill("#model", "AT5.2_Feminine");
     await page.selectOption("#rate", "48000");
-    const leave = new Promise((resolve) =>
-      page.once("dialog", async (d) => {
+    // Reloads the page: "beforeunload" when the page asked first (the test then leaves), else "no question".
+    const reloadAsks = async () => {
+      let answer;
+      const asked = new Promise((resolve) => (answer = resolve));
+      const onDialog = async (d) => {
         const type = d.type();
         await d.accept();
-        resolve(type);
-      }),
-    );
-    await page.reload();
-    const asked = await Promise.race([leave, new Promise((r) => setTimeout(() => r("no question"), 3000))]);
-    check(asked === "beforeunload", "the page asks before you leave it with runs that aren't saved", asked);
+        answer(type);
+      };
+      page.on("dialog", onDialog);
+      try {
+        await page.reload();
+        return await Promise.race([asked, new Promise((r) => setTimeout(() => r("no question"), 3000))]);
+      } finally {
+        page.off("dialog", onDialog);
+      }
+    };
+    const asked = await reloadAsks();
+    check(asked === "beforeunload", "the page asks before you leave it with runs, even right after a download", asked);
     await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
     check(
       (await page.locator("#btnRun").isDisabled()) && /Record the script first/.test(await page.locator("#runInfo").textContent()),
@@ -604,6 +665,17 @@ async function main() {
         (await page.locator("#rate").inputValue()) === "48000",
       "the page remembers your script, model name and sample rate",
     );
+
+    // Notes typed before any recording or run live only in the page too: it asks. Holding nothing, it doesn't.
+    await page.click("#notes");
+    await page.keyboard.type("Krisp: 35 % (off: 25 %)");
+    const askedForNotes = await reloadAsks();
+    check(askedForNotes === "beforeunload", "the page also asks when only the Notes box has text", askedForNotes);
+    await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    await page.click("#notes"); // a click, so Edge would ask if the page wanted it to
+    await page.fill("#notes", "");
+    const askedEmpty = await reloadAsks();
+    check(askedEmpty === "no question", "and doesn't ask when the page holds nothing", askedEmpty);
   } catch (err) {
     check(false, "scenario finished", err.stack || err.message);
     await page.screenshot({ path: path.join(OUT, "failure.png"), fullPage: true }).catch(() => {});

@@ -1003,6 +1003,7 @@ function callSummary(f) {
 // ---------- 5 · live ----------
 
 action("btnLive", "starting", async () => {
+  $("liveInfo").textContent = ""; // not the last call's quiet test
   const controller = new AbortController();
   state.liveStart = controller;
   refreshButtons();
@@ -1050,11 +1051,12 @@ action("btnLive", "starting", async () => {
   rec.start();
   const stats = watchStats();
   const follow = followCall(ctx, rec);
-  const timer = setInterval(() => {
-    const secs = follow.tick();
+  const show = (secs) => {
     const link = handle.droppedReason ? `dropped (${handle.droppedReason})` : handle.getState();
     $("liveInfo").textContent = `${clock(secs)} · ${handle.engine} ${link} · delay ${follow.last ? `${Math.round(follow.last.lagMs)} ms` : "– (speak)"}`;
-  }, 3000);
+  };
+  show(0);
+  const timer = setInterval(() => show(follow.tick()), 3000);
   state.live = { cfg, mic, micNode, handle, rec, stats, timer, follow };
   state.mode = "live";
   setStatus(`Live: speak. Press Stop when done.${note}`, note ? "warn" : "ok");
@@ -1096,6 +1098,8 @@ action("btnStopLive", null, async () => {
     if (dropped) setStatus(`Live stopped. ${l.handle.engine} had dropped the call (${dropped}).${quiet.text}`, "warn");
     else if (!summary.ok) setStatus(`Live stopped: ${summary.reason}.${quiet.text}`, "warn");
     else setStatus(`Live stopped.${quiet.text}`, quiet.bad ? "warn" : "ok");
+    // The same line next to Stop, where you are looking (the timer is cleared, so it stays).
+    $("liveInfo").textContent = $("status").textContent;
   } finally {
     state.mode = "idle";
   }
@@ -1474,6 +1478,7 @@ action("btnStopRead", "busy", async () => {
 // "Long check": another app's microphone followed like a Live call, for up to 90 minutes,
 // during a full-length test call (nothing is recorded beyond the last 12 s).
 action("btnWatch", "busy", async () => {
+  $("watchInfo").textContent = ""; // not the last check's quiet test
   const ctx = await ensureCtx();
   const p = await openOtherApp();
   const w = { ...p, autoStopped: false };
@@ -1490,9 +1495,13 @@ action("btnWatch", "busy", async () => {
   w.cfg = deviceSettings(p);
   w.rec.start();
   w.follow = followCall(ctx, w.rec);
+  const show = (secs) => {
+    $("watchInfo").textContent = `${clock(secs)} · ${w.follow.last ? `delay ${Math.round(w.follow.last.lagMs)} ms` : "– (speak)"}`;
+  };
+  show(0);
   w.timer = setInterval(() => {
     const secs = w.follow.tick();
-    $("watchInfo").textContent = `${clock(secs)} · ${w.follow.last ? `delay ${Math.round(w.follow.last.lagMs)} ms` : "– (speak)"}`;
+    show(secs);
     if (secs >= LONG_MAX_MIN * 60 && !w.autoStopped) {
       w.autoStopped = true;
       $("btnStopWatch").click();
@@ -1535,7 +1544,8 @@ action("btnStopWatch", "busy", async () => {
   const head = summary.ok
     ? `Long check done: ${clock(summary.durationSec)}, delay median ${Math.round(summary.delayMedianMs)} ms, max ${Math.round(summary.delayMaxMs)} ms.`
     : `Long check: ${summary.reason}.`;
-  $("watchInfo").textContent = head;
+  // The quiet test goes next to Stop too: the status line is far above it.
+  $("watchInfo").textContent = `${head}${quiet.text}`;
   setStatus(`${head}${quiet.text}`, !summary.ok || quiet.bad ? "warn" : "ok");
 });
 
@@ -1625,9 +1635,11 @@ async function loadOriginCheck() {
 
 // ---------- start ----------
 
-// Runs, ratings, notes and the recording live only in the open page: ask before leaving it.
+// Runs, ratings, notes and the recording live only in the open page: ask before
+// leaving it whenever it holds any of them, even right after a download (the
+// README says when Leave is safe).
 window.addEventListener("beforeunload", (event) => {
-  if (state.runs.length || state.recording || state.mode !== "idle") {
+  if (state.runs.length || state.recording || state.mode !== "idle" || $("notes").value.trim()) {
     event.preventDefault();
     event.returnValue = "";
   }
