@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sanas Check</title>
+  <link rel="stylesheet" href="probe.css">
+  <script type="module" src="probe.js"></script>
+</head>
+<body>
+  <header>
+    <h1>AccentSwitch · Step 0: is Sanas good enough?</h1>
+    <p>Wear headphones. Sanas credit is used only while a step runs (about $0.009 per minute).</p>
+    <p id="status" role="status" data-kind="info">Loading…</p>
+  </header>
+  <main>
+    <section id="s-setup">
+      <h2>1 · Setup</h2>
+      <div class="grid">
+        <label>Engine
+          <select id="engine">
+            <option value="sanas">Sanas (real, uses credit)</option>
+            <option value="mock">Mock (free test with a fake delay)</option>
+          </select>
+        </label>
+        <label>Model name (as shown in the Sanas Console)
+          <input id="model" value="AT5.2" spellcheck="false" autocomplete="off">
+        </label>
+        <label>Sample rate
+          <select id="rate">
+            <option value="16000">16 kHz (G.722, SDK default)</option>
+            <option value="48000">48 kHz (Opus)</option>
+            <option value="8000">8 kHz (phone quality)</option>
+          </select>
+        </label>
+        <label>Jitter buffer (ms)
+          <input id="jitter" type="number" min="0" max="1000" step="10" placeholder="SDK default">
+        </label>
+        <label class="mock-only">Mock delay (ms)
+          <input id="mockDelay" type="number" value="300" min="0" max="2000" step="10">
+        </label>
+        <label class="mock-only">Mock fails after (s)
+          <input id="mockFail" type="number" min="0" step="1" placeholder="never">
+        </label>
+        <label>Microphone
+          <select id="mic"></select>
+        </label>
+        <label>Headphones (playback)
+          <select id="out"></select>
+        </label>
+      </div>
+      <p class="row">
+        <button id="btnMic" type="button">Allow microphone</button>
+        <button id="btnConnect" type="button">Connect to Sanas</button>
+        <span id="connInfo"></span>
+      </p>
+    </section>
+
+    <section id="s-record">
+      <h2>2 · Record yourself reading the script</h2>
+      <p>Read each line at your normal speed. Pause about one second between lines. You can change the text.</p>
+      <textarea id="script" rows="10" spellcheck="false"></textarea>
+      <p class="row">
+        <button id="btnRecord" type="button">Record</button>
+        <button id="btnStopRecord" type="button">Stop</button>
+        <meter id="recLevel" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter>
+        <span id="recInfo"></span>
+      </p>
+    </section>
+
+    <section id="s-run">
+      <h2>3 · Send the recording through the engine at live speed</h2>
+      <p>Do this 3 times, at different times of day. Try both 16 kHz and 48 kHz.</p>
+      <p class="row">
+        <button id="btnRun" type="button">Run</button>
+        <progress id="runProgress" max="1" value="0"></progress>
+        <span id="runInfo"></span>
+      </p>
+      <div class="table-wrap">
+        <table id="runs">
+          <thead>
+            <tr>
+              <th>#</th><th>Engine</th><th>Rate</th><th>Delay ms</th><th>Median / p95</th>
+              <th>Gaps (longest ms)</th><th>Bandwidth</th><th>Level dB</th><th>RTT ms</th>
+              <th>Jitter buf ms</th><th>Loss / concealed %</th><th>Codec</th><th>Start-up ms</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="s-listen">
+      <h2>4 · Listen and rate</h2>
+      <p class="row">
+        <button id="btnPlayOrig" type="button">▶ Original</button>
+        <button id="btnPlayConv" type="button">▶ Converted</button>
+        <button id="btnStopPlay" type="button">■ Stop</button>
+      </p>
+      <ol id="utts"></ol>
+      <p>Score: <strong id="score">–</strong> / 10 &nbsp;(a line counts when all three boxes are ticked)</p>
+      <label class="block">Notes (what sounded wrong?)
+        <textarea id="notes" rows="3"></textarea>
+      </label>
+    </section>
+
+    <section id="s-live">
+      <h2>5 · Live: hear yourself converted</h2>
+      <p>Your converted voice plays in your headphones, a little late. That feels strange; it is normal.</p>
+      <p class="row">
+        <button id="btnLive" type="button">Start live</button>
+        <button id="btnStopLive" type="button">Stop</button>
+        <span id="liveInfo"></span>
+      </p>
+    </section>
+
+    <section id="s-long">
+      <h2>6 · Stability: 10 minutes without a break</h2>
+      <p>Plays your recording again and again through one Sanas connection (about $0.09 for 10 minutes).</p>
+      <p class="row">
+        <label class="inline">Minutes <input id="longMinutes" type="number" value="10" min="1" max="60"></label>
+        <button id="btnLong" type="button">Start</button>
+        <button id="btnStopLong" type="button">Stop</button>
+        <progress id="longProgress" max="1" value="0"></progress>
+        <span id="longInfo"></span>
+      </p>
+    </section>
+
+    <section id="s-pair">
+      <h2>7 · Measure another microphone (optional)</h2>
+      <p>Compares your microphone with another one, for example "CABLE Output" or "Krisp Microphone". Press the button, then say "pa-ta-ka" a few times with pauses.</p>
+      <p class="row">
+        <label class="inline">Other microphone <select id="pairDevice"></select></label>
+        <button id="btnPair" type="button">Record 12 s</button>
+        <span id="pairInfo"></span>
+      </p>
+    </section>
+
+    <section id="s-save">
+      <h2>8 · Save</h2>
+      <p class="row">
+        <button id="btnSaveJson" type="button">Download results (JSON)</button>
+        <button id="btnSaveWav" type="button">Download last run (WAV)</button>
+        <span id="costInfo"></span>
+      </p>
+      <p class="hint">The JSON has numbers and settings only, no audio: that is the file to share. WAV files are your voice; keep them on your PC.</p>
+      <details>
+        <summary>Log</summary>
+        <pre id="log"></pre>
+      </details>
+    </section>
+  </main>
+</body>
+</html>
