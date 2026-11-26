@@ -63,7 +63,7 @@
     <section id="s-record">
       <h2>2 · Record yourself reading the script</h2>
       <p>Read each line at your normal speed. Pause about one second between lines. You can change the text.</p>
-      <textarea id="script" rows="10" spellcheck="false"></textarea>
+      <textarea id="script" rows="15" spellcheck="false"></textarea>
       <p class="row">
         <button id="btnRecord" type="button">Record</button>
         <button id="btnStopRecord" type="button">Stop</button>
@@ -104,12 +104,14 @@
         <button id="btnStopPlay" type="button">■ Stop</button>
       </p>
       <ol id="utts"></ol>
-      <p>Score: <strong id="score">–</strong> / 10 &nbsp;(a line counts when all three boxes are ticked)</p>
-      <p>Blind listener: a friend who knows your voice hears 5 converted lines of this run without seeing the script, and says what they heard.</p>
+      <p>Score: <strong id="score">–</strong> / 10 &nbsp;(a line counts when all four boxes are ticked; “–” until you tick a box)</p>
+      <p><strong>Blind listener:</strong> a friend who knows your voice, and did not hear you read, listens to lines of this run with the small ▶ converted buttons, without seeing the script, and says what they heard. Each run gets different lines, so no sentence is heard twice: lines 1–5 for the first run you play, 6–10 for the second, 11–15 for the third.</p>
       <p class="row">
-        <label class="inline">Lines with every word right <input id="blindWords" type="number" min="0" max="5" step="1" placeholder="0–5"></label>
-        <label class="inline">Lines that sound like you <input id="blindVoice" type="number" min="0" max="5" step="1" placeholder="0–5"></label>
-        <span class="hint">of 5</span>
+        <label class="inline">Lines played <input id="blindLines" type="number" min="1" max="15" step="1" value="5" disabled></label>
+        <label class="inline">Every word right <input id="blindWords" type="number" min="0" max="15" step="1" disabled></label>
+        <label class="inline">Sound like you <input id="blindVoice" type="number" min="0" max="15" step="1" disabled></label>
+        <label class="inline">Sound American <input id="blindUs" type="number" min="0" max="15" step="1" disabled></label>
+        <span id="blindInfo" class="hint"></span>
       </p>
       <label class="block">Notes (what sounded wrong?)
         <textarea id="notes" rows="3"></textarea>
@@ -144,13 +146,19 @@
       <p class="row">
         <label class="inline">Other microphone <select id="pairDevice"></select></label>
       </p>
-      <p><strong>Read the script:</strong> press the button, read the whole script from step 2 aloud with a short pause between lines, then press Stop. The result appears in step 3's table and in step 4 for rating, like a Sanas run.</p>
+      <p><strong>Read the script:</strong> press the button, read the whole script from step 2 aloud with about one second of pause between lines (as in step 2), then press Stop. The page listens 3 more seconds for the app's last words. The result appears in step 3's table and in step 4 for rating, like a Sanas run. If step 4 shows far fewer lines than your script has, read it again with longer pauses.</p>
       <p class="row">
         <button id="btnRead" type="button">Read the script</button>
         <button id="btnStopRead" type="button">Stop</button>
-        <meter id="readLevelA" title="your microphone" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter>
-        <meter id="readLevelB" title="the other microphone" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter>
+        <label class="inline">You <meter id="readLevelA" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter></label>
+        <label class="inline">Other app <meter id="readLevelB" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter></label>
         <span id="readInfo"></span>
+      </p>
+      <p><strong>Long check:</strong> start it, then hold a full-length test call that uses the app (as in your interview), including a 15-minute stretch where you stay silent. It follows your microphone and the app's for up to 90 minutes, keeping only the last few seconds, and notes the delay and whether the app comes back at once after the silence.</p>
+      <p class="row">
+        <button id="btnWatch" type="button">Start long check</button>
+        <button id="btnStopWatch" type="button">Stop</button>
+        <span id="watchInfo"></span>
       </p>
       <p><strong>Quick check:</strong> 12 seconds of “pa-ta-ka” with pauses; measures the delay only. With “CABLE Output” the page plays your microphone into VB-CABLE first and measures the cable.</p>
       <p class="row">

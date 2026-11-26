@@ -1,0 +1,79 @@
+# Your interview with a ready-made app
+
+Until our own app is built and tested, you can use Krisp or the Sanas desktop app in an interview, but only one that passes the bar below. Its numbers come from Part 2 of the [README](README.md); I'll also check them from your results file.
+
+## 1. Does the app pass?
+
+Every line must hold:
+
+| Check | Pass |
+|---|---|
+| Your score for its read-aloud run | 8 out of 10 or more. A line counts only with all four boxes ticked: natural, your voice, every word right, sounds American. |
+| Blind listener: every word right | at least 4 of 5 lines |
+| Blind listener: sounds like you | at least 4 of 5 lines |
+| Blind listener: sounds American | at least 4 of 5 lines |
+| Delay (Delay ms in the page's table) | about 500 ms or less |
+| CPU during the Zoom video test | the usual Utilization with the app on is about 60 % or less |
+| Daily limit | the trial's minutes of accent conversion per day cover the interview (plan 90 minutes) plus your checks |
+
+- **If both apps pass,** pick the one whose lines your friend got right more often. If that is a tie, pick the higher score, then the lower delay.
+- **If neither passes, or no trial works,** do the interview without a tool. Mangled technical words are worse than an accent.
+
+## 2. Ask first (1–2 days before)
+
+Email the recruiter, for example: "I sometimes use a real-time AI accent-conversion tool on my microphone in calls. The words are my own. Is it all right if I use it in the interview?"
+
+- If they say no, or the company's rules ban AI tools, don't use it.
+- Never use it in a proctored or recorded assessment.
+
+## 3. Set it up once (about 45 minutes)
+
+1. **In the app:**
+   - Your headset is its microphone.
+   - Accent conversion is on, for your microphone.
+   - Meeting notes, transcription and recording are off (in Krisp: the AI Note Taker's automatic activation).
+2. **In Zoom, Teams or Meet:** pick the app's microphone, for example "Krisp Microphone", as your microphone. Don't pick your headset.
+3. **Lip sync** (your camera is on). The converted voice is a little late, so the video is delayed by the same amount:
+   1. Install OBS Studio from [obsproject.com](https://obsproject.com). When it first starts, choose that you will only use the virtual camera.
+   2. Under Sources: **+** → **Video Capture Device** → your webcam. Right-click it → **Transform** → **Fit to screen**.
+   3. Right-click it → **Filters** → **+** under Audio/Video Filters → **Video Delay (Async)**. Set the delay to the app's Delay ms from Part 2.
+   4. Click **Start Virtual Camera**. In the meeting app, choose the camera **OBS Virtual Camera**.
+4. **Check the lip sync** (about 15 minutes):
+   1. Start a Zoom meeting on the laptop. Join it from your phone as a second participant, muted, with earphones in.
+   2. On the laptop: **Record → Record on this Computer**. It works on the free plan.
+   3. Say a sharp "Pa!" a few times, with your lips clearly visible, then a few sentences.
+   4. End the meeting. Zoom saves the recording as an MP4 file.
+   5. Watch it and compare when your lips open with when you hear "Pa":
+      - if you hear it before the lips open, lower the OBS delay by 40–50 ms;
+      - if the lips open before you hear it, raise it by 40–50 ms.
+   6. Stop when you can't see a difference. If you're unsure, keep the measured Delay ms.
+
+## 4. Rehearsal (a day or two before, about an hour)
+
+Hold a test meeting as long as the interview, on the interview's platform, with the app, OBS and video on. A friend plays the interviewer.
+
+1. Before the call, open the test page (as in Part 1) and start step 7's **Long check**, with the app's microphone as the other microphone.
+2. In the call, stay silent for 15 minutes while your friend talks, then answer. Your friend tells you whether your converted voice was there from your first word after the silence, and whether anything sounded wrong.
+3. Near the end, note the CPU % in Task Manager.
+4. After the call, press **Stop** on the long check, then **Download results (JSON)**, and send me the file.
+5. Practise the emergency steps in section 6 once.
+
+## 5. On the day
+
+1. Plug in the charger. Use a cable to the internet if you can.
+2. Start the app and OBS's virtual camera. Keep your own check short (a minute): the trial's daily minutes count.
+3. On the meeting's pre-join screen, check that:
+   - the microphone is the app's;
+   - its level moves when you speak;
+   - the video shows you, filling the picture.
+4. Share one window, never the whole screen.
+5. If the recruiter agreed, say it once at the start: "Before we start: I use a real-time AI accent-conversion tool on my microphone. The words are my own. I'm happy to turn it off if you prefer."
+
+## 6. If something goes wrong during the call
+
+- **Voice:** switch the meeting's microphone back to your headset:
+  - in Zoom, the **^** next to Mute;
+  - in Teams or Meet, the arrow next to the microphone button.
+- **Video:** keep **OBS Virtual Camera** in the meeting. In OBS, open **Filters** on the webcam source and click the eye next to Video Delay (Async) to turn the delay off.
+  - Don't pick the webcam in the meeting app while OBS runs: OBS is holding it.
+  - If you must use the webcam directly, close OBS first (File → Exit).

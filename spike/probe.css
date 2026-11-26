@@ -49,6 +49,7 @@ section {
 #status[data-kind="error"] { color: var(--error); }
 #status[data-kind="warn"] { color: var(--warn); }
 #status[data-kind="ok"] { color: var(--accent); }
+.hint[data-kind="warn"] { color: var(--warn); }
 
 .grid {
   display: grid;

@@ -65,16 +65,19 @@ Your NVIDIA T1200 GPU doesn't change this. All three run their accent model in t
 - **Bandwidth, level change, WebRTC stats** (round-trip time, jitter buffer, loss, concealment, codec, Sanas server address).
 - **Stability**: one connection for 65 minutes (an interview's length; 10 minutes for a quick look). A drop is a `disconnected` or `failed` call, or a whole loop with no converted audio while the call claims to be up. Each drop is followed by a reconnect, whose time is measured. Delay figures pool every sentence of every loop, so one slow stretch shows in p95 and max.
 - **Start-up**: time until the audio connection is up (not just until Sanas answers).
-- **Quiet test** (Live): the longest stretch without converted speech, and whether it came back after it. Sanas documents no idle timeout, so the README asks for 15 minutes of silence.
-- **Other apps** (step 7, "Read the script"): your headset microphone and the other app's virtual microphone, recorded side by side while you read the script aloud. They are analysed like a Sanas run (delay per sentence, gaps, bandwidth, level) and rated the same way.
+- **Quiet test** (Live): Sanas documents no idle timeout, so the README asks for 15 minutes of silence, then speech. Every 3 s the page notes whether your microphone had speech and whether converted speech followed it, and saves both timelines (`speechAtSec`, `heardAtSec`). From them:
+  - `silenceLongestSec`: your longest silence;
+  - `convertedBackAfterSec`: how many seconds after you spoke again converted speech came back. It is null when it never did, which is not the same as "you stayed silent". A run where you spoke but nothing was converted says so in its reason.
+- **Other apps** (step 7, "Read the script"): your headset microphone and the other app's virtual microphone, recorded side by side while you read the script aloud. They are analysed like a Sanas run (delay per sentence, gaps, bandwidth, level) and rated the same way. Stop waits 3 s for the app's last words, as the Sanas runs keep recording after the script ends.
+- **Other apps, long check** (step 7): the same two microphones followed like a Live call for up to 90 minutes, during a full-length rehearsal call, keeping only the last 12 s. It saves the delay and the quiet-test fields for the app.
   - The delay here is the app's whole path, up to its microphone.
   - The Sanas cloud delay (step 3) leaves out the microphone and the virtual cable that our app adds (Gate 1 allows up to 120 ms for those). Add that before comparing.
 - **Sanas address check** (server, free: it asks only for the project's entitlements): whether Sanas accepts `http://tauri.localhost` and `https://tauri.localhost`, the page addresses the app would use.
   - This page's own address is a check that must pass.
   - An unlisted address is a check that must fail.
   - Otherwise the result says "inconclusive", and the app's own test (Step 1) decides.
-- **Your rating** per sentence and per run: natural, still your voice, every word right.
-- **Blind listener** per run: of 5 converted lines, how many a friend heard with every word right, and how many sound like you.
+- **Your rating** per sentence and per run: natural, still your voice, every word right, sounds American. A line counts only with all four. A run nobody rated has `rated: false` and no score, not 0/10.
+- **Blind listener** per run: the lines played (5 by default, different lines for each run), and how many of them a friend heard with every word right, how many sound like you, and how many sound American.
 
 ## Review of the probe (2026-11-26)
 
@@ -100,10 +103,10 @@ GO needs every row to pass (from the plan).
 | Usable from a desktop JS app | browser SDK or WebSocket/WebRTC API | enterprise only | ✅ Browser SDK (MIT) |
 | Delay median / p95 | ≤ 380 / 480 ms (best ≤ 300 / 380) | worse | ⏳ |
 | Gaps in speech (3 runs) | ≤ 1 per run | more | ⏳ |
-| Listening test (10 sentences) | ≥ 8/10 (6–7 = your call) | ≤ 5/10 or words mangled | ⏳ |
+| Listening test (your 15 sentences) | ≥ 8/10, a line counting only if natural, your voice, every word right and American (6–7 = your call) | ≤ 5/10 or words mangled | ⏳ |
 | Price | ≤ $0.05/min | more | ✅ $0.009/min |
 | Stability (65 min) | no drop and no silent loop; reconnect ≤ 5 s | drops with no recovery | ⏳ |
-| Quiet test (15 min) | converted voice comes back at once | it doesn't, or the call drops | ⏳ |
+| Quiet test (15 min) | converted voice comes back within about 6 s of speaking again (`convertedBackAfterSec` ≤ 6) | later, never, or the call drops | ⏳ |
 
 Also recorded. These decide how the app is built, not GO / NO-GO:
 
@@ -117,11 +120,13 @@ Also recorded. These decide how the app is built, not GO / NO-GO:
 
 Build the rest of our app (plan Steps 2 and 4–9) only if Sanas cloud passes the GO checklist above **and** one of these holds:
 
-1. It rates at least as well as the best ready-made app, blind listener included, with at most about 100 ms more delay. Count our app's own path in that delay.
+1. It rates at least as well as the best ready-made app, with at most about 100 ms more delay. "Rates" means your score and the blind listener's counts (every word right, and sounds American). Count our app's own path in that delay.
 2. After hearing both, you still prefer our own app, for cost or lightness.
 3. The ready-made apps are unavailable, too expensive, or their terms don't allow this use.
 
-An app on the laptop that pushes total CPU above about 60 % in a Zoom video call counts as worse (Sanas's own guidance).
+An app on the laptop whose usual total CPU (not a spike) is above about 60 % in a Zoom video call, with the app on, counts as worse (Sanas's own guidance).
+
+Before a ready-made app is used in a real interview, it must also pass the bar in [INTERVIEW.md](../INTERVIEW.md): your score at least 8/10, the blind listener at least 4 of 5 on every count, delay about 500 ms or less, CPU within the rule above, and enough daily conversion minutes for the interview.
 
 Otherwise use the winner directly. For lip sync, set OBS "Video Delay (Async)" to its measured delay (README: "Your interview with a ready-made app"). Wrapping it in our app would only add delay.
 

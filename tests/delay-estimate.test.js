@@ -267,3 +267,20 @@ test("analyzeRun reports why when nothing came back", () => {
   assert.equal(r.ok, false);
   assert.match(r.reason, /no converted audio/);
 });
+
+test("analyzeRun: a sentence cut off by the end of the recording gets no wrong delay and no false gap inside it", () => {
+  // Speech right up to the end (someone still talking at Stop): the converted
+  // copy of the last sentence runs past the end of the recording.
+  for (const seed of [3, 5, 8]) {
+    const sr = 48000;
+    const { samples: ref } = synthSpeech({ sampleRate: sr, seconds: 9, seed, leadSec: 0.4, tailSec: 0 });
+    const sig = delayed(ref, Math.round(0.25 * sr));
+    const r = analyzeRun({ ref, sig, sampleRate: sr });
+    assert.ok(r.ok);
+    for (const u of r.utterances.filter((u) => u.trusted)) {
+      assert.ok(Math.abs(u.lagMs - 250) <= 20, `seed ${seed}: trusted sentence at ${u.startSec} s has ${u.lagMs} ms`);
+    }
+    const inside = r.gaps.filter((g) => !g.pastEnd);
+    assert.deepEqual(inside, [], `seed ${seed}: ${JSON.stringify(r.gaps)}`);
+  }
+});

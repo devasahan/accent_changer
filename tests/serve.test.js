@@ -267,7 +267,9 @@ test("the origin check tells accepted, refused, CORS-blocked and unknown apart",
   assert.equal(refused.get.status, 403);
   // Sanas answers, but a browser would block it.
   assert.equal((await check(APP_ORIGINS[0], fakePortal({ cors: "none" }))).verdict, "no-cors");
-  assert.equal((await check(APP_ORIGINS[0], fakePortal({ allowHeaders: "*" }))).verdict, "no-cors", '"*" does not cover Authorization');
+  const wildcard = await check(APP_ORIGINS[0], fakePortal({ allowHeaders: "*" }));
+  assert.equal(wildcard.verdict, "accepted", "Edge and WebView2 let a * through for requests without credentials");
+  assert.match(wildcard.note, /Allow-Headers: \*/);
   assert.equal((await check(APP_ORIGINS[0], fakePortal({ allowHeaders: "content-type" }))).verdict, "no-cors");
   // Other answers can't tell anything.
   const expired = await check(APP_ORIGINS[0], fakePortal({ status: 401 }));
@@ -323,6 +325,23 @@ test("the origin report needs both controls before it says anything about the ap
   const report = originReport([], PAGE);
   assert.equal(report.appReady, null);
   assert.match(report.lines[0], /not checked/);
+});
+
+test("the origin report says inconclusive, not refused, when the app addresses couldn't be checked", () => {
+  const r = (origin, verdict, note = "") => ({ origin, verdict, note, preflight: null, get: null });
+  const base = [r(PAGE, "accepted"), r(CONTROL_ORIGIN, "refused")];
+  const errors = originReport([...base, r(APP_ORIGINS[0], "error", "Sanas answered HTTP 429"), r(APP_ORIGINS[1], "error", "no answer within 10 s")], PAGE);
+  assert.equal(errors.appReady, null);
+  assert.match(errors.conclusion, /Inconclusive: Sanas could not be asked/);
+  assert.match(errors.lines[1], /could not check \(Sanas answered HTTP 429\)/);
+  const mixed = originReport([...base, r(APP_ORIGINS[0], "error", "x"), r(APP_ORIGINS[1], "refused")], PAGE);
+  assert.equal(mixed.appReady, null, "one refusal and one error is not 'both refused'");
+  const cors = originReport([...base, r(APP_ORIGINS[0], "no-cors"), r(APP_ORIGINS[1], "no-cors")], PAGE);
+  assert.equal(cors.appReady, false);
+  assert.match(cors.conclusion, /without the CORS headers/);
+  const refused = originReport([...base, r(APP_ORIGINS[0], "refused"), r(APP_ORIGINS[1], "refused")], PAGE);
+  assert.equal(refused.appReady, false);
+  assert.match(refused.conclusion, /refused both app addresses/);
 });
 
 test("the server shares the origin check with the page, without the token", async () => {

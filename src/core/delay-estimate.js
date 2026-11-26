@@ -295,8 +295,13 @@ export function utteranceDelays(
   const lo = Math.min(0, Math.max(-search, Math.round(minLagMs / hopMs) - center)); // offsets from the overall delay
   return segs.map((seg) => {
     const start = Math.max(0, seg.start - margin);
-    const end = Math.min(a.length, seg.end + margin);
-    const len = end - start;
+    const full = Math.min(a.length, seg.end + margin) - start;
+    // An utterance at the very end of a recording may have its output cut off
+    // by the end: compare only the part whose output is inside the recording
+    // at every lag searched (one window length for all lags, so no lag is
+    // favoured). With less than half of it left, the match can't be trusted.
+    const len = Math.min(full, b.length - (start + center + search));
+    const cut = len < full;
     const r = new Float64Array(search - lo + 1);
     for (let k = lo; k <= search; k++) r[k - lo] = windowCorrelation(a, start, b, start + center + k, len);
     const p = peakOf(r);
@@ -305,7 +310,7 @@ export function utteranceDelays(
       endSec: (seg.end * hopMs) / 1000,
       lagMs: (center + lo + p.position) * hopMs,
       score: p.value,
-      edge: p.index === 0 || p.index === r.length - 1,
+      edge: p.index === 0 || p.index === r.length - 1 || (cut && len < full / 2),
     };
   });
 }
