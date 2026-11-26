@@ -33,7 +33,7 @@ Email the recruiter, for example: "I sometimes use a real-time AI accent-convers
 ## 3. Set it up once (about 45 minutes)
 
 1. **In the app:**
-   - Your headset is its microphone.
+   - Your wired or USB headset is its microphone, not a Bluetooth one (see the README, "Before you start", step 4).
    - Accent conversion is on, for your microphone.
    - Meeting notes, transcription and recording are off (in Krisp: the AI Note Taker's automatic activation).
 2. **In Zoom, Teams or Meet:** pick the app's microphone, for example "Krisp Microphone", as your microphone. Don't pick your headset.
@@ -86,7 +86,7 @@ If it didn't pass, or there isn't time for all that, do the interview without a 
 ## 5. On the day
 
 1. Plug in the charger and set Power mode to **Best performance** (as in section 4). Use a cable to the internet if you can.
-2. Start the app and OBS's virtual camera. Keep your own check short (a minute): the trial's daily minutes count.
+2. Plug in your wired or USB headset, then start the app and OBS's virtual camera. Keep your own check short (a minute): the trial's daily minutes count.
 3. On the meeting's pre-join screen, check that:
    - the microphone is the app's;
    - its level moves when you speak;

@@ -45,8 +45,11 @@ Both need no build. If one of them beats Sanas cloud on your laptop, you can use
 | Model and voice | AT5.7: US English, "Universal" source accents, 16 kHz, "reduced processing latency". Voice Personalization keeps your voice. | Indian English to US English, about 200 ms claimed [unverified] |
 | Price | 7-day trial; the price after it is not published | Core about $8/month paid yearly or $16 monthly, with 1 h/day of conversion; Advanced about $15 / $30 with 4 h/day; 7-day trial [unverified] |
 | Unknown until measured | Delay and CPU load on your laptop; whether the trial includes conversion of your own voice | Real delay and CPU load |
+| Your earlier use | none | Before this test, on this laptop with a Bluetooth headset: the accent sounded very good, but it felt heavy, your voice sometimes cut off, and your lips didn't match your words (no video delay) |
 
 Your NVIDIA T1200 GPU doesn't change this. All three run their accent model in the cloud or on the CPU. No open-source model converts an accent live while keeping your voice: the live voice tools change only whose voice it sounds like, and the accent models run offline only.
+
+A Bluetooth headset explains part of your earlier Krisp problems: in call mode it lowers the sound quality both ways, can drop out, and adds a delay of its own that varies, which no fixed video delay can match. So Part 2 tests Krisp with a wired or USB headset: the read-aloud run counts the cut-offs (gaps) and measures the delay for OBS, and the CPU check shows how heavy it is.
 
 ## What the probe measures
 

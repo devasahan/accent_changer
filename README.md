@@ -30,7 +30,7 @@ The free trials last 7 days each. Starting them 5–6 days before the interview 
 1. **Node.js 20 or newer.** Open PowerShell (Start menu → type `PowerShell` → Enter), then type `node --version`. If it says "not recognized", or shows a version below 20, install the **LTS** version from [nodejs.org](https://nodejs.org) (Windows Installer). Then open a **new** PowerShell window.
 2. **Get this code.** On GitHub use **Code → Download ZIP** and unzip it.
 3. **Open a terminal in the right folder.** In File Explorer, open the folder that holds `README.md` and the `spike` folder. After unzipping it is often `accent_changer-main` inside another `accent_changer-main`. Click that window's address bar, type `powershell` and press Enter. This works on Windows 10 and 11.
-4. **Headphones:** make your wired or USB headphones the **default playback device** in Windows sound settings. Sanas plays its audio through the default device, so a Bluetooth headset in call mode would cut the quality.
+4. **A wired or USB headset, not Bluetooth:** headphones with a microphone that plug into the laptop's headphone jack (like the earphones with a microphone that came with older phones) or into a USB port. Make its headphones the **default playback device** in Windows sound settings: Sanas plays its audio through the default device. A Bluetooth headset switches to call mode when its microphone is on: the sound gets worse both ways, it can cut out, and it adds a delay of its own that varies, so lips and voice can't be matched. If you only have a Bluetooth headset, get a basic wired or USB one before you record in Part 1.
 
 ## Part 1: test Sanas cloud (now)
 
