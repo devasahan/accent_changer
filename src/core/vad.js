@@ -8,7 +8,9 @@
  * The signal is cut into short frames (10 ms). A frame is speech when it is
  * clearly above the room's noise floor and within `peakRangeDb` of the
  * speaker's recent peak: vowels come close to full level, while breaths, lip
- * smacks and keyboard noise stay far below it. `speaking` needs `attackMs` of
+ * smacks and keyboard noise stay far below it. The peak follows the voice,
+ * not the loudest sound (SpeechPeak): a cough or a mic bump does not make
+ * the next sentence "too quiet" to be speech. `speaking` needs `attackMs` of
  * speech frames in a row to switch on (a click is not speech) and stays on
  * for `hangMs` after the last one (the gaps between words belong to the
  * sentence).
@@ -48,6 +50,108 @@ export function frameLevelsDb(samples, sampleRate, frameMs = 10) {
   return out;
 }
 
+/** SpeechPeak's histogram: levels from SILENCE_DB to PEAK_TOP_DB in steps of PEAK_BIN_DB. */
+const PEAK_BIN_DB = 0.25;
+const PEAK_TOP_DB = 20;
+const PEAK_BINS = Math.round((PEAK_TOP_DB - SILENCE_DB) / PEAK_BIN_DB) + 1;
+
+/**
+ * The level of the user's loud speech, for "within N dB of the speech peak"
+ * tests that one loud sound must not throw off.
+ *
+ * It is the loudest speech frame heard lately (it jumps up, holds, then sinks
+ * slowly; time passes only for the frames it is given, so a long silence
+ * leaves it alone), but never more than `capDb` above the level that the
+ * loudest fifth (1 - `quantile`) of the last `windowMs` of speech frames
+ * reach. A cough, a click, a plosive pop or one shouted word is a few percent
+ * of that window: it cannot lift the peak far above the voice, so the voice's
+ * own frames stay inside every range measured from the peak. A voice that
+ * really gets louder lifts the reference once it fills a fifth of the window;
+ * a voice that gets quieter brings the peak down by the hold and the decay.
+ *
+ * Allocation-free: a ring of the window's levels (as histogram bins) and the
+ * histogram.
+ */
+export class SpeechPeak {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.frameMs=10] time per frame given to push()
+   * @param {number} [options.holdMs=2000] the loudest frame holds this long (in frames given) ...
+   * @param {number} [options.decayDbPerSec=3] ... then sinks this fast
+   * @param {number} [options.windowMs=2500] speech frames the reference level is taken over
+   * @param {number} [options.quantile=0.8] the reference: the level this share of the window stays under
+   * @param {number} [options.capDb=4] the peak is at most this far above the reference (the loudest
+   *   frames of real speech are typically 4-6 dB over it, so it holds the voice's own peak)
+   */
+  constructor({ frameMs = 10, holdMs = 2000, decayDbPerSec = 3, windowMs = 2500, quantile = 0.8, capDb = 4 } = {}) {
+    this.holdFrames = Math.max(0, Math.round(holdMs / frameMs));
+    this.decayDb = (decayDbPerSec * frameMs) / 1000;
+    this.capDb = capDb;
+    this._share = Math.min(1, Math.max(0, 1 - quantile)); // the loudest share of the window that sets the reference
+    this._ring = new Uint16Array(Math.max(1, Math.round(windowMs / frameMs)));
+    this._hist = new Uint16Array(PEAK_BINS);
+    this.reset();
+  }
+
+  /** Forget everything: no speech heard. */
+  reset() {
+    this._hist.fill(0);
+    this._n = 0; // levels in the window
+    this._w = 0; // next ring slot
+    this._max = -Infinity; // the loudest recent speech frame (held, then sinking)
+    this._hold = 0;
+    this._ref = Infinity; // the reference level (none until the first speech frame)
+    this._db = -Infinity;
+  }
+
+  /**
+   * One frame for which time passes: its level (dB), and whether it is speech
+   * (only speech raises the peak and joins the window; any frame given lets
+   * the hold run down and the peak sink toward it).
+   * @param {number} level
+   * @param {boolean} speech
+   */
+  push(level, speech) {
+    if (speech && level > this._max) {
+      this._max = level;
+      this._hold = this.holdFrames;
+    } else if (this._hold > 0) {
+      this._hold--;
+    } else if (this._max - this.decayDb > level) {
+      this._max -= this.decayDb;
+    }
+    if (speech) this._add(level);
+    const capped = this._ref + this.capDb;
+    this._db = this._max < capped ? this._max : capped;
+  }
+
+  /** The speech peak (dB; -Infinity before any speech). */
+  get db() {
+    return this._db;
+  }
+
+  _add(level) {
+    let b = Math.round((level - SILENCE_DB) / PEAK_BIN_DB);
+    if (b < 0) b = 0;
+    else if (b >= PEAK_BINS) b = PEAK_BINS - 1;
+    const ring = this._ring;
+    if (this._n === ring.length) this._hist[ring[this._w]]--;
+    else this._n++;
+    ring[this._w] = b;
+    if (++this._w === ring.length) this._w = 0;
+    this._hist[b]++;
+    // The reference: walking down from the top, the bin where the loudest share of the window is reached.
+    const want = Math.max(1, Math.ceil(this._share * this._n - 1e-9));
+    let seen = 0;
+    let k = PEAK_BINS - 1;
+    for (; k > 0; k--) {
+      seen += this._hist[k];
+      if (seen >= want) break;
+    }
+    this._ref = SILENCE_DB + k * PEAK_BIN_DB;
+  }
+}
+
 /**
  * Speech detector with an adaptive noise floor, a speech-peak tracker, attack
  * and hangover. Push the mic signal in blocks of any length; the state
@@ -65,6 +169,9 @@ export class Vad {
    * @param {number} [options.peakRangeDb=25] speech frames are within this of the recent speech peak
    * @param {number} [options.peakHoldMs=2000] the peak holds this long (counted in frames above the threshold) ...
    * @param {number} [options.peakDecayDbPerSec=3] ... then sinks this fast while there is sound
+   * @param {number} [options.peakWindowMs=2500] ... and is at most peakCapDb above the level the loudest fifth
+   *   of this much recent speech reaches (a cough or a click cannot lift it: see SpeechPeak)
+   * @param {number} [options.peakCapDb=4]
    * @param {number} [options.floorRiseDbPerSec=3] the noise floor rises this fast (it falls at once)
    */
   constructor({
@@ -77,6 +184,8 @@ export class Vad {
     peakRangeDb = 25,
     peakHoldMs = 2000,
     peakDecayDbPerSec = 3,
+    peakWindowMs = 2500,
+    peakCapDb = 4,
     floorRiseDbPerSec = 3,
   } = {}) {
     this.sampleRate = sampleRate;
@@ -87,8 +196,13 @@ export class Vad {
     this.attackFrames = Math.max(1, Math.ceil(attackMs / this.frameMs - 1e-9));
     this.hangSamples = Math.round((hangMs * sampleRate) / 1000);
     this.peakRangeDb = peakRangeDb;
-    this.peakHoldFrames = Math.round(peakHoldMs / this.frameMs);
-    this.peakDecayDb = (peakDecayDbPerSec * this.frameMs) / 1000;
+    this._peak = new SpeechPeak({
+      frameMs: this.frameMs,
+      holdMs: peakHoldMs,
+      decayDbPerSec: peakDecayDbPerSec,
+      windowMs: peakWindowMs,
+      capDb: peakCapDb,
+    });
     this.floorRiseDb = (floorRiseDbPerSec * this.frameMs) / 1000;
     this.reset();
   }
@@ -102,8 +216,7 @@ export class Vad {
     this._level = SILENCE_DB;
     this._floor = FLOOR_MIN_DB;
     this._floorSet = false;
-    this._peak = -Infinity; // no speech heard yet
-    this._peakHold = 0;
+    this._peak.reset(); // no speech heard yet
     this._run = 0; // speech frames in a row
     this._speaking = false;
     this._lastSpeechEnd = -1; // sample index just after the last speech frame; -1 = never
@@ -153,19 +266,14 @@ export class Vad {
 
     const threshold = Math.max(this._floor + this.marginDb, this.minDb);
     const loud = level > threshold;
-    const speech = loud && level >= this._peak - this.peakRangeDb; // any loud frame before the first speech
+    const speech = loud && level >= this._peak.db - this.peakRangeDb; // any loud frame before the first speech
 
-    // Speech peak: jumps up with louder speech, holds, then sinks slowly. Time only passes for
-    // it while there is sound, so a long silence (listening to the interviewer) does not lower
-    // it and let the next breath pass as speech; and a voice that got much quieter still
-    // brings it down in the end.
-    if (speech && level > this._peak) {
-      this._peak = level;
-      this._peakHold = this.peakHoldFrames;
-    } else if (loud) {
-      if (this._peakHold > 0) this._peakHold--;
-      else if (this._peak - this.peakDecayDb > level) this._peak -= this.peakDecayDb;
-    }
+    // Speech peak: jumps up with louder speech, holds, then sinks slowly, never far above the
+    // voice's usual level (a cough must not make the next words "too quiet"). Time only passes
+    // for it while there is sound, so a long silence (listening to the interviewer) does not
+    // lower it and let the next breath pass as speech; and a voice that got much quieter
+    // still brings it down in the end.
+    if (loud) this._peak.push(level, speech);
 
     if (speech) {
       this._run++;
@@ -196,7 +304,7 @@ export class Vad {
 
   /** Recent speech peak, dBFS (-Infinity before any speech). */
   get peakDb() {
-    return this._peak;
+    return this._peak.db;
   }
 
   /** Current speech threshold: max(floor + marginDb, minDb). */

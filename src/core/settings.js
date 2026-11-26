@@ -36,9 +36,13 @@ export const DEFAULTS = Object.freeze({
 /** Why a key-like setting was dropped (the text the app shows). */
 export const SECRET_MESSAGE = "API keys are kept in Windows Credential Manager, not in settings";
 
-/** Setting names that look like a secret; the known names that only contain "key" are not. */
+/**
+ * Setting names that look like a secret; the known names that only contain
+ * "key" are not, however they are capitalised (a hand-edited "HotkeyOwn" is
+ * an unknown name, dropped quietly, not a key the user put in the file).
+ */
 const SECRET_NAME = /key|token|secret|password|credential/i;
-const NOT_SECRET = new Set(["hotkeyOwn", "hotkeyConvert", "keyExpiresOn"]);
+const NOT_SECRET = new Set(["hotkeyown", "hotkeyconvert", "keyexpireson"]);
 
 const VOICE_TYPES = ["masculine", "feminine"];
 const SAMPLE_RATES = [16000, 48000];
@@ -55,6 +59,17 @@ const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v)
 const absent = (v) => v === undefined || v === null;
 const numberIn = (v, lo, hi) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
 
+/**
+ * True when redact() would hide part of `text`: a key, token or id pasted in
+ * by mistake. In a Windows path ("C:\…", "C:/…", "\\server\…") either slash
+ * separates parts, so "C:/Program Files/obs-studio/bin/64bit/obs64.exe" is
+ * checked part by part and is not taken for a base64 key.
+ */
+function looksLikeSecret(text, isPath = false) {
+  const checked = isPath && /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(text) ? text.replace(/\//g, "\\") : text;
+  return redact(checked) !== checked;
+}
+
 /** A real calendar date "YYYY-MM-DD" (no 30 February). */
 function isIsoDate(text) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
@@ -69,7 +84,7 @@ function reportSecrets(value, path, errors, depth) {
   for (const [key, child] of Object.entries(value)) {
     const where = path ? `${path}.${key}` : key;
     // redact(): a name that is itself key-like is not repeated in the message.
-    if (SECRET_NAME.test(key) && !NOT_SECRET.has(key)) errors.push(`Removed "${redact(where)}": ${SECRET_MESSAGE}.`);
+    if (SECRET_NAME.test(key) && !NOT_SECRET.has(key.toLowerCase())) errors.push(`Removed "${redact(where)}": ${SECRET_MESSAGE}.`);
     else reportSecrets(child, where, errors, depth + 1);
   }
 }
@@ -161,16 +176,15 @@ function keyOf(part) {
 }
 
 /**
- * A hotkey in canonical form ("ctrl + alt + b" → "Ctrl+Alt+B", modifiers in
- * the order Ctrl, Alt, Shift, Super), or null when it is not modifiers and
- * one key. The shape only: whether Windows lets the app have it is found out
- * when it is registered. It needs Ctrl, Alt or the Windows key, or Shift
- * with a key that types nothing (F9): a global Shift+B would steal every
- * capital B typed in the meeting's chat.
- * @param {string} text
- * @returns {string|null}
+ * Shortcuts that are not letters but that Windows or every app needs: closing
+ * a window (Alt+F4 would close the meeting), switching windows, the window
+ * and Start menus, the security screen and the Task Manager. Letters are
+ * covered by the two-modifier rule in normalizeHotkey.
  */
-export function normalizeHotkey(text) {
+const TAKEN = new Set(["Alt+F4", "Alt+Tab", "Alt+Escape", "Alt+Space", "Ctrl+Escape", "Ctrl+Alt+Delete", "Ctrl+Shift+Escape", "Super+Tab"]);
+
+/** The modifiers and key of a hotkey in canonical form, or null when it is not modifiers and one key. */
+function parseHotkey(text) {
   if (typeof text !== "string") return null;
   const parts = text.split("+").map((p) => p.trim());
   if (parts.length < 2 || parts.some((p) => !p)) return null;
@@ -188,17 +202,47 @@ export function normalizeHotkey(text) {
     }
   }
   if (!key || !mods.size) return null;
-  if (mods.size === 1 && mods.has("Shift") && key.types) return null;
-  return [...MODIFIER_ORDER.filter((m) => mods.has(m)), key.name].join("+");
+  return { mods, key, text: [...MODIFIER_ORDER.filter((m) => mods.has(m)), key.name].join("+") };
+}
+
+/** Why a well-formed hotkey would take a shortcut away from the user's other apps, or null when it would not. */
+function takenFromOthers({ mods, key, text }) {
+  // One modifier with a letter is some app's shortcut: Ctrl+C/V/X/Z/A/S copy, paste, undo, save;
+  // Ctrl+B bold in the meeting's chat, Ctrl+W closes a tab, Alt+letter opens a menu, Win+L locks the PC.
+  // Shift+B is every capital B typed in the chat.
+  if (mods.size === 1 && /^[A-Z]$/.test(key.name)) return "a letter needs two of Ctrl, Alt, Shift and Win";
+  // Shift with another typing key is a symbol or a space.
+  if (mods.size === 1 && mods.has("Shift") && key.types) return "with Shift alone it types a character";
+  return TAKEN.has(text) ? "Windows uses it" : null;
+}
+
+/**
+ * A hotkey in canonical form ("ctrl + alt + b" → "Ctrl+Alt+B", modifiers in
+ * the order Ctrl, Alt, Shift, Super), or null when it is not modifiers and
+ * one key, or when it would take a shortcut from the user's other apps: the
+ * hotkey is global, so the meeting app and the chat would never see it. It
+ * needs Ctrl, Alt or the Windows key, or Shift with a key that types nothing
+ * (F9): a global Shift+B would steal every capital B typed in the meeting's
+ * chat. A letter needs two modifiers (Ctrl+V is paste everywhere; Ctrl+Alt+V
+ * is free), and system shortcuts like Alt+F4 and Alt+Tab are refused. Whether
+ * Windows lets the app have the rest is found out when it is registered.
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function normalizeHotkey(text) {
+  const hotkey = parseHotkey(text);
+  return hotkey && takenFromOthers(hotkey) === null ? hotkey.text : null;
 }
 
 /**
  * Check settings read from the file (or edited on the settings page).
  * Unknown names are dropped. Key-like names (key, token, secret, password,
- * credential: all but hotkeyOwn, hotkeyConvert and keyExpiresOn), at any
- * depth, are dropped and reported. Every wrong value is replaced by its
- * default and reported. Error texts name the setting but never repeat its
- * value (it could be a pasted key).
+ * credential: all but hotkeyOwn, hotkeyConvert and keyExpiresOn in any
+ * capitalisation), at any depth, are dropped and reported. So is a key in
+ * a free-text setting (modelName, micLabel, cableLabel, obsPath: anything
+ * redact() would hide). Every wrong value is replaced by its default and
+ * reported. Error texts name the setting but never repeat its value (it
+ * could be a pasted key).
  *
  * `ready` is true once voiceType is "masculine" or "feminine": the Sanas
  * model is picked by it, so until then the app can't convert. A missing
@@ -224,6 +268,14 @@ export function validateSettings(input) {
     errors.push(`${name} must be text; it was cleared.`);
     return DEFAULTS[name];
   };
+  // Free text that a pasted key could end up in. Not the device ids: their 64 hex digits are
+  // what redact() hides from logs, yet they are only names for this PC's devices.
+  const plainText = (name) => {
+    const v = text(name);
+    if (!v || !looksLikeSecret(v, name === "obsPath")) return v;
+    errors.push(`${name} looks like an API key, so it was not kept (${SECRET_MESSAGE}); it was cleared.`);
+    return DEFAULTS[name];
+  };
   const bool = (v, label, fallback) => {
     if (absent(v)) return fallback;
     if (typeof v === "boolean") return v;
@@ -234,9 +286,9 @@ export function validateSettings(input) {
   const settings = {
     version: 1,
     micDeviceId: text("micDeviceId"),
-    micLabel: text("micLabel"),
+    micLabel: plainText("micLabel"),
     cableDeviceId: text("cableDeviceId"),
-    cableLabel: text("cableLabel"),
+    cableLabel: plainText("cableLabel"),
     modelName: modelName(src.modelName, errors),
     voiceType: voiceType(src.voiceType, errors),
     sampleRate: sampleRate(src.sampleRate, errors),
@@ -246,7 +298,7 @@ export function validateSettings(input) {
     startWithWindows: bool(src.startWithWindows, "startWithWindows", DEFAULTS.startWithWindows),
     lipSync: { ...DEFAULTS.lipSync },
     budget: { ...DEFAULTS.budget },
-    obsPath: text("obsPath"),
+    obsPath: plainText("obsPath"),
   };
 
   if (settings.hotkeyOwn === settings.hotkeyConvert) {
@@ -288,7 +340,7 @@ function modelName(value, errors) {
   if (absent(value) || (typeof value === "string" && !value.trim())) return DEFAULTS.modelName;
   const name = typeof value === "string" ? value.trim() : "";
   // The key and the model name are both copied from the Sanas Console: a key pasted here must not be saved.
-  if (name && redact(name) !== name) {
+  if (name && looksLikeSecret(name)) {
     errors.push(`modelName looks like an API key, so it was not kept (${SECRET_MESSAGE}); using ${DEFAULTS.modelName}.`);
   } else if (MODEL_NAME.test(name)) return name;
   else errors.push(`modelName must be a model name from the Sanas Console, like AT5.2; using ${DEFAULTS.modelName}.`);
@@ -322,6 +374,14 @@ function hotkey(value, name, errors) {
   if (absent(value) || value === "") return DEFAULTS[name];
   const canonical = normalizeHotkey(value);
   if (canonical) return canonical;
-  errors.push(`${name} must be Ctrl, Alt, Shift or Win keys and one more key, like ${DEFAULTS[name]}; using ${DEFAULTS[name]}.`);
+  const parsed = parseHotkey(value);
+  if (parsed) {
+    // Its canonical text is made of modifier and key names only, so it may be shown.
+    errors.push(
+      `${name} must be keys no other app needs: a hotkey works everywhere, so ${parsed.text} would be taken from Windows and every app (${takenFromOthers(parsed)}); using ${DEFAULTS[name]}.`,
+    );
+  } else {
+    errors.push(`${name} must be Ctrl, Alt, Shift or Win keys and one more key, like ${DEFAULTS[name]}; using ${DEFAULTS[name]}.`);
+  }
   return DEFAULTS[name];
 }

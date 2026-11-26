@@ -220,9 +220,11 @@ export class CostMeter {
    * (plain JSON, local dates). Without `atMs` only ended calls are in; pass
    * `atMs` to include open calls up to then, so a save every minute or so
    * during a long call loses at most that minute if the app is killed. The
-   * last 62 days are kept (counted back from `atMs`, else from this run's
-   * latest call end, else from the newest saved day); older days are
-   * dropped, their months keep them. Months are kept for two years.
+   * last 62 days are kept, counted back from a clock reading: `atMs`, else
+   * this run's latest call end. Older days are dropped, their months keep
+   * them; months are kept for two years. Without a clock reading (no `atMs`
+   * and no call this run) nothing is dropped: the saved dates alone can't
+   * say what "now" is.
    * @param {{atMs?: number, timeZoneOffsetMin?: number}} [options]
    * @returns {{version: 1, days: Object<string, number>, months: Object<string, number>}}
    */
@@ -239,16 +241,21 @@ export class CostMeter {
       });
     }
     // Count the kept days back from a clock reading (atMs, else this run's
-    // latest call end) when there is one: one odd future date in a
-    // hand-edited file must not push the real history out.
+    // latest call end). Without one, keep everything: counting back from the
+    // newest saved date would let one future date (a PC clock that was wrong
+    // during an earlier run, or a hand edit) drop every real day and month,
+    // and this month's spend with them. A run without calls adds nothing, so
+    // the file does not grow; the next save with a clock reading trims it.
     let nowMs = validTime(atMs) ? atMs : null;
     for (const call of calls) if (nowMs === null || call.endMs > nowMs) nowMs = call.endMs;
-    let newestDay = nowMs !== null ? localDay(nowMs, off) : -Infinity;
-    if (nowMs === null) for (const key of days.keys()) newestDay = Math.max(newestDay, dayNumber(key));
-    let newestMonth = nowMs !== null ? monthIndex(dayKey(newestDay)) : -Infinity;
-    if (nowMs === null) for (const key of months.keys()) newestMonth = Math.max(newestMonth, monthIndex(key));
-    const keptDays = [...days].filter(([key]) => dayNumber(key) > newestDay - KEEP_DAYS);
-    const keptMonths = [...months].filter(([key]) => monthIndex(key) > newestMonth - KEEP_MONTHS);
+    let keptDays = [...days];
+    let keptMonths = [...months];
+    if (nowMs !== null) {
+      const newestDay = localDay(nowMs, off);
+      const newestMonth = monthIndex(dayKey(newestDay));
+      keptDays = keptDays.filter(([key]) => dayNumber(key) > newestDay - KEEP_DAYS);
+      keptMonths = keptMonths.filter(([key]) => monthIndex(key) > newestMonth - KEEP_MONTHS);
+    }
     return {
       version: 1,
       days: Object.fromEntries(keptDays.sort(byKey).map(rounded)),

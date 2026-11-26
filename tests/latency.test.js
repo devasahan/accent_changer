@@ -14,7 +14,31 @@ const LONG_SR = 16000; // the long takes are made at 16 kHz: the same envelopes,
  * (another speaker's syllables), over a faint noise floor.
  */
 function converted(samples, sampleRate, delayMs, seed) {
-  const x = recolour(delayed(samples, Math.round((delayMs * sampleRate) / 1000)), sampleRate, {
+  return engineVoice(delayed(samples, Math.round((delayMs * sampleRate) / 1000)), sampleRate, seed);
+}
+
+/**
+ * As converted(), with a delay that moves: dAt(sec) gives the delay (ms) of
+ * the converted voice arriving at that moment, null while nothing arrives (a
+ * stall). A jitter buffer that grows or drains stretches or squeezes the
+ * voice by that much.
+ */
+function convertedVarying(samples, sampleRate, dAt, seed) {
+  const y = new Float32Array(samples.length);
+  for (let n = 0; n < y.length; n++) {
+    const d = dAt(n / sampleRate);
+    if (d === null) continue;
+    const pos = n - (d * sampleRate) / 1000;
+    const i = Math.floor(pos);
+    const f = pos - i;
+    if (i >= 0 && i + 1 < samples.length) y[n] = samples[i] * (1 - f) + samples[i + 1] * f;
+  }
+  return engineVoice(y, sampleRate, seed);
+}
+
+/** The engine's voice for converted(): darker, -6 dB, ±6 dB wobble every 40 ms, a -60 dB floor. */
+function engineVoice(delayedSamples, sampleRate, seed) {
+  const x = recolour(delayedSamples, sampleRate, {
     cutoffHz: 1000,
     gainDb: -6,
   });
@@ -212,7 +236,9 @@ test("follows a delay stepping ±10 ms every few minutes through a 60-minute int
   let current = null; // delay of the current (or last) answer
   let previous = null; // delay of the answer before it
   let answerStart = 0;
-  const started = performance.now();
+  // CPU time, not wall-clock time: `npm test` runs the test files side by side, and on a busy
+  // machine the same work can take several times as long by the clock.
+  const started = process.cpuUsage();
   for (const s of segments) {
     if (s.k >= 0 && s.turnStart) {
       previous = current ?? s.D;
@@ -240,11 +266,12 @@ test("follows a delay stepping ±10 ms every few minutes through a 60-minute int
     );
     now += orig.length * (HOP / 1000);
   }
-  const elapsed = performance.now() - started;
+  const used = process.cpuUsage(started);
+  const cpuMs = (used.user + used.system) / 1000;
   assert.ok(Math.abs(now - 3600) < 15, `simulated ${now} s`);
   assert.ok(searches.full <= 2, `whole-range searches: ${searches.full} (the lock only)`);
   assert.ok(searches.local > 500, `local searches: ${searches.local}`);
-  assert.ok(elapsed < 5000, `tracking the hour took ${elapsed.toFixed(0)} ms`);
+  assert.ok(cpuMs < 5000, `tracking the hour used ${cpuMs.toFixed(0)} ms of CPU time`);
   const p95 = percentile(
     t.history.map((h) => h.ms),
     95,
@@ -373,14 +400,124 @@ test("a converted-voice dropout leaves D alone; after unrelated sound D comes ba
   }
 });
 
+test("after a stall, relock() follows the delay while the jitter buffer drains, and locks again only once it has settled", () => {
+  // The converted voice stops at 20 s; the app calls relock() when the stall is reported (0.45 s
+  // later). The voice comes back 1.5 s after it stopped, 650 ms late, and the jitter buffer
+  // drains to 330 ms over 5 s. Taking the first estimate after relock() for good locked D on a
+  // passing value (475-630 ms) and the rest of the drain then needed three agreeing whole-range
+  // estimates: D was more than 40 ms off for 13-19 s.
+  const [STALL, RESUME, DRAIN, FROM, TO] = [20, 21.5, 5, 650, 330];
+  const dAt = (sec) => (sec < STALL ? TO : sec < RESUME ? null : sec < RESUME + DRAIN ? FROM - ((sec - RESUME) * (FROM - TO)) / DRAIN : TO);
+  const settledSec = RESUME + DRAIN;
+  for (const seed of [1, 2, 3, 6]) {
+    const { samples } = synthSpeech({ sampleRate: LONG_SR, seconds: 40, seed });
+    const orig = env(addNoise(samples, -65, seed + 10), LONG_SR);
+    const conv = env(convertedVarying(samples, LONG_SR, dAt, seed + 5), LONG_SR);
+    const t = new LatencyTracker();
+    let relocked = false;
+    let offSec = 0; // after the voice came back: time with D more than 40 ms from the delay it has
+    const after = []; // results after relock()
+    feed(
+      t,
+      orig,
+      conv,
+      (tr, sec, r) => {
+        if (!relocked) return;
+        if (r) after.push({ sec, ...r, D: tr.delayMs, locked: tr.locked });
+        const label = `seed ${seed} at ${sec} s: D ${tr.delayMs} (${tr.locked ? "locked" : "following"})`;
+        if (!after.length) assert.ok(Math.abs(tr.delayMs - TO) <= 10, `${label}: the old D is kept until the first estimate`);
+        if (tr.locked) assert.ok(Math.abs(tr.delayMs - TO) <= 10, `${label}: never locked on a passing value`);
+        if (sec >= settledSec + 6) assert.ok(Math.abs(tr.delayMs - TO) <= 10, `${label}: settled within 6 s of the drain's end, for good`);
+        if (sec >= RESUME && Math.abs(tr.delayMs - dAt(sec)) > 40) offSec += (CHUNK * HOP) / 1000;
+      },
+      {
+        before: (tr, sec) => {
+          if (!relocked && sec >= STALL + 0.45) {
+            tr.relock();
+            relocked = true;
+          }
+        },
+      },
+    );
+    const label = `seed ${seed}: ${JSON.stringify(after.map((x) => [x.sec, x.ms, x.accepted, x.locked]))}`;
+    // D followed the drain, one whole-range estimate every 3 s: the first one moved it at once, and
+    // it moved down with the delay until three estimates in a row agreed.
+    const lock = after.findIndex((x) => x.locked);
+    assert.ok(lock >= 2, label);
+    assert.ok(after.slice(0, lock + 1).every((x) => x.method === "full" && x.accepted), label);
+    assert.ok(after[0].D - TO > 150, label);
+    for (let i = 1; i <= lock; i++) assert.ok(after[i].D <= after[i - 1].D + 10, label);
+    assert.ok(offSec <= DRAIN + 6, `seed ${seed}: D more than 40 ms off for ${offSec} s after the voice came back`);
+    assert.ok(t.locked && Math.abs(t.delayMs - TO) <= 10, label);
+  }
+});
+
+test("follows a jitter buffer that grows and shrinks by 10 ms a second", () => {
+  // No stall: the delay ramps 300 → 400 ms over 10 s, holds, then ramps down to 320 ms over 8 s.
+  // A 12 s window lagged so far behind that D stayed up to 96 ms off for 18-24 s of the take; the
+  // last 6 s keep it on a delay the converted voice really had a moment ago.
+  const dAt = (sec) => (sec < 20 ? 300 : sec < 30 ? 300 + (sec - 20) * 10 : sec < 50 ? 400 : sec < 58 ? 400 - (sec - 50) * 10 : 320);
+  for (const seed of [1, 2, 3, 4]) {
+    const { samples } = synthSpeech({ sampleRate: LONG_SR, seconds: 75, seed });
+    const orig = env(addNoise(samples, -65, seed + 10), LONG_SR);
+    const conv = env(convertedVarying(samples, LONG_SR, dAt, seed + 77), LONG_SR);
+    const t = new LatencyTracker();
+    let worst = 0;
+    feed(t, orig, conv, (tr, sec) => {
+      if (sec < 3) return;
+      const label = `seed ${seed} at ${sec} s: D ${tr.delayMs}, true ${dAt(sec).toFixed(1)}`;
+      worst = Math.max(worst, Math.abs(tr.delayMs - dAt(sec)));
+      // Within 20 ms of a delay the converted voice had in the last 6 s.
+      let near = Infinity;
+      for (let back = 0; back <= 6; back += 0.25) near = Math.min(near, Math.abs(tr.delayMs - dAt(Math.max(0, sec - back))));
+      assert.ok(near <= 20, label);
+      // Once a ramp ends, D is on the new delay within 4 s and stays there.
+      if ((sec >= 34 && sec < 50) || sec >= 62) assert.ok(Math.abs(tr.delayMs - dAt(sec)) <= 10, label);
+    });
+    assert.ok(worst <= 75, `seed ${seed}: D up to ${worst} ms off the delay of the moment`);
+  }
+});
+
+test("a delay that changes while the user listens: the first estimate on little speech never moves D to a look-alike", () => {
+  // 20 s of talking at 330 ms; the delay changes during 15 s of listening. The first window of the
+  // next answer is mostly silence: its short block of speech lifted the score of a side lobe near
+  // the old D, and the narrow window took it, leaving D 40-55 ms from both delays for 9 s.
+  for (const [delta, seed] of [
+    [200, 4],
+    [200, 13],
+    [-200, 13],
+    [250, 12],
+  ]) {
+    const d2 = 330 + delta;
+    const a = synthSpeech({ sampleRate: LONG_SR, seconds: 20, seed, tailSec: 0.5 });
+    const b = synthSpeech({ sampleRate: LONG_SR, seconds: 30, seed: seed + 50, leadSec: 15 });
+    const join = (x, y) => {
+      const out = new Float32Array(x.length + y.length);
+      out.set(x);
+      out.set(y, x.length);
+      return out;
+    };
+    const orig = join(env(addNoise(a.samples, -65, seed + 10), LONG_SR), env(addNoise(b.samples, -65, seed + 11), LONG_SR));
+    const conv = join(env(converted(a.samples, LONG_SR, 330, seed + 20), LONG_SR), env(converted(b.samples, LONG_SR, d2, seed + 21), LONG_SR));
+    const t = new LatencyTracker();
+    feed(t, orig, conv, (tr, sec) => {
+      if (sec < 3) return;
+      const off = Math.min(Math.abs(tr.delayMs - 330), Math.abs(tr.delayMs - d2));
+      assert.ok(off <= 10, `${delta} ms, seed ${seed}, at ${sec} s: D ${tr.delayMs}, neither 330 nor ${d2}`);
+    });
+    assert.ok(Math.abs(t.delayMs - d2) <= 10, `${delta} ms, seed ${seed}: D ${t.delayMs} at the end`);
+  }
+});
+
 // ---------- the decision rules, with a stand-in for the search ----------
 
 /**
  * A stand-in for estimateDelayFromEnvelopes. The converted voice is
  * `world.peak` ms late with correlation `world.score`. A search whose range
  * misses the peak finds `world.lookalike` ({ at, score }) when it covers it,
- * else only a slope up to its nearer end (score 0.2). `world.none`: nothing
- * to compare. Every search's [minLagMs, maxLagMs] goes into `calls`.
+ * else only a slope up to its nearer end (score `world.slope`, 0.2 unless
+ * set). `world.none`: nothing to compare. Every search's [minLagMs,
+ * maxLagMs] goes into `calls`.
  */
 function fakeWorld(world) {
   const calls = [];
@@ -391,7 +528,7 @@ function fakeWorld(world) {
     if (inside(world.peak)) return { lagMs: world.peak, score: world.score, method: "onsets" };
     const l = world.lookalike;
     if (l && inside(l.at)) return { lagMs: l.at, score: l.score, method: "onsets" };
-    return { lagMs: world.peak < minLagMs ? minLagMs : maxLagMs, score: 0.2, method: "envelope" };
+    return { lagMs: world.peak < minLagMs ? minLagMs : maxLagMs, score: world.slope ?? 0.2, method: "envelope" };
   };
   return { calls, estimate };
 }
@@ -527,6 +664,145 @@ test("a narrow-window result far below the recent scores is checked: a look-alik
   assert.equal(calls.length, 2);
   w2.score = 0.7; // the median of the recent scores is still 0.9: 0.7 is within 0.75 of it
   assert.deepEqual(step(t2), { ms: 300, score: 0.7, method: "local", accepted: true });
+});
+
+test("two agreeing whole-range estimates move D when the delay drifted out of the narrow window toward an equally strong peak", () => {
+  // The narrow window's best match is at its edge with a trusted score (a slope up toward the
+  // new peak) and the whole range finds that peak scoring like the recent matches: a jitter
+  // buffer grew past the window. Two estimates in a row are enough.
+  const world = { peak: 300, score: 0.9 };
+  const { t, calls } = locked(world);
+  Object.assign(world, { peak: 395, slope: 0.6 });
+  assert.deepEqual(step(t), { ms: 395, score: 0.9, method: "full", accepted: false });
+  assert.deepEqual(step(t), { ms: 395, score: 0.9, method: "full", accepted: true });
+  assert.equal(t.delayMs, 395);
+  assert.deepEqual(calls, [
+    [240, 360],
+    [-100, 1500],
+    [-100, 1500],
+  ]);
+
+  // Not drift, so three: a slope that is not trusted (the old peak faded: the test above), a new
+  // peak far weaker than the recent matches, or the narrow window's edge on the other side.
+  for (const [change, label] of [
+    [{ peak: 395, slope: 0.2 }, "an untrusted slope"],
+    [{ peak: 395, slope: 0.6, score: 0.5 }, "a weak new peak"],
+    [{ peak: 395, lookalike: { at: 241, score: 0.6 } }, "the edge on the other side"],
+  ]) {
+    const w = { peak: 300, score: 0.9 };
+    const { t: t2 } = locked(w);
+    Object.assign(w, change);
+    assert.deepEqual([step(t2).accepted, step(t2).accepted, step(t2).accepted], [false, false, true], label);
+    assert.equal(t2.delayMs, 395, label);
+  }
+});
+
+test("a whole-range match near D that scores far below the recent ones may confirm D but never move it", () => {
+  // While the engine sends something unrelated, the best match near D is a look-alike: taking it
+  // would walk D off by up to localSearchMs at a time.
+  const world = { peak: 300, score: 0.9 };
+  const { t, calls } = locked(world);
+  Object.assign(world, { peak: 340, score: 0.5 }); // below 0.75 x 0.9, 40 ms from D
+  assert.deepEqual(step(t), { ms: 340, score: 0.5, method: "full", accepted: false });
+  assert.equal(t.delayMs, 300);
+  assert.deepEqual(calls, [
+    [240, 360],
+    [-100, 1500],
+  ]);
+  // It counts as untrusted: after three in a row only the whole range is searched.
+  step(t);
+  step(t);
+  calls.length = 0;
+  assert.equal(step(t).accepted, false);
+  assert.deepEqual(calls, [[-100, 1500]]);
+  // A weak match within confirmMs of D confirms it (a window with little speech, the peak still at D).
+  world.peak = 306;
+  assert.deepEqual(step(t), { ms: 306, score: 0.5, method: "full", accepted: true });
+  assert.equal(t.delayMs, 306);
+  // A strong one near D moves it as before.
+  Object.assign(world, { peak: 340, score: 0.9 });
+  assert.deepEqual(step(t), { ms: 340, score: 0.9, method: "local", accepted: true });
+});
+
+test("in a window with little speech, a narrow-window result that moves D more than 20 ms is checked with the whole range", () => {
+  // The first estimate after the user listened for a while: half a second of speech in 6 s. Its
+  // block of speech lifts the score of every lag near it, so a side lobe looks like a peak.
+  const QUIET_ORIG = new Float32Array(CHUNK).fill(-60);
+  const QUIET_CONV = new Float32Array(CHUNK).fill(-66);
+  /** 5.5 s of listening, then 0.5 s of talking: the result of the estimate that runs at its end. */
+  const listenThenTalk = (tracker) => {
+    let r = null;
+    for (let i = 0; i < 24; i++) {
+      tracker.push(i < 22 ? QUIET_ORIG : TALK_ORIG, i < 22 ? QUIET_CONV : TALK_CONV);
+      r = tracker.update() ?? r;
+    }
+    return r;
+  };
+  // The delay jumped to 530 ms while the user listened; the narrow window holds a 0.85 look-alike at 270 ms.
+  const world = { peak: 300, score: 0.9 };
+  const { t, calls } = locked(world);
+  Object.assign(world, { peak: 530, lookalike: { at: 270, score: 0.85 } });
+  assert.deepEqual(listenThenTalk(t), { ms: 530, score: 0.9, method: "full", accepted: false });
+  assert.deepEqual(calls, [
+    [240, 360],
+    [-100, 1500],
+  ]);
+  assert.equal(t.delayMs, 300, "the look-alike did not move D");
+
+  // A small move from little speech is taken as usual; a bigger one once the whole range agrees.
+  const w2 = { peak: 300, score: 0.9 };
+  const { t: t2, calls: c2 } = locked(w2);
+  w2.peak = 315;
+  assert.deepEqual(listenThenTalk(t2), { ms: 315, score: 0.9, method: "local", accepted: true });
+  w2.peak = 345;
+  assert.deepEqual(listenThenTalk(t2), { ms: 345, score: 0.9, method: "full", accepted: true });
+  assert.deepEqual(c2, [
+    [240, 360],
+    [255, 375],
+    [-100, 1500],
+  ]);
+  // With speech in half the window, the same move needs no whole-range search.
+  assert.equal(step(t2).method, "local");
+  w2.peak = 375;
+  assert.deepEqual(step(t2), { ms: 375, score: 0.9, method: "local", accepted: true });
+});
+
+test("after relock() D follows every trusted whole-range estimate, and locks again once three in a row agree", () => {
+  const world = { peak: 300, score: 0.9 };
+  const { t, calls } = locked(world);
+  t.relock();
+  // The voice came back late after a stall and the jitter buffer drains.
+  const seen = [];
+  for (const [peak, score] of [
+    [620, 0.9],
+    [480, 0.9],
+    [335, 0.9],
+    [700, 0.2], // untrusted: D stays, and agreement starts over
+    [331, 0.9],
+    [329, 0.9],
+  ]) {
+    Object.assign(world, { peak, score });
+    const r = step(t);
+    seen.push([r.ms, r.method, r.accepted, t.delayMs, t.locked]);
+  }
+  assert.deepEqual(seen, [
+    [620, "full", true, 620, false],
+    [480, "full", true, 480, false],
+    [335, "full", true, 335, false],
+    [700, "full", false, 335, false],
+    [331, "full", true, 331, false],
+    [329, "full", true, 329, false],
+  ]);
+  world.peak = 332;
+  assert.deepEqual(step(t), { ms: 332, score: 0.9, method: "full", accepted: true });
+  assert.equal(t.locked, true, "three in a row within confirmMs");
+  assert.ok(calls.every(([lo, hi]) => lo === -100 && hi === 1500), "whole-range searches until then");
+  assert.deepEqual(step(t).method, "local");
+  assert.deepEqual(
+    t.history.slice(5).map((h) => h.ms),
+    [620, 480, 335, 331, 329, 332, 332],
+    "every estimate taken is in the history",
+  );
 });
 
 test("after three untrusted estimates in a row only the whole range is searched, until a trusted one", () => {
