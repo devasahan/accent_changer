@@ -82,13 +82,15 @@ function speechMs(isSpeech, from, to) {
 /**
  * Places where a stall cuts into continuous speech: inside a vowel (±30 ms
  * within 6 dB of the peak), at least 700 ms before the end of its sentence,
- * not in the first sentence. One per sentence, at a random sample.
+ * not in the first sentence (nor in one starting before `afterSec`). One per
+ * sentence, at a random sample.
  */
-function stallPoints(samples, utterances, rand, count, levels = frameLevelsDb(samples, SR, 10)) {
+function stallPoints(samples, utterances, rand, count, levels = frameLevelsDb(samples, SR, 10), afterSec = 0) {
   let peak = -Infinity;
   for (const v of levels) peak = Math.max(peak, v);
   const points = [];
   for (const u of utterances.slice(1)) {
+    if (u.start < afterSec) continue;
     const options = [];
     for (let j = Math.ceil(u.start * 100) + 3; j < Math.floor((u.end - 0.7) * 100); j++) {
       let vowel = true;
@@ -113,6 +115,91 @@ function conceal(conv, at, seed) {
 /** Adds `x` into `into` from sample `at` on (in place). */
 function addAt(into, x, at) {
   for (let i = 0; i < x.length && at + i < into.length; i++) into[at + i] += x[i];
+}
+
+/**
+ * A converted voice band-limited like an 8 kHz-sampled one: `delayMs` later, -6 dB, through a
+ * 4th-order Butterworth low-pass at `fcHz` (two biquads). The synth's fricatives come out 20 dB
+ * and more under the original's.
+ */
+function bandLimited(samples, delayMs, fcHz) {
+  const w = (2 * Math.PI * fcHz) / SR;
+  const cw = Math.cos(w);
+  const al = Math.sin(w) / Math.SQRT2;
+  const [b0, b1, a0, a1, a2] = [(1 - cw) / 2, 1 - cw, 1 + al, -2 * cw, 1 - al];
+  const stage = (x) => {
+    const y = new Float32Array(x.length);
+    let x1 = 0;
+    let x2 = 0;
+    let y1 = 0;
+    let y2 = 0;
+    for (let i = 0; i < x.length; i++) {
+      const v = (b0 * x[i] + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2) / a0;
+      x2 = x1;
+      x1 = x[i];
+      y2 = y1;
+      y1 = Math.abs(v) < 1e-20 ? 0 : v;
+      y[i] = y1;
+    }
+    return y;
+  };
+  return stage(stage(scaled(delayed(samples, ms(delayMs)), -6)));
+}
+
+/** `x` times 10^(db/20), a copy. */
+function scaled(x, db) {
+  const g = 10 ** (db / 20);
+  return Float32Array.from(x, (v) => v * g);
+}
+
+/** The voice's loudest 10 ms frame (dBFS). */
+function peakDb(samples) {
+  let peak = -Infinity;
+  for (const v of frameLevelsDb(samples, SR, 10)) peak = Math.max(peak, v);
+  return peak;
+}
+
+/**
+ * The take with a drawn-out vowel ("sooo", "uhhh": a steady harmonic buzz at the synth's vowel
+ * level with a slight 3 Hz vibrato, 20 ms ramps) of `sec` seconds, 150 ms after the first sentence
+ * that ends after 9 s; the rest of the take moves later to make room. Returns the new samples and
+ * where the vowel starts.
+ */
+function withVowel(seed, sec) {
+  const { samples, utterances } = speech(seed, 24);
+  const k = utterances.findIndex((u) => u.start > 9);
+  const ins = Math.round(utterances[k - 1].end * SR) + ms(150);
+  const shift = Math.round((sec + 0.3) * SR);
+  const y = new Float32Array(samples.length);
+  y.set(samples.subarray(0, ins));
+  y.set(samples.subarray(ins, samples.length - shift), ins + shift);
+  const n = Math.round(sec * SR);
+  const f0 = 120 + 10 * seed;
+  let phase = 0;
+  for (let i = 0; i < n; i++) {
+    phase += (2 * Math.PI * f0 * (1 + 0.03 * Math.sin((2 * Math.PI * 3 * i) / SR))) / SR;
+    let x = 0;
+    for (let h = 1; h <= 12; h++) x += Math.sin(h * phase) / h;
+    y[ins + i] = 0.12 * Math.min(1, i / ms(20), (n - i) / ms(20)) * x;
+  }
+  return { samples: y, vowelAt: ins, vowelEnd: ins + n };
+}
+
+/**
+ * The user talks for `talkSec` (until the end of the sentence going on then), then listens while
+ * `other` (a sound in the room, from 1 s into the listening) and a -65 dBFS room reach the mic.
+ * The converter returns the user's voice only. Returns { mic, conv, end, start }.
+ */
+function listening(seed, D, talkSec, other) {
+  const { samples, utterances } = speech(seed);
+  const end = Math.round(utterances.find((u) => u.end > talkSec).end * SR);
+  const voice = Float32Array.from(samples);
+  voice.fill(0, end);
+  const start = end + ms(1000);
+  const mic = Float32Array.from(voice);
+  const room = noise(mic.length, -65, 60 + seed);
+  for (let i = 0; i < mic.length; i++) mic[i] += room[i] + (i >= start ? other(i - start) : 0);
+  return { mic, conv: converted(voice, D), end, start };
 }
 
 const DELAYS = [0, 120, 250, 300, 333, 450, 600];
@@ -174,6 +261,61 @@ test("concealment-like stall (last 20 ms repeated and fading, then noise at -50 
   assert.ok(cases >= 60, `${cases} cases`);
 });
 
+test("concealment that comes close to the converted voice's level (a quiet talker or a quiet converter) is still a stall within 500 ms of speech", () => {
+  // The noise a stalled stream decays into is -50 dBFS whatever the voice's level: with the voice
+  // 6 dB quieter and the converter 6 dB down, or the converter 12 dB down, its loudest frames are
+  // under 20 dB above it, so the level tests alone take the noise for the voice. The converted
+  // voice dips between syllables where the original does; the noise does not.
+  let cases = 0;
+  for (const [talkDb, convDb] of [
+    [-6, -6],
+    [0, -12],
+  ]) {
+    for (const [seed, D] of [
+      [1, 250],
+      [2, 400],
+    ]) {
+      const { samples, utterances } = speech(seed);
+      const isSpeech = speechFrames(samples);
+      const [at] = stallPoints(samples, utterances, rng(20 * seed + D), 1, frameLevelsDb(samples, SR, 10), 9);
+      const orig = scaled(samples.subarray(0, at + ms(D) + ms(3000)), talkDb);
+      const conv = converted(orig, D, { gainDb: convDb });
+      conceal(conv, at + ms(D), seed + D);
+      const { stall, firedAt } = run(orig, conv, D);
+      const what = `talker ${talkDb} dB, converter ${convDb} dB, seed ${seed}, D ${D}`;
+      assert.ok(firedAt !== null, `${what}: no stall 3 s after the converted voice turned into noise`);
+      const lost = speechMs(isSpeech, at, firedAt - ms(D));
+      assert.ok(lost >= 350 && lost <= 500, `${what}: fired after ${lost} ms of speech`);
+      const errMs = ((stall.stallStartSample - at) * 1000) / SR;
+      assert.ok(errMs >= -20 && errMs <= 60, `${what}: stallStartSample off by ${errMs.toFixed(1)} ms`);
+      cases++;
+    }
+  }
+  assert.equal(cases, 4);
+});
+
+test("a converter stuck looping its last 20 ms at the voice's level (a buzz) is a stall within about 650 ms of speech", () => {
+  for (const [seed, D] of [
+    [1, 250],
+    [2, 400],
+    [4, 300],
+  ]) {
+    const { samples, utterances } = speech(seed);
+    const isSpeech = speechFrames(samples);
+    const [at] = stallPoints(samples, utterances, rng(30 * seed + D), 1, frameLevelsDb(samples, SR, 10), 9);
+    const orig = samples.subarray(0, at + ms(D) + ms(3000));
+    const conv = converted(orig, D);
+    const s0 = at + ms(D);
+    const loop = conv.slice(s0 - ms(20), s0);
+    for (let i = s0; i < conv.length; i++) conv[i] = loop[(i - s0) % loop.length];
+    const { firedAt } = run(orig, conv, D);
+    const what = `seed ${seed}, D ${D}`;
+    assert.ok(firedAt !== null, `${what}: no stall 3 s into the buzz`);
+    const lost = speechMs(isSpeech, at, firedAt - ms(D));
+    assert.ok(lost <= 650, `${what}: fired after ${lost} ms of speech`);
+  }
+});
+
 test("a cough, a click or one loud word during speech does not blind it: a stall 600 ms later still fires after 350-450 ms of speech", () => {
   // A speech peak that jumped to the transient and held there would leave every ordinary
   // voice frame more than speechRangeDb under it for seconds: nothing decided, no stall.
@@ -207,6 +349,30 @@ test("a cough, a click or one loud word during speech does not blind it: a stall
     }
   }
   assert.equal(cases, 24);
+});
+
+test("a coughing fit (five coughs 15 dB over the vowels, 250 ms apart) just before a stall does not blind it: fires after 350-430 ms of speech", () => {
+  // Five coughs fill a fifth of a 2.5 s span of speech and would set the speech peak's reference
+  // themselves; over the detector's 5 s span they cannot.
+  for (const [seed, D] of [
+    [1, 250],
+    [2, 400],
+    [3, 250],
+    [4, 400],
+  ]) {
+    const { samples, utterances } = speech(seed);
+    const isSpeech = speechFrames(samples);
+    const [at] = stallPoints(samples, utterances, rng(10 * seed + D), 1, frameLevelsDb(samples, SR, 10), 11);
+    const orig = Float32Array.from(samples.subarray(0, at + ms(D) + ms(2000)));
+    for (let c = 0; c < 5; c++) addAt(orig, noise(ms(100), -10, 10 * seed + c), at - ms(700) - c * ms(250));
+    const conv = converted(orig, D);
+    conv.fill(0, at + ms(D));
+    const { firedAt } = run(orig, conv, D);
+    const what = `seed ${seed}, D ${D}`;
+    assert.ok(firedAt !== null, `${what}: no stall`);
+    const lost = speechMs(isSpeech, at, firedAt - ms(D));
+    assert.ok(lost >= 350 && lost <= 430, `${what}: fired after ${lost} ms of speech`);
+  }
 });
 
 test("steady noise that starts while the user listens or talks never counts as missing speech: a fan, an unmute, a noise step", () => {
@@ -253,6 +419,102 @@ test("steady noise that starts while the user listens or talks never counts as m
     assert.ok(r.maxMissMs <= 60, `${name}: a miss run of ${r.maxMissMs} ms`);
     assert.equal(r.badAt, null, `${name}: bad output`);
     assert.ok(r.stall.speechPeakDb > -24, `${name}: the speech peak sank to ${r.stall.speechPeakDb.toFixed(1)} dB`);
+  }
+});
+
+test("a stall inside a drawn-out vowel ('sooo', 'uhhh', 0.6-1.6 s) fires after 350-450 ms of speech, not when the vowel ends", () => {
+  // The middle of a long vowel is steady: no frame within ±250 ms is 10 dB quieter. It still
+  // counts, at vowel level, inside speech the converter has been carrying.
+  for (const [seed, D] of [
+    [1, 250],
+    [3, 400],
+  ]) {
+    for (const sec of [0.6, 1.2, 1.6]) {
+      const { samples, vowelAt, vowelEnd } = withVowel(seed, sec);
+      const isSpeech = speechFrames(samples);
+      const at = vowelAt + ms(150); // the converter stops 150 ms into the vowel
+      const orig = samples.subarray(0, at + ms(D) + ms(3000));
+      const conv = converted(orig, D);
+      conv.fill(0, at + ms(D));
+      const { stall, firedAt } = run(orig, conv, D);
+      const what = `${sec} s vowel, seed ${seed}, D ${D}`;
+      assert.ok(firedAt !== null, `${what}: no stall`);
+      const lost = speechMs(isSpeech, at, firedAt - ms(D));
+      assert.ok(lost >= 350 && lost <= 450, `${what}: fired after ${lost} ms of speech`);
+      if (sec >= 1.2) assert.ok(firedAt - ms(D) < vowelEnd, `${what}: fired only ${(firedAt - ms(D) - vowelEnd) / 48} ms after the vowel ended`);
+      const errMs = ((stall.stallStartSample - at) * 1000) / SR;
+      assert.ok(errMs >= -20 && errMs <= 0, `${what}: stallStartSample off by ${errMs.toFixed(1)} ms`);
+    }
+  }
+});
+
+test("a loud fan (-22 dBFS, 3-4 dB under the voice's loudest frames) that starts while the user listens is no stall", () => {
+  // Steady sound near vowel level, but no speech the converter carried since the user stopped:
+  // it is not taken for a drawn-out vowel. (Its first 250 ms rise out of the room: modulated
+  // frames the converter leaves out, a miss run that ends there.)
+  for (const seed of [1, 2, 3]) {
+    const D = 300;
+    const fan = noise(ms(16000), -22, 11 + seed);
+    const { mic, conv, start } = listening(seed, D, 5, (i) => fan[i] * Math.min(1, i / ms(200)));
+    const r = run(mic, conv, D);
+    assert.equal(r.firedAt, null, `seed ${seed}: a stall ${r.firedAt && ((r.firedAt - start) / SR).toFixed(1)} s after the fan started`);
+    assert.ok(r.maxMissMs <= 300, `seed ${seed}: a miss run of ${r.maxMissMs} ms`);
+  }
+});
+
+test("another person talking, or music, 14-22 dB under the user's voice while the user listens is no stall", () => {
+  // The converter returns the user's voice only. The detector's speech peak learns from what the
+  // converter carried, so it does not sink to the other sound and count all of it as missing.
+  const D = 300;
+  const music = (seed) => {
+    // Chords changing every 250 ms, 4 Hz tremolo, at the synth's vowel level.
+    const rand = rng(300 + seed);
+    const x = new Float32Array(ms(12000));
+    let f1 = 220;
+    for (let i = 0; i < x.length; i++) {
+      if (i % ms(250) === 0) f1 = 196 * 2 ** ((1 + Math.floor(rand() * 4)) / 12);
+      const t = i / SR;
+      const trem = 0.6 + 0.4 * Math.sin(2 * Math.PI * 4 * t);
+      x[i] = (0.12 * trem * (Math.sin(2 * Math.PI * f1 * t) + Math.sin(2 * Math.PI * 1.26 * f1 * t) + Math.sin(2 * Math.PI * 1.5 * f1 * t))) / 2;
+    }
+    return x;
+  };
+  for (const seed of [1, 2]) {
+    const other = synthSpeech({ seconds: 12, seed: 100 + seed, leadSec: 0 }).samples;
+    const tones = music(seed);
+    for (const rel of [-14, -22]) {
+      const g = 10 ** (rel / 20);
+      for (const [kind, sound] of [
+        ["talker", (i) => g * (other[i] ?? 0)],
+        ["music", (i) => g * (tones[i] ?? 0)],
+      ]) {
+        const { mic, conv, start } = listening(seed, D, 5, sound);
+        const r = run(mic, conv, D);
+        assert.equal(r.firedAt, null, `${kind} ${rel} dB, seed ${seed}: a stall ${r.firedAt && ((r.firedAt - start) / SR).toFixed(1)} s after it started`);
+      }
+    }
+  }
+});
+
+test("a voice that gets 18 dB quieter for good (the converter follows) is still watched: a later stall fires", () => {
+  // The speech peak learns only from speech the converter carried; frames under the judging range
+  // that it carried at their own level teach it once no frame in range was carried for 2 s.
+  for (const seed of [1]) {
+    const { samples, utterances } = synthSpeech({ seconds: 40, seed });
+    const g = 10 ** (-18 / 20);
+    const x = Float32Array.from(samples, (v, i) => (i >= 10 * SR ? v * g : v));
+    const levels = frameLevelsDb(samples, SR, 10);
+    const peak = peakDb(samples);
+    const u = utterances.find((v) => v.start > 25);
+    let j = Math.ceil(u.start * 100) + 5;
+    while (levels[j] < peak - 6) j++;
+    const at = j * FRAME + 100;
+    const D = 300;
+    const conv = converted(x, D);
+    conv.fill(0, at + ms(D));
+    const { firedAt } = run(x, conv, D, { until: Math.min(x.length, at + ms(D) + ms(4000)) });
+    assert.ok(firedAt !== null, `seed ${seed}: no stall`);
+    assert.ok(firedAt - (at + ms(D)) <= ms(1500), `seed ${seed}: fired ${(firedAt - at - ms(D)) / 48} ms after the stall arrived`);
   }
 });
 
@@ -316,6 +578,101 @@ test("a converted stream that keeps losing pieces is a stall, counted from its f
   }
 });
 
+test("a stream losing 20-27 % of its blocks (one in four or five, 20 ms of every 80) never earns 3 s of health; from mid-sentence it is a stall that starts where the losses began", () => {
+  // Holes in a fifth to a quarter of the frames where the voice is due: the share hovers around
+  // choppyShare, so the stream counts as choppy only now and then, and with 20 ms holes every
+  // pause ends a cluster of them. The run still starts at the first hole after the stream was
+  // last whole, not at the newest cluster.
+  const D = 300;
+  for (const [name, on, off, seeds] of [
+    ["1 block in 4", 384, 128, [1, 2]],
+    ["1 block in 5", 512, 128, [1, 2]],
+    ["20 ms of 80", ms(60), ms(20), [1, 4]],
+  ]) {
+    for (const seed of seeds) {
+      const { samples, utterances } = speech(seed, 24);
+      const isSpeech = speechFrames(samples);
+      const levels = frameLevelsDb(samples, SR, 10);
+      const peak = peakDb(samples);
+      const what = `${name}, seed ${seed}`;
+      // Lossy from the start: the mixer needs 3 s of health to switch to it.
+      const lossy = converted(samples, D);
+      for (let t = 0; t < lossy.length; t += on + off) lossy.fill(0, t + on, t + on + off);
+      let maxHealthy = 0;
+      run(samples, lossy, D, { onBlock: (st) => (maxHealthy = Math.max(maxHealthy, st.healthyMs)) });
+      assert.ok(maxHealthy < 3000, `${what}: ${maxHealthy} ms of health from the start`);
+      // Healthy, then lossy from mid-sentence (arrival time at + D) on.
+      const [at] = stallPoints(samples, utterances, rng(77 * seed), 1, levels, 11);
+      const conv = converted(samples, D);
+      for (let t = at + ms(D); t < conv.length; t += on + off) conv.fill(0, t + on, t + on + off);
+      const { stall, firedAt } = run(samples, conv, D);
+      assert.ok(firedAt !== null, `${what}: no stall`);
+      const lost = speechMs(isSpeech, at, firedAt - ms(D));
+      assert.ok(lost <= 2500, `${what}: fired after ${lost} ms of speech`);
+      // The first lost piece of the voice worth hearing (content time; within 20 dB of its peak).
+      let first = null;
+      for (let t = at + on; first === null; t += on + off) {
+        for (let a = t; a < t + off && first === null; a++) if (levels[Math.floor(a / FRAME)] >= peak - 20) first = a;
+      }
+      // The mixer replays from 70 ms (tolMs + replayLeadMs) before stallStartSample: at or before
+      // where the losses began, and not seconds before.
+      const errMs = ((stall.stallStartSample - first) * 1000) / SR;
+      assert.ok(errMs <= 70 && errMs >= -500, `${what}: stallStartSample ${errMs.toFixed(1)} ms from the first speech lost`);
+    }
+  }
+});
+
+test("a converted voice band-limited to 4 kHz (its fricatives far down: level holes, not lost blocks) is not choppy and earns health as a full-band one", () => {
+  // At the right D and 30 ms early. Counted as whole holes, its fricatives hovered around the 20 %
+  // share: choppy for seconds, no health, and no switch to the converted voice for 20 s or more.
+  for (const [seed, err] of [
+    [1, -30],
+    [2, 0],
+    [3, -30],
+    [4, -30],
+  ]) {
+    const { samples } = speech(seed, 24);
+    let choppy = 0;
+    let health = null;
+    run(samples, bandLimited(samples, 300 + err, 4000), 300, {
+      onBlock: (st, end) => {
+        if (st.choppy) choppy += BLOCK;
+        if (health === null && st.healthyMs >= 3000) health = end;
+      },
+    });
+    const what = `seed ${seed}, converter ${err} ms from D`;
+    assert.ok(choppy <= ms(1000), `${what}: choppy for ${choppy / 48} ms`);
+    assert.ok(health !== null && health <= ms(20000), `${what}: 3 s of health ${health === null ? "never" : `at ${(health / SR).toFixed(1)} s`}`);
+  }
+});
+
+test("a band-limited stream that later loses blocks for real: the run starts where the losses began, not seconds before at an old fricative hole", () => {
+  // Its fricative holes keep the stream from ever being whole for 400 ms, so the first hole after
+  // it was last whole is old: the run start goes back at most lookBackMs before the newest cluster.
+  const D = 300;
+  for (const [name, on, off, seed] of [
+    ["1 block in 3", 256, 128, 5],
+    ["20 ms of 80", ms(60), ms(20), 5],
+    ["1 block in 3", 256, 128, 2],
+  ]) {
+    const { samples, utterances } = speech(seed, 24);
+    const levels = frameLevelsDb(samples, SR, 10);
+    const peak = peakDb(samples);
+    const [at] = stallPoints(samples, utterances, rng(77 * seed), 1, levels, 11);
+    const conv = bandLimited(samples, D, 4000);
+    for (let t = at + ms(D); t < conv.length; t += on + off) conv.fill(0, t + on, t + on + off);
+    const { stall, firedAt } = run(samples, conv, D);
+    const what = `${name}, seed ${seed}`;
+    assert.ok(firedAt !== null && firedAt > at + ms(D), `${what}: no stall after the losses began`);
+    let first = null;
+    for (let t = at + on; first === null; t += on + off) {
+      for (let a = t; a < t + off && first === null; a++) if (levels[Math.floor(a / FRAME)] >= peak - 20) first = a;
+    }
+    const errMs = ((stall.stallStartSample - first) * 1000) / SR;
+    assert.ok(errMs >= -1000 && errMs <= 70, `${what}: stallStartSample ${errMs.toFixed(1)} ms from the first speech lost`);
+  }
+});
+
 test("a stall that starts in a pause fires during the next sentence, and the replay point is before that sentence", () => {
   for (const seed of [1, 2, 3]) {
     const { samples, utterances } = speech(seed);
@@ -333,6 +690,44 @@ test("a stall that starts in a pause fires during the next sentence, and the rep
       assert.ok(lost >= 350 && lost <= 450, `seed ${seed} D ${D}: fired after ${lost} ms of speech`);
       assert.ok(stall.stallStartSample <= next, `seed ${seed} D ${D}: the replay would start after the sentence did`);
       assert.ok(stall.stallStartSample >= Math.round(utterances[k - 1].end * SR) - ms(300), `seed ${seed} D ${D}: replay point far too early`);
+    }
+  }
+});
+
+test("a stop in a sentence's soft ending, found only in the next sentence after a pause: the start is in that ending; a stop mid-pause repeats nothing", () => {
+  // The ±tol spans (or a concealment tail) match the last loud frames, so no miss run starts
+  // before the pause, and the 500 ms look-back from the next sentence ends in the pause: the
+  // look-back walks on to the previous sentence's last loud frame.
+  // (Behind a concealment tail that kept the last loud frame's level, the start can still be a
+  // few tens of ms late there.)
+  {
+    for (const seed of [1, 2, 3, 5]) {
+      const D = 300;
+      const { samples, utterances } = speech(seed, 24);
+      const k = utterances.findIndex((x) => x.start > 10 && x.end - x.start > 0.9 && x.end < 16);
+      const u = utterances[k];
+      const nx = utterances[k + 1];
+      const until = Math.round(nx.end * SR) + ms(1500);
+      const stop = (at) => {
+        const conv = converted(samples, D);
+        conv.fill(0, at + ms(D));
+        return run(samples, conv, D, { until });
+      };
+      const what = `seed ${seed}`;
+      // (a) The converter stops 150 ms before the sentence ends. The mixer replays from 70 ms before
+      // stallStartSample with a 30 ms fade-in: from the stop on, nothing is lost.
+      const at = Math.round(u.end * SR) - ms(150);
+      const a = stop(at);
+      assert.ok(a.firedAt !== null, `${what}, tail: no stall`);
+      assert.ok(a.stall.stallStartSample - ms(40) <= at, `${what}, tail: stallStartSample ${(a.stall.stallStartSample - at) / 48} ms after the stop`);
+      // (b) It stops in the middle of the pause: the replay repeats nothing of the sentence before.
+      let last = Math.round(nx.start * SR);
+      while (samples[last - 1] === 0) last--;
+      const mid = Math.round((last + Math.round(nx.start * SR)) / 2);
+      const b = stop(mid);
+      assert.ok(b.firedAt !== null, `${what}, mid-pause: no stall`);
+      assert.ok(b.stall.stallStartSample - ms(70) >= last, `${what}, mid-pause: the replay would repeat ${(last - b.stall.stallStartSample + ms(70)) / 48} ms`);
+      assert.ok(b.stall.stallStartSample <= Math.round(nx.start * SR), `${what}, mid-pause: the replay would start after the next sentence did`);
     }
   }
 });
@@ -419,6 +814,74 @@ test("a stale D (a jitter buffer that grew or drained by 100 ms) does not make a
       assert.equal(r.badAt, null, `seed ${seed} off ${off}: bad output`);
     }
   }
+});
+
+test("a stall while the converter runs 30-40 ms earlier than D: the stop is found at the lag the stream followed (no half-second repeat)", () => {
+  // Paired at D, converted and original frames are 3-4 frames apart: near a syllable start no two
+  // in a row match, and the look-back would fall back to its far end, 0.5 s before the stop.
+  let cases = 0;
+  for (const off of [-40, -30]) {
+    for (const [seed, D] of [
+      [1, 250],
+      [2, 400],
+    ]) {
+      const { samples, utterances } = speech(seed, 24);
+      for (const at of stallPoints(samples, utterances, rng(31 * seed + D), 2, frameLevelsDb(samples, SR, 10), 9)) {
+        const conv = converted(samples, D + off);
+        conv.fill(0, at + ms(D + off));
+        const { stall, firedAt } = run(samples, conv, D, { until: Math.min(samples.length, at + ms(D) + ms(2500)) });
+        const what = `D ${D} told, ${D + off} real, seed ${seed}, stall at ${(at / SR).toFixed(3)} s`;
+        assert.ok(firedAt !== null, `${what}: no stall`);
+        // The mixer replays from 70 ms before stallStartSample with a 30 ms fade-in: before the
+        // stop, repeating at most 150 ms.
+        const replay = stall.stallStartSample - ms(70);
+        assert.ok(replay + ms(30) <= at && at - replay <= ms(150), `${what}: the replay would start ${(at - replay) / 48} ms before the stop`);
+        cases++;
+      }
+    }
+  }
+  assert.equal(cases, 8);
+});
+
+test("a lag within a frame of D is D: a converter whose coverage settles a frame off (a dark one at the right D) keeps its health", () => {
+  // A one-pole low-pass at 1200 Hz makes the lag the stream followed read 10 ms early although D is
+  // right. Pairing the look-back at that lag found fewer alive frames: longer false miss runs, the
+  // health reset again and again, and 3 s of it never came.
+  for (const seed of [2, 4]) {
+    const { samples } = speech(seed, 24);
+    let health = null;
+    run(samples, converted(samples, 300, { cutoffHz: 1200 }), 300, {
+      onBlock: (st, end) => {
+        if (health === null && st.healthyMs >= 3000) health = end;
+      },
+    });
+    assert.ok(health !== null && health <= ms(15000), `seed ${seed}: 3 s of health ${health === null ? "never" : `at ${(health / SR).toFixed(1)} s`}`);
+  }
+});
+
+test("a concealment stall while the converter runs 20-40 ms later than D: the start moves earlier by that lag, so the replay starts before the stop", () => {
+  let cases = 0;
+  for (const off of [20, 40]) {
+    for (const D of [250, 400]) {
+      for (const seed of [1, 3]) {
+        const { samples, utterances } = speech(seed, 24);
+        const levels = frameLevelsDb(samples, SR, 10);
+        for (const k of [0]) {
+          const at = stallPoints(samples, utterances, rng(31 * seed + D + k), 2, levels, 9)[k];
+          const conv = converted(samples, D + off);
+          conceal(conv, at + ms(D + off), seed);
+          const { stall, firedAt } = run(samples, conv, D, { until: Math.min(samples.length, at + ms(D) + ms(2500)) });
+          const what = `D ${D} told, ${D + off} real, seed ${seed}, stall at ${(at / SR).toFixed(3)} s`;
+          assert.ok(firedAt !== null, `${what}: no stall`);
+          // The mixer's replay (70 ms before stallStartSample) starts at least 20 ms before the stop.
+          const replay = stall.stallStartSample - ms(70);
+          assert.ok(replay <= at - ms(20), `${what}: the replay would start ${(replay - at) / 48} ms from the stop`);
+          cases++;
+        }
+      }
+    }
+  }
+  assert.equal(cases, 8);
 });
 
 test("D that changes at a pause: the jitter buffer grows 300 -> 420 ms, the mixer applies the new D a few seconds later", () => {
@@ -513,6 +976,34 @@ test("healthyMs grows with matched speech and resets on a miss run; following te
   assert.ok(end[1] > 1000 && end[1] <= after, `healthy at the end ${end[1]}, ${after} ms of speech after the hole`);
 });
 
+test("missStartSample: null while the converted voice follows; while a miss run is open, where it started (the stallStartSample to be); null once the voice is back", () => {
+  const { samples, utterances } = speech(4);
+  const D = 300;
+  const Ds = ms(D);
+  const [at] = stallPoints(samples, utterances, rng(4), 1);
+  const conv = delayed(samples, Ds);
+  conv.fill(0, at + Ds, at + Ds + ms(1200)); // the engine recovers after 1.2 s
+  let open = null;
+  let atStall = null;
+  const r = run(samples, conv, D, {
+    onBlock: (s, end) => {
+      if (end <= at + Ds) assert.equal(s.missStartSample, null, `a miss run before the stop, at ${end}`);
+      if (open === null && s.missStartSample !== null) open = { start: s.missStartSample, stalled: s.stalled, missMs: s.missMs };
+      if (atStall === null && s.stalled) atStall = { miss: s.missStartSample, start: s.stallStartSample };
+    },
+  });
+  assert.ok(open && !open.stalled && open.missMs < 350, "the run was not seen open before the stall");
+  assert.equal(open.start, atStall.start, "the run's start moved");
+  assert.equal(atStall.miss, atStall.start);
+  const errMs = ((open.start - at) * 1000) / SR;
+  assert.ok(errMs >= -20 && errMs <= 0, `missStartSample off by ${errMs.toFixed(1)} ms`);
+  // The engine came back: the run ended (the stall stays sticky until reset()).
+  assert.equal(r.stall.stalled, true);
+  assert.equal(r.stall.missStartSample, null);
+  r.stall.reset();
+  assert.equal(r.stall.missStartSample, null);
+});
+
 test("badOutput: NaN or Infinity at once; a +20 dB burst for 30 ms is bad, +15 dB is not", () => {
   const { samples } = speech(3);
   const levels = frameLevelsDb(samples, SR, 10);
@@ -541,6 +1032,25 @@ test("badOutput: NaN or Infinity at once; a +20 dB burst for 30 ms is bad, +15 d
     conv[ms(5000) + 17] = bad;
     const r = run(samples, conv, 300);
     assert.ok(r.badAt !== null && r.badAt - (ms(5000) + 17) <= BLOCK, `${bad} seen at ${r.badAt}`);
+  }
+});
+
+test("badOutput: a single frame-aligned 10 ms burst at +25 dB is not bad output (a click), 30 ms is", () => {
+  const { samples } = speech(3);
+  const levels = frameLevelsDb(samples, SR, 10);
+  let peak = -Infinity;
+  for (const v of levels) peak = Math.max(peak, v);
+  let j = 400;
+  while (![-2, -1, 0, 1, 2, 3, 4, 5].every((t) => levels[j + t] >= peak - 3)) j++;
+  for (const D of [0, 300]) {
+    const burst = (lenMs) => {
+      const conv = delayed(samples, ms(D));
+      const at = j * FRAME + ms(D); // exactly one converted frame (frames start every 480 samples)
+      for (let i = at; i < at + ms(lenMs); i++) conv[i] *= 10 ** (25 / 20);
+      return run(samples, conv, D, { until: at + ms(500) }).badAt;
+    };
+    assert.equal(burst(10), null, `D ${D}: one 10 ms frame at +25 dB flagged`);
+    assert.ok(burst(30) !== null, `D ${D}: 30 ms at +25 dB not flagged`);
   }
 });
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { OriginalTimeline } from "../src/core/timeline.js";
-import { addNoise, rng, synthSpeech } from "./helpers/synth.js";
+import { addNoise, breathNoise, rng, synthSpeech } from "./helpers/synth.js";
 
 const SR = 48000;
 const BLOCK = 128;
@@ -85,6 +85,27 @@ function locate(out, audio, spans, from = 0) {
       if (out[i] !== audio[on]) continue;
       let k = 1;
       while (k < len && out[i + k] === audio[on + k]) k++;
+      if (k === len) {
+        i0 = i + len;
+        return i;
+      }
+    }
+    return -1;
+  });
+}
+
+/**
+ * As locate, but each sample within `tol` of the input: a skip onto near-silent content lets the
+ * last value before it fade out over fadeMs on top of what follows (at most the pause's level).
+ */
+function locateNear(out, audio, spans, from = 0, tol = 0.002) {
+  let i0 = from;
+  return spans.map(({ on, off }) => {
+    const len = off - on;
+    for (let i = i0; i + len <= out.length; i++) {
+      if (Math.abs(out[i] - audio[on]) > tol) continue;
+      let k = 1;
+      while (k < len && Math.abs(out[i + k] - audio[on + k]) <= tol) k++;
       if (k === len) {
         i0 = i + len;
         return i;
@@ -181,9 +202,11 @@ test("a target lag from the start: silence, then the original delayed by exactly
  * whole; pauses follow the rules and give back exactly the excess; no clicks.
  * Returns how many pauses of the replayed content the catch-up took.
  */
-function replayCase({ seed, targetMs, jb: jbAt, noiseDb = -60 }) {
+function replayCase({ seed, targetMs, jb: jbAt, noiseDb = -60, pauseRanges = [[300, 600]], edit = null }) {
   const target = ms(targetMs);
-  const { audio, utts } = take({ seed, noiseDb });
+  const t = take({ seed, noiseDb, pauseRanges });
+  const utts = t.utts;
+  const audio = edit ? edit(Float32Array.from(t.audio), utts) : t.audio;
   const flags = blockFlags(utts, audio.length);
   const jb = jbAt(utts);
   let J = null;
@@ -259,6 +282,26 @@ test("replay starting inside a pause: the same rules, still catches up", () => {
   const jb = (utts) => Math.floor((utts[3].on + utts[3].off) / 2 / BLOCK);
   const { inSpeech } = replayCase({ seed: 4, targetMs: 0, jb });
   assert.equal(inSpeech, false);
+});
+
+test("replay with an inhale before every sentence (400 ms, peak -40 dBFS, ending 100 ms before it): the breath goes with the pause, no slower than the rules allow", () => {
+  // A breath is louder than the pause's quiet; it lasts far longer than a word's soft first sound
+  // and falls back to the quiet before the word, so a skip may drop it.
+  const midWord = (utts) => Math.floor((Math.floor((utts[3].on + utts[3].off) / 2) + ms(750)) / BLOCK) - 1;
+  const breaths = (seed) => (audio, utts) => {
+    utts.forEach((u, k) => {
+      if (k === 0) return;
+      const b = breathNoise(SR, 0.4, 50 * seed + k);
+      for (let i = 0; i < b.length; i++) audio[u.on - ms(100) - b.length + i] += 0.01 * b[i];
+    });
+    return audio;
+  };
+  for (const seed of [1, 4, 5]) {
+    for (const targetMs of [0, 200]) {
+      const { pauses, fewest, label } = replayCase({ seed, targetMs, jb: midWord, noiseDb: -65, pauseRanges: [[700, 1000]], edit: breaths(seed) });
+      assert.ok(pauses <= fewest + 1, `${label}: ${pauses} pauses where ${fewest} could do`);
+    }
+  }
 });
 
 test("short pauses are left alone, long ones catch up, a sluggish VAD loses no word", () => {
@@ -347,6 +390,43 @@ test("a soft first sound the VAD calls pause (an h, an f, a breathy start) is ne
   }
 });
 
+test("a soft 's' with a stop closure before the vowel (\"stop\", \"speak\") is never dropped while catching up, though it falls back to quiet first", () => {
+  // 60-150 ms of fricative, then a 70 ms closure as quiet as the pause, then the vowel: unlike a
+  // breath it is too short to be skipped. (The closure is pause as quiet as the rest: the rules
+  // may shorten it before the word-start guard, as any pause.)
+  for (const seed of [1, 4, 5]) {
+    const { audio: base, utts } = take({ seed, noiseDb: -65 });
+    const audio = Float32Array.from(base);
+    const words = [];
+    utts.forEach((u, k) => {
+      if (k === 0) return;
+      const len = ms(60 + 30 * (k % 4)); // 60-150 ms
+      const f = fricative(len, k % 2 ? -46 : -42, 30 * seed + k);
+      const from = u.on - ms(70) - len;
+      for (let i = 0; i < len; i++) audio[from + i] += f[i];
+      words.push({ on: from, off: from + len }, { on: u.on, off: u.off });
+    });
+    const flags = blockFlags(utts, audio.length);
+    const jb = Math.floor((Math.floor((utts[3].on + utts[3].off) / 2) + ms(750)) / BLOCK) - 1;
+    let J = null;
+    const { out, lags } = simulate({
+      audio,
+      flags,
+      step: (b, t) => {
+        if (b !== jb) return;
+        J = t.writePos - ms(750);
+        t.jumpTo(J);
+      },
+    });
+    assert.equal(lags[lags.length - 1], 0, `seed ${seed}: never caught up`);
+    const after = words.filter((w) => w.on > J + FADE);
+    assert.ok(after.length >= 10, `seed ${seed}: ${after.length / 2} words`);
+    locateNear(out, audio, after, jb * BLOCK).forEach((p, k) => {
+      assert.ok(p >= 0, `seed ${seed}: the ${k % 2 ? "word" : "'s'"} at ${(after[k].on / SR).toFixed(3)} s is not in the output whole`);
+    });
+  }
+});
+
 test("never skips speech: without a pause the replay lag stays and the output is the content", () => {
   const { audio } = take({ seed: 3, seconds: 8 });
   const flags = new Uint8Array(audio.length / BLOCK).fill(1);
@@ -420,6 +500,37 @@ test("a larger target holds back in a pause: silence goes in, speech is never re
   const gapOut = at[4] - (at[3] + utts[3].off - utts[3].on);
   assert.equal(gapOut, utts[4].on - utts[3].off + L);
   assert.ok(maxStep(out) <= 2 * maxStep(audio));
+});
+
+test("a larger target never holds inside a soft first sound the flag still calls pause: the silence goes into the next real pause", () => {
+  // Room at -65 dBFS, a 150 ms 'h' (noise at -46 dBFS RMS), then a vowel (flagged from 40 ms in).
+  // The original runs 300 ms behind; the target becomes 400 ms while it plays the 'h'.
+  const n = Math.floor(ms(3000) / BLOCK) * BLOCK;
+  const pre = ms(1200);
+  const h = ms(150);
+  const v = ms(400);
+  for (const seed of [1, 2]) {
+    const rand = rng(seed);
+    const gauss = () => {
+      let u = -3;
+      for (let k = 0; k < 6; k++) u += rand();
+      return u;
+    };
+    const x = new Float32Array(n);
+    for (let i = 0; i < n; i++) x[i] = 10 ** (-65 / 20) * Math.SQRT2 * gauss();
+    for (let i = pre; i < pre + h; i++) x[i] += 10 ** (-46 / 20) * Math.SQRT2 * gauss() * Math.min(1, (i - pre) / ms(10));
+    for (let i = pre + h; i < pre + h + v; i++) x[i] += 0.2 * Math.sin((2 * Math.PI * 150 * i) / SR) * Math.min(1, (i - pre - h) / ms(10));
+    const flags = new Uint8Array(n / BLOCK);
+    for (let b = 0; b < flags.length; b++) flags[b] = b * BLOCK + BLOCK - 1 >= pre + h + ms(40) && b * BLOCK + BLOCK - 1 < pre + h + v + ms(100) ? 1 : 0;
+    for (const intoMs of [20, 50, 80]) {
+      const raise = pre + ms(300) + ms(intoMs); // output time when the head is intoMs into the 'h'
+      const { out, tl } = simulate({ audio: x, flags, target: (b) => (b * BLOCK >= raise ? ms(400) : ms(300)) });
+      assert.equal(tl.lagSamples, ms(400), `seed ${seed}, ${intoMs} ms: the hold never happened`);
+      // The 'h' and the vowel after it come out verbatim and whole: no silence inside.
+      const [at] = locate(out, x, [{ on: pre, off: pre + h + v }]);
+      assert.ok(at >= 0, `seed ${seed}: raised ${intoMs} ms into the 'h', which is split or cut`);
+    }
+  }
 });
 
 test("jumpTo is clamped to the history and writePos; non-numbers are ignored", () => {

@@ -14,7 +14,13 @@
  * quiet (its quietest 10 ms, +6 dB): a word whose first sound is soft (an
  * "h", an "f", a breathy start) may stay under the VAD's threshold for a
  * hundred ms or more, a whole syllable's soft tail too, and the flag calls
- * all of it pause.
+ * all of it pause. One exception: a louder stretch that lasted 250 ms or
+ * more and fell back to the pause's quiet before the guard zone (an inhale
+ * before a sentence) may be skipped with the pause; a soft first sound
+ * lasts 60-150 ms, or runs on into its word.
+ * Each pause gives back at most half of itself, so on fluent speech, whose
+ * pauses are mostly under about 250 ms, the replayed original can stay
+ * 0.3-1 s behind for tens of seconds, until longer pauses come.
  * The other way round (the target lag grew, lip sync switched on) it holds
  * back: the voice stops in a pause and later goes on from the same sample, so
  * silence goes in and speech is never repeated or split. Nothing clicks: a
@@ -35,6 +41,7 @@ const MAX_FADES = 4; // read heads still fading out at once (one per jump within
 const RUN_CAP = 4096; // speech/pause runs remembered: one per flag change, far more than the history needs
 const QUIET_FLOOR = 0.001; // -60 dBFS peak: quieter than this is never a word worth keeping
 const CHUNK_MS = 10; // the quiet level of a pause is that of its quietest chunk this long
+const BREATH_MS = 250; // a louder stretch in a pause this long or longer, quiet again before the guard zone, may be skipped
 const SOFT_STEP = 0.002; // -54 dBFS: a jump in level this small is inaudible, so such content may start without a fade
 
 export class OriginalTimeline {
@@ -76,9 +83,11 @@ export class OriginalTimeline {
     this._chunkCount = 0; // complete chunks
     this._chunkPeak = 0; // peak of the chunk being written
     this._chunkFill = 0;
+    this._breathChunks = Math.max(1, Math.round(BREATH_MS / CHUNK_MS));
     // How far the pause under the read head stays quiet (see _quietEnd), worked out once per read().
     this._qeReads = -1;
     this._qeRun = -1;
+    this._qeSkip = false;
     this._qeFrom = 0;
     this._qeEnd = 0;
     // Speech flags as runs: [start of run k, start of run k+1) has flag k; the last run is open.
@@ -304,8 +313,9 @@ export class OriginalTimeline {
       S = quiet ? reach : safe;
     }
     if (S <= 0) return;
-    // Only quiet content is dropped, and the landing's fade-in is over before any sound.
-    const loudAt = this._quietEnd(k, rs, re, pos);
+    // Only quiet content (or a breath, see _quietEnd) is dropped, and the landing's fade-in is
+    // over before any other sound.
+    const loudAt = this._quietEnd(k, rs, re, pos, true);
     if (loudAt < re && S > loudAt - pos - F) S = loudAt - pos - F;
     if (S <= 0) return;
     if (open && S < this.minSkipSamples && S < excess) return; // the pause is still growing: skip later, in one go
@@ -338,7 +348,7 @@ export class OriginalTimeline {
     const rs = this._start(k);
     const open = k === this._runCount - 1;
     const re = open ? this._writePos : this._start(k + 1);
-    if (this._quietEnd(k, rs, re, pos) <= pos) return;
+    if (this._quietEnd(k, rs, re, pos, false) <= pos) return;
     if (re - pos < this.guardSamples) {
       if (this._checkedAt === this._reads) return;
       this._checkedAt = this._reads;
@@ -461,28 +471,47 @@ export class OriginalTimeline {
    * Where content stops being quiet at or after pos, in pause run k ([rs,
    * re)): the start of the chunk before the first one louder than the
    * pause's quiet (_quietLimit: a sound rising out of the quiet starts in
-   * the chunk before it shows), or re. At most once per read() call: within
-   * one call the head only moves forward and nothing is written, so the
-   * answer stands.
+   * the chunk before it shows), or re. For a skip (`skip` true) one kind of
+   * louder stretch does not stop it: one that lasted BREATH_MS (250 ms) or
+   * more and fell back to the pause's quiet before the guard zone, like an
+   * inhale before a sentence. A skip may drop it (or land in it). A word's
+   * soft first sound (an "h", an "f", the "s" of "stop" with its closure) is
+   * shorter (60-150 ms), or runs on into the word, and still stops it. A
+   * hold never puts silence into such a stretch. At most once per read()
+   * call: within one call the head only moves forward and nothing is
+   * written, so the answer stands.
    */
-  _quietEnd(k, rs, re, pos) {
-    if (this._qeReads === this._reads && this._qeRun === k && pos >= this._qeFrom) return this._qeEnd;
+  _quietEnd(k, rs, re, pos, skip) {
+    if (this._qeReads === this._reads && this._qeRun === k && this._qeSkip === skip && pos >= this._qeFrom) return this._qeEnd;
     const len = this._chunkLen;
+    const N = this._chunkN;
+    const count = this._chunkCount;
     const limit = this._quietLimit(rs, re);
+    const zone = re - this.guardSamples; // where a word the VAD has not flagged yet may start
     let end = re;
     for (let c = Math.floor(pos / len); c * len < re; c++) {
-      if (c <= this._chunkCount - this._chunkN) {
+      if (c <= count - N) {
         end = Math.max(rs, c * len); // too old to tell: not quiet
         break;
       }
-      const peak = c < this._chunkCount ? this._chunks[c % this._chunkN] : this._chunkPeak; // the chunk being written
+      const peak = c < count ? this._chunks[c % N] : this._chunkPeak; // the chunk being written
       if (peak > limit) {
+        if (skip && c < count) {
+          // The louder stretch [c, e) of complete chunks, as far as the guard zone.
+          let e = c + 1;
+          while (e < count && (e + 1) * len <= zone && this._chunks[e % N] > limit) e++;
+          if (e - c >= this._breathChunks && e < count && (e + 1) * len <= zone && this._chunks[e % N] <= limit) {
+            c = e; // chunk e is quiet again: go on after it
+            continue;
+          }
+        }
         end = Math.max(rs, (c - 1) * len);
         break;
       }
     }
     this._qeReads = this._reads;
     this._qeRun = k;
+    this._qeSkip = skip;
     this._qeFrom = pos;
     this._qeEnd = end;
     return end;

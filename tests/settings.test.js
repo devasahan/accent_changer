@@ -19,7 +19,7 @@ const complete = () => ({
   hotkeyConvert: "Ctrl+Shift+F9",
   startWithWindows: false,
   lipSync: { enabled: true, totalMs: 420, obsOffsetMs: -40 },
-  budget: { capUsd: 25, keyExpiresOn: "2027-11-26" },
+  budget: { capUsd: 25, keyExpiresOn: "2027-11-26", creditUsd: 7.25, creditAtMin: 120.5 },
   obsPath: "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",
 });
 
@@ -41,7 +41,7 @@ test("DEFAULTS are the spec's values and frozen all the way down", () => {
     hotkeyConvert: "Ctrl+Alt+N",
     startWithWindows: true,
     lipSync: { enabled: false, totalMs: null, obsOffsetMs: 0 },
-    budget: { capUsd: 10, keyExpiresOn: null },
+    budget: { capUsd: 10, keyExpiresOn: null, creditUsd: null, creditAtMin: null },
     obsPath: "",
   });
   assert.ok(Object.isFrozen(DEFAULTS) && Object.isFrozen(DEFAULTS.lipSync) && Object.isFrozen(DEFAULTS.budget));
@@ -72,7 +72,7 @@ test("a complete, valid file comes back the same, with no errors", () => {
   // Partial groups are filled in from the defaults.
   const partial = validateSettings({ voiceType: "masculine", lipSync: { enabled: true }, budget: { capUsd: 5 } });
   assert.deepEqual(partial.settings.lipSync, { enabled: true, totalMs: null, obsOffsetMs: 0 });
-  assert.deepEqual(partial.settings.budget, { capUsd: 5, keyExpiresOn: null });
+  assert.deepEqual(partial.settings.budget, { capUsd: 5, keyExpiresOn: null, creditUsd: null, creditAtMin: null });
   assert.deepEqual(partial.errors, []);
 });
 
@@ -303,6 +303,31 @@ test("budget: a cap above $0, the key's expiry as YYYY-MM-DD or empty", () => {
     assert.deepEqual(r.errors, ["budget.keyExpiresOn must be a date like 2027-11-26; it was cleared."]);
   }
   assert.deepEqual(withSettings({ budget: 10 }).settings.budget, DEFAULTS.budget);
+});
+
+test("budget: the wallet's balance (creditUsd, $0 or more) with the meter's minutes when it was read (creditAtMin); a file from before them loads, credit unknown", () => {
+  const budget = (changes) => withSettings({ budget: { ...complete().budget, ...changes } });
+  const ok = budget({ creditUsd: 0, creditAtMin: 0 });
+  assert.deepEqual([ok.settings.budget.creditUsd, ok.settings.budget.creditAtMin, ok.errors], [0, 0, []]);
+  // Saved before the wallet was a setting: no error, both unknown.
+  const old = withSettings({ budget: { capUsd: 25, keyExpiresOn: "2027-11-26" } });
+  assert.deepEqual(old.errors, []);
+  assert.deepEqual(old.settings.budget, { capUsd: 25, keyExpiresOn: "2027-11-26", creditUsd: null, creditAtMin: null });
+  for (const creditUsd of [null, ""]) {
+    const r = budget({ creditUsd, creditAtMin: null });
+    assert.deepEqual([r.settings.budget.creditUsd, r.settings.budget.creditAtMin, r.errors], [null, null, []], String(creditUsd));
+  }
+  for (const creditUsd of [-1, "7.25", NaN, Infinity, {}]) {
+    const r = budget({ creditUsd });
+    assert.deepEqual([r.settings.budget.creditUsd, r.settings.budget.creditAtMin], [null, null], String(creditUsd));
+    assert.deepEqual(r.errors, ["budget.creditUsd must be empty or the balance in dollars, $0 or more; it was cleared."]);
+  }
+  // A balance without the minutes it was read at cannot be counted down: unknown, ask again.
+  for (const creditAtMin of [undefined, null, -3, "120", NaN]) {
+    const r = budget({ creditAtMin });
+    assert.deepEqual([r.settings.budget.creditUsd, r.settings.budget.creditAtMin], [null, null], String(creditAtMin));
+    assert.deepEqual(r.errors, ["budget.creditUsd came without budget.creditAtMin (the minutes counted when it was read); enter the balance again."]);
+  }
 });
 
 test("hotkeys: modifiers and one key, written the same way every time", () => {

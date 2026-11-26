@@ -226,6 +226,40 @@ test("voice changers and voice filters are virtual microphones too", () => {
   }
 });
 
+test("loopback captures (Stereo Mix and its spellings) are never picked; Windows' default on one is warned about", () => {
+  // The headset was unplugged (the saved Jabra is gone) and Windows moved its default
+  // microphone to an enabled Stereo Mix, which records everything the PC plays.
+  for (const loop of [
+    "Stereo Mix (Realtek(R) Audio)",
+    "Stereomix (Realtek(R) Audio)",
+    "Mixage stéréo (Realtek(R) Audio)",
+    "Mezcla estéreo (Realtek(R) Audio)",
+    "Missaggio stereo (Realtek(R) Audio)",
+    "What U Hear (Sound Blaster Z)",
+    "Wave Out Mix (Conexant SmartAudio HD)",
+    "Speakers (Realtek(R) Audio) Loopback",
+  ]) {
+    const inputs = [
+      mic("default", `Default - ${loop}`),
+      mic("communications", "Communications - Microphone Array (Realtek(R) Audio)"),
+      mic("loop", loop),
+      mic(ID.array, "Microphone Array (Realtek(R) Audio)"),
+    ];
+    assert.ok(VIRTUAL_MIC.test(loop), loop);
+    assert.deepEqual(usableMics(inputs).map((d) => d.deviceId), [ID.array], loop);
+    assert.equal(pickMic(inputs, { deviceId: ID.jabra, label: "Headset Microphone (Jabra EVOLVE 20 MS)" })?.deviceId, ID.array, loop);
+    assert.equal(pickMic([mic("loop", loop), mic(ID.array, "Microphone Array (Realtek(R) Audio)")])?.deviceId, ID.array, `${loop} listed first`);
+    const warnings = feedbackWarnings({ micLabel: "Microphone Array (Realtek(R) Audio)", defaultInputLabel: `Default - ${loop}`, defaultOutputLabel: "Default - Speakers (Realtek(R) Audio)" });
+    assert.equal(warnings.length, 1, loop);
+    assert.match(warnings[0], /records everything the PC plays/);
+  }
+  // A real microphone with "Stereo" in its name stays usable.
+  for (const real of ["Microphone (Yeti Stereo Microphone)", "Microphone (Elgato Wave:3)"]) {
+    assert.equal(VIRTUAL_MIC.test(real), false, real);
+    assert.deepEqual(feedbackWarnings({ micLabel: real, defaultInputLabel: `Default - ${real}` }), [], real);
+  }
+});
+
 test("a cable renamed in Windows' sound settings is still the cable", () => {
   // Windows lets the user rename an endpoint; the driver's name in brackets stays.
   const renamedIn = out(ID.cableIn, "Accent Out (VB-Audio Virtual Cable)");

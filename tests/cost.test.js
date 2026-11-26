@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { CostMeter, PRICE_PER_MIN, budgetStatus, idleDisconnect, keyExpiry, localDate } from "../src/core/cost.js";
+import { CostMeter, PRICE_PER_MIN, budgetStatus, creditLeftUsd, idleDisconnect, keyExpiry, localDate } from "../src/core/cost.js";
 
 const MIN = 60000;
 const DAY = 24 * 60 * MIN;
@@ -82,7 +82,7 @@ test("day roll-over: a call across midnight is split between the two days", () =
   m.callEnded("c", at("2026-11-27T00:20:00Z"));
   assert.deepEqual(mins(m.totals(at("2026-11-27T09:00:00Z"))), { session: 30, today: 20, month: 30 });
   assert.deepEqual(mins(m.totals(at("2026-11-28T09:00:00Z"))), { session: 30, today: 0, month: 30 });
-  assert.deepEqual(m.serialize(), { version: 1, days: { "2026-11-26": 10, "2026-11-27": 20 }, months: { "2026-11": 30 } });
+  assert.deepEqual(m.serialize(), { version: 1, days: { "2026-11-26": 10, "2026-11-27": 20 }, months: { "2026-11": 30 }, totalMin: 30 });
 });
 
 test("today is the local day: the time zone offset moves midnight", () => {
@@ -153,6 +153,7 @@ test("serialize and restore: earlier runs count in today and this month, not in 
     version: 1,
     days: { "2026-10-31": 7, "2026-11-25": 20, "2026-11-26": 15 },
     months: { "2026-10": 7, "2026-11": 35 },
+    totalMin: 42,
   });
   const b = new CostMeter({ state: saved, timeZoneOffsetMin: IST });
   assert.deepEqual(mins(b.totals(now)), { session: 0, today: 15, month: 35 });
@@ -173,7 +174,7 @@ test("serialize({atMs}) saves an open call up to then, so a crash loses at most 
   const m = new CostMeter();
   const t0 = at("2026-11-26T10:00:00Z");
   m.callStarted("live", t0);
-  assert.deepEqual(m.serialize(), { version: 1, days: {}, months: {} }, "without atMs: ended calls only");
+  assert.deepEqual(m.serialize(), { version: 1, days: {}, months: {}, totalMin: 0 }, "without atMs: ended calls only");
   const snapshot = m.serialize({ atMs: t0 + 30 * MIN });
   assert.deepEqual(snapshot.days, { "2026-11-26": 30 });
   assert.deepEqual(m.serialize({ atMs: t0 + 40 * MIN }).days, { "2026-11-26": 40 }, "not 30 + 40");
@@ -228,7 +229,7 @@ test("a corrupt or hand-edited state never stops the app: what can't be read is 
     },
   });
   assert.deepEqual(mins(odd.totals(t)), { session: 0, today: 2, month: 2 }, "months rebuilt from the readable days");
-  assert.deepEqual(odd.serialize(), { version: 1, days: { "2026-11-26": 2 }, months: { "2026-11": 2 } });
+  assert.deepEqual(odd.serialize(), { version: 1, days: { "2026-11-26": 2 }, months: { "2026-11": 2 }, totalMin: 2 });
   // One future date in the file does not push the real history out when the time is known.
   const future = new CostMeter({ state: { days: { "2031-01-01": 1, "2026-11-20": 4 }, months: { "2031-01": 1, "2026-11": 4 } } });
   const kept = future.serialize({ atMs: t });
@@ -251,11 +252,12 @@ test("without a clock reading serialize() drops nothing: one future date cannot 
     version: 1,
     days: { "2026-11-20": 4, "2026-11-25": 30, "2031-01-01": 1 },
     months: { "2026-10": 120, "2026-11": 34, "2031-01": 1 },
+    totalMin: 155, // a file from before the all-time total: its months
   });
   const next = new CostMeter({ state: JSON.stringify(m.serialize()) });
   const now = at("2026-11-26T12:00:00Z");
   assert.deepEqual(mins(next.totals(now)), { session: 0, today: 0, month: 34 });
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: next.totals(now).month.usd }), { minutesLeft: 1077, red: false });
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: next.totals(now).month.usd }), { minutesLeft: 1077, red: false, creditUnknown: true });
   // Old days are still trimmed once there is a clock reading: atMs, or a call made in this run.
   const old = new CostMeter({ state: { days: { "2026-01-02": 3, "2026-11-25": 30 }, months: { "2026-01": 3, "2026-11": 30 } } });
   assert.deepEqual(old.serialize().days, { "2026-01-02": 3, "2026-11-25": 30 }, "no clock reading: kept");
@@ -267,22 +269,126 @@ test("without a clock reading serialize() drops nothing: one future date cannot 
 });
 
 test("budgetStatus: minutes left before the cap, red under 90", () => {
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 0 }), { minutesLeft: 1111, red: false });
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 9.19 }), { minutesLeft: 90, red: false });
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 9.2 }), { minutesLeft: 88, red: true });
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 12 }), { minutesLeft: 0, red: true }, "over the cap");
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: NaN }), { minutesLeft: 1111, red: false }, "unknown spend counts as 0");
-  assert.deepEqual(budgetStatus({ capUsd: 1, spentUsd: 0.5, pricePerMin: 0.02, redBelowMin: 30 }), { minutesLeft: 25, red: true });
-  assert.deepEqual(budgetStatus({ capUsd: 1, spentUsd: 0.3, pricePerMin: 0.02, redBelowMin: 30 }), { minutesLeft: 35, red: false });
+  // No wallet balance given: the cap alone, and creditUnknown (never shown green).
+  const capOnly = (minutesLeft, red) => ({ minutesLeft, red, creditUnknown: true });
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 0 }), capOnly(1111, false));
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 9.19 }), capOnly(90, false));
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 9.2 }), capOnly(88, true));
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 12 }), capOnly(0, true), "over the cap");
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: NaN }), capOnly(1111, false), "unknown spend counts as 0");
+  assert.deepEqual(budgetStatus({ capUsd: 1, spentUsd: 0.5, pricePerMin: 0.02, redBelowMin: 30 }), capOnly(25, true));
+  assert.deepEqual(budgetStatus({ capUsd: 1, spentUsd: 0.3, pricePerMin: 0.02, redBelowMin: 30 }), capOnly(35, false));
   for (const bad of [{}, { capUsd: 0 }, { capUsd: -5 }, { capUsd: NaN }, { capUsd: 10, pricePerMin: 0 }]) {
-    assert.deepEqual(budgetStatus(bad), { minutesLeft: null, red: false }, JSON.stringify(bad));
+    assert.deepEqual(budgetStatus(bad), { minutesLeft: null, red: false, creditUnknown: true }, JSON.stringify(bad));
   }
-  assert.deepEqual(budgetStatus(), { minutesLeft: null, red: false });
+  assert.deepEqual(budgetStatus(), { minutesLeft: null, red: false, creditUnknown: true });
   // With the meter: this month's spend against the monthly cap.
   const m = new CostMeter();
   m.callStarted("c", at("2026-11-26T10:00:00Z"));
   const spent = m.totals(at("2026-11-26T10:00:00Z") + 1000 * MIN).month.usd; // $9.00
-  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: spent }), { minutesLeft: 111, red: false });
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: spent }), capOnly(111, false));
+});
+
+test("the wallet is a second limit: two months on a $10 credit with a $10 monthly cap turn red once fewer than 90 minutes are left in the wallet", () => {
+  // The README's path: $10 of free credit (prepaid, no monthly refill) and a $10 cap. The balance
+  // is read in the Sanas Console before the first call, with the meter's all-time minutes then.
+  const budget = { capUsd: 10, creditUsd: 10, creditAtMin: 0 };
+  let state = null;
+  const session = (iso, minutes) => {
+    const m = new CostMeter({ state, timeZoneOffsetMin: IST });
+    m.callStarted(1, at(iso));
+    m.callEnded(1, at(iso) + minutes * MIN);
+    state = JSON.stringify(m.serialize({ atMs: at(iso) + minutes * MIN }));
+  };
+  session("2026-11-27T10:00:00Z", 111); // Session A, about $1
+  session("2026-12-15T10:00:00Z", 111); // practice in December, about $1
+  let used = 222;
+  let sawRed = false;
+  // January: a 60-minute call a day, until the wallet is empty.
+  for (let d = 5; d <= 31 && used * PRICE_PER_MIN < 10; d++) {
+    const now = at(`2027-01-${String(d).padStart(2, "0")}T09:00:00Z`);
+    const meter = new CostMeter({ state, timeZoneOffsetMin: IST });
+    const t = meter.totals(now);
+    assert.ok(Math.abs(t.all.min - used) < 1e-6, `Jan ${d}: all-time ${t.all.min} min, ${used} used`);
+    const credit = creditLeftUsd({ creditUsd: budget.creditUsd, creditAtMin: budget.creditAtMin, totalMin: t.all.min });
+    const status = budgetStatus({ capUsd: budget.capUsd, spentUsd: t.capMonth.usd, creditLeftUsd: credit });
+    const walletMin = Math.floor((10 - used * PRICE_PER_MIN) / PRICE_PER_MIN + 1e-9);
+    const capMin = Math.floor((10 - t.capMonth.usd) / PRICE_PER_MIN + 1e-9);
+    assert.equal(status.creditUnknown, false);
+    assert.equal(status.minutesLeft, Math.min(walletMin, capMin), `Jan ${d}`);
+    assert.equal(status.red, walletMin < 90, `Jan ${d}: ${walletMin} min in the wallet, status ${JSON.stringify(status)}`);
+    sawRed ||= status.red;
+    session(`2027-01-${String(d).padStart(2, "0")}T09:00:00Z`, Math.min(60, walletMin));
+    used += Math.min(60, walletMin);
+  }
+  assert.ok(sawRed, "never red");
+  // The month's spend alone (the cap) would have shown hundreds of minutes, green, all along.
+  const t = new CostMeter({ state, timeZoneOffsetMin: IST }).totals(at("2027-01-31T09:00:00Z"));
+  assert.ok(budgetStatus({ capUsd: 10, spentUsd: t.month.usd }).minutesLeft > 90);
+});
+
+test("creditLeftUsd: the balance read in the console minus what the meter counted since; unknown without a balance, or when the meter lost its history", () => {
+  assert.ok(Math.abs(creditLeftUsd({ creditUsd: 10, creditAtMin: 222, totalMin: 1002 }) - (10 - 780 * PRICE_PER_MIN)) < 1e-9);
+  assert.equal(creditLeftUsd({ creditUsd: 5, creditAtMin: 100, totalMin: 100 }), 5);
+  assert.ok(creditLeftUsd({ creditUsd: 0.5, creditAtMin: 0, totalMin: 100 }) < 0, "more counted than the balance: below 0");
+  for (const credit of [
+    { creditUsd: null, creditAtMin: 0, totalMin: 10 },
+    { creditUsd: 10, creditAtMin: null, totalMin: 10 },
+    { creditUsd: -1, creditAtMin: 0, totalMin: 10 },
+    { creditUsd: 10, creditAtMin: 50, totalMin: 10 }, // the meter's state was lost after the balance was read
+    { creditUsd: 10, creditAtMin: 0, totalMin: NaN },
+    {},
+  ]) {
+    assert.equal(creditLeftUsd(credit), null, JSON.stringify(credit));
+  }
+  assert.equal(creditLeftUsd(), null);
+  // budgetStatus: the smaller limit; the wallet alone when there is no cap; red under 90.
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 1, creditLeftUsd: 0.5 }), { minutesLeft: 55, red: true, creditUnknown: false });
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 9.5, creditLeftUsd: 8 }), { minutesLeft: 55, red: true, creditUnknown: false }, "the cap is smaller");
+  assert.deepEqual(budgetStatus({ capUsd: null, spentUsd: 0, creditLeftUsd: 4.5 }), { minutesLeft: 500, red: false, creditUnknown: false }, "no cap");
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 0, creditLeftUsd: -0.2 }), { minutesLeft: 0, red: true, creditUnknown: false }, "overdrawn");
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: 0, creditLeftUsd: NaN }), { minutesLeft: 1111, red: false, creditUnknown: true });
+});
+
+test("all-time minutes: never trimmed with the days and months; a file from before them starts from its months", () => {
+  const m = new CostMeter();
+  for (let k = 0; k < 30; k++) {
+    const start = Date.UTC(2024, k, 1, 12);
+    m.callStarted(k, start);
+    m.callEnded(k, start + 2 * MIN);
+  }
+  const s = m.serialize();
+  assert.equal(Object.keys(s.months).length, 24, "months trimmed to two years");
+  assert.equal(s.totalMin, 60, "the all-time total keeps all 30 calls");
+  const next = new CostMeter({ state: JSON.stringify(s) });
+  const now = Date.UTC(2026, 5, 2);
+  assert.equal(next.totals(now).all.min, 60);
+  next.callStarted("x", now);
+  assert.ok(Math.abs(next.totals(now + 5 * MIN).all.min - 65) < 1e-9, "an open call counts up to now");
+  assert.ok(Math.abs(next.totals(now + 5 * MIN).all.usd - 65 * PRICE_PER_MIN) < 1e-12);
+  assert.equal(next.serialize({ atMs: now + 5 * MIN }).totalMin, 65);
+  // Older files: the months they have; a bad totalMin likewise.
+  assert.equal(new CostMeter({ state: { days: {}, months: { "2026-10": 7, "2026-11": 35 } } }).totals(now).all.min, 42);
+  assert.equal(new CostMeter({ state: { months: { "2026-11": 35 }, totalMin: -4 } }).totals(now).all.min, 35);
+  assert.equal(new CostMeter({ state: { months: { "2026-11": 35 }, totalMin: 500 } }).totals(now).all.min, 500);
+});
+
+test("capMonth: at a month's start in India the UTC month (which a cap may count) is still the last one", () => {
+  // 1050 minutes in November (IST). At 00:30 IST on 1 December it is still 30 November in UTC.
+  const m = new CostMeter({ timeZoneOffsetMin: IST, state: { days: { "2026-11-20": 1050 }, months: { "2026-11": 1050 }, totalMin: 1050 } });
+  const t = m.totals(at("2026-11-30T19:00:00Z"));
+  assert.equal(t.month.min, 0, "the local month is new");
+  assert.equal(t.capMonth.min, 1050);
+  assert.deepEqual(budgetStatus({ capUsd: 10, spentUsd: t.capMonth.usd }), { minutesLeft: 61, red: true, creditUnknown: true });
+  // At 06:00 IST both months are December.
+  assert.equal(m.totals(at("2026-12-01T00:30:00Z")).capMonth.min, 0);
+  // New York, 21:00 on 30 November local = 02:00 on 1 December UTC: the local month is the larger.
+  const ny = new CostMeter({ timeZoneOffsetMin: NEW_YORK });
+  ny.callStarted("c", at("2026-11-30T20:00:00Z"));
+  ny.callEnded("c", at("2026-11-30T20:00:00Z") + 100 * MIN);
+  const n = ny.totals(at("2026-12-01T02:00:00Z"));
+  assert.equal(n.month.min, 100);
+  assert.equal(n.capMonth.min, 100);
 });
 
 test("keyExpiry: days left, warning from 14 days before, expired after the day", () => {

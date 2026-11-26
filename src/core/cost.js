@@ -3,11 +3,16 @@
  *
  * Sanas bills a call from the moment it is Ready until it is destroyed, at
  * PRICE_PER_MIN, whether or not anyone speaks. CostMeter adds up those
- * minutes for this session, today and this month (in the user's local time)
- * and keeps per-day and per-month totals small enough to save after every
- * call. budgetStatus turns the month's spend into minutes left before the
- * spend cap, keyExpiry warns before the API key runs out, and idleDisconnect
- * says when a connected call is only costing money.
+ * minutes for this session, today and this month (in the user's local time),
+ * and for all time, and keeps per-day and per-month totals small enough to
+ * save after every call. Sanas is a prepaid wallet ($10 of free credit, no
+ * monthly refill) with an optional monthly spend cap, and conversion stops
+ * at whichever runs out first: budgetStatus turns both into minutes left,
+ * the smaller of the cap's remainder and the wallet's (creditLeftUsd works
+ * the wallet out from the balance the user read in the Sanas Console and the
+ * meter's all-time minutes then and now). keyExpiry warns before the API key
+ * runs out, and idleDisconnect says when a connected call is only costing
+ * money.
  *
  * Pure: no clock, no storage, no timers. Times come in as epoch milliseconds
  * from the caller's clock and the local time zone as an offset in minutes, so
@@ -32,6 +37,9 @@ const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 
 const validTime = (ms) => typeof ms === "number" && ms >= 0 && ms <= MAX_TIME_MS;
+
+/** A dollar amount or a count of minutes as the settings and the state file hold them. */
+const isAmount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
 /** Offset in ms from minutes to add to UTC for local time; anything unusable is UTC. */
 function offsetMs(timeZoneOffsetMin) {
@@ -105,12 +113,15 @@ function readState(state) {
   }
   const days = new Map();
   const months = new Map();
-  if (!s || typeof s !== "object") return { days, months };
+  if (!s || typeof s !== "object") return { days, months, totalMin: 0 };
   for (const [key, min] of entriesOf(s.days)) if (DATE.test(key) && dayNumber(key) !== null && isMinutes(min)) days.set(key, min);
   for (const [key, min] of entriesOf(s.months)) if (MONTH.test(key) && isMinutes(min)) months.set(key, min);
   // Day totals without month totals (an older or hand-made file): rebuild the months from the days.
   if (!months.size) for (const [key, min] of days) add(months, key.slice(0, 7), min);
-  return { days, months };
+  // The all-time total; a file from before it was kept: the months it still has (two years).
+  let totalMin = isMinutes(s.totalMin) ? s.totalMin : 0;
+  if (!isMinutes(s.totalMin)) for (const min of months.values()) totalMin += min;
+  return { days, months, totalMin };
 }
 
 /**
@@ -138,6 +149,7 @@ export class CostMeter {
     const saved = readState(state);
     this._days = saved.days; // earlier runs: local date "YYYY-MM-DD" -> minutes
     this._months = saved.months; // earlier runs: "YYYY-MM" -> minutes
+    this._totalMin = saved.totalMin; // earlier runs, all time: never trimmed
     this._open = new Map(); // call id -> Ready time (ms)
     this._ended = []; // this run's ended calls: [{startMs, endMs}]
   }
@@ -186,12 +198,24 @@ export class CostMeter {
 
   /**
    * Minutes and dollars for this session (the calls since this meter was
-   * made), today and this month. Open calls count up to `atMs`; "today" and
-   * "this month" are the local day and month of `atMs`, earlier runs
+   * made), today, this month and all time (`all`, earlier runs included, for
+   * the wallet: see creditLeftUsd). Open calls count up to `atMs`; "today"
+   * and "this month" are the local day and month of `atMs`, earlier runs
    * included.
+   *
+   * `capMonth` is what a monthly spend cap may have counted: the larger of
+   * this local month and the UTC month that holds `atMs`. The Sanas Console
+   * does not say which month its cap counts (UTC is likely); near a month's
+   * end the two differ by the time zone's offset (in India the local month
+   * starts 5.5 h before the UTC one), and the larger never promises minutes
+   * the cap has already spent. Earlier runs are known only by local month,
+   * so for the UTC month this counts them by the local month of the same
+   * name (off by at most the calls an earlier run made within the offset of
+   * the month's start or end).
    * @param {number} atMs epoch milliseconds (now)
    * @param {{timeZoneOffsetMin?: number}} [options] minutes to add to UTC for local time
-   * @returns {{session: {min: number, usd: number}, today: {min: number, usd: number}, month: {min: number, usd: number}}}
+   * @returns {{session: {min: number, usd: number}, today: {min: number, usd: number}, month: {min: number, usd: number},
+   *   capMonth: {min: number, usd: number}, all: {min: number, usd: number}}}
    */
   totals(atMs, { timeZoneOffsetMin = this.timeZoneOffsetMin } = {}) {
     if (!validTime(atMs)) throw new TypeError("CostMeter.totals needs the time now, in epoch milliseconds");
@@ -199,25 +223,32 @@ export class CostMeter {
     const day = localDay(atMs, off);
     const dayStartMs = day * DAY_MS - off;
     const month = monthOf(day, off);
+    const utcMonth = monthOf(localDay(atMs, 0), 0);
     let sessionMs = 0;
     let todayMs = 0;
     let monthMs = 0;
+    let utcMonthMs = 0;
     for (const call of this._calls(atMs)) {
       sessionMs += call.endMs - call.startMs;
       todayMs += overlapMs(call, dayStartMs, dayStartMs + DAY_MS);
       monthMs += overlapMs(call, month.startMs, month.endMs);
+      utcMonthMs += overlapMs(call, utcMonth.startMs, utcMonth.endMs);
     }
+    const monthMin = (this._months.get(month.key) ?? 0) + monthMs / MINUTE_MS;
+    const utcMonthMin = (this._months.get(utcMonth.key) ?? 0) + utcMonthMs / MINUTE_MS;
     return {
       session: this._money(sessionMs / MINUTE_MS),
       today: this._money((this._days.get(dayKey(day)) ?? 0) + todayMs / MINUTE_MS),
-      month: this._money((this._months.get(month.key) ?? 0) + monthMs / MINUTE_MS),
+      month: this._money(monthMin),
+      capMonth: this._money(Math.max(monthMin, utcMonthMin)),
+      all: this._money(this._totalMin + sessionMs / MINUTE_MS),
     };
   }
 
   /**
    * The totals to save, earlier runs and this one together:
-   * { version: 1, days: {"YYYY-MM-DD": min}, months: {"YYYY-MM": min} }
-   * (plain JSON, local dates). Without `atMs` only ended calls are in; pass
+   * { version: 1, days: {"YYYY-MM-DD": min}, months: {"YYYY-MM": min}, totalMin }
+   * (plain JSON, local dates; totalMin: all time, never trimmed). Without `atMs` only ended calls are in; pass
    * `atMs` to include open calls up to then, so a save every minute or so
    * during a long call loses at most that minute if the app is killed. The
    * last 62 days are kept, counted back from a clock reading: `atMs`, else
@@ -226,13 +257,15 @@ export class CostMeter {
    * and no call this run) nothing is dropped: the saved dates alone can't
    * say what "now" is.
    * @param {{atMs?: number, timeZoneOffsetMin?: number}} [options]
-   * @returns {{version: 1, days: Object<string, number>, months: Object<string, number>}}
+   * @returns {{version: 1, days: Object<string, number>, months: Object<string, number>, totalMin: number}}
    */
   serialize({ atMs = null, timeZoneOffsetMin = this.timeZoneOffsetMin } = {}) {
     const off = offsetMs(timeZoneOffsetMin);
     const days = new Map(this._days);
     const months = new Map(this._months);
     const calls = this._calls(atMs);
+    let totalMin = this._totalMin;
+    for (const call of calls) totalMin += (call.endMs - call.startMs) / MINUTE_MS;
     for (const call of calls) {
       eachLocalDay(call.startMs, call.endMs, off, (day, ms) => {
         const key = dayKey(day);
@@ -260,6 +293,7 @@ export class CostMeter {
       version: 1,
       days: Object.fromEntries(keptDays.sort(byKey).map(rounded)),
       months: Object.fromEntries(keptMonths.sort(byKey).map(rounded)),
+      totalMin: rounded(["", totalMin])[1],
     };
   }
 }
@@ -276,22 +310,51 @@ export function localDate(atMs, { timeZoneOffsetMin = 0 } = {}) {
 }
 
 /**
- * Minutes of conversion left before the spend cap, rounded down (never
- * promise a minute that isn't there). `red` when fewer than `redBelowMin`
- * are left: under 90 minutes, one more interview may not fit. Without a
- * usable cap or price, minutesLeft is null and nothing is red.
- * @param {{capUsd: number, spentUsd: number, pricePerMin?: number, redBelowMin?: number}} budget
- *   spentUsd: what this cap counts (the month's spend for a monthly cap); unknown counts as 0
- * @returns {{minutesLeft: number|null, red: boolean}}
+ * What is left in the Sanas wallet (dollars), from the balance the user read
+ * in the Sanas Console (`creditUsd`, settings.budget.creditUsd) and the
+ * meter's all-time minutes when it was read (`creditAtMin`,
+ * settings.budget.creditAtMin) and now (`totalMin`, totals(now).all.min):
+ * creditUsd - (totalMin - creditAtMin) * price. Null when that is not
+ * known: no balance entered, or a meter whose all-time total is below the
+ * one the balance was read at (its saved state was lost: ask again, as after
+ * a top-up). It may go below 0 when the meter counted more than Sanas billed.
+ * @param {{creditUsd: number|null, creditAtMin: number|null, totalMin: number, pricePerMin?: number}} credit
+ * @returns {number|null}
  */
-export function budgetStatus({ capUsd, spentUsd, pricePerMin = PRICE_PER_MIN, redBelowMin = 90 } = {}) {
-  if (!(Number.isFinite(capUsd) && capUsd > 0) || !(Number.isFinite(pricePerMin) && pricePerMin > 0)) {
-    return { minutesLeft: null, red: false };
+export function creditLeftUsd({ creditUsd, creditAtMin, totalMin, pricePerMin = PRICE_PER_MIN } = {}) {
+  if (!isAmount(creditUsd) || !isAmount(creditAtMin) || !isAmount(totalMin) || !isAmount(pricePerMin)) return null;
+  // A millionth of a minute of slack: the saved totals are rounded to that.
+  if (totalMin < creditAtMin - 1e-6) return null;
+  return creditUsd - Math.max(0, totalMin - creditAtMin) * pricePerMin;
+}
+
+/**
+ * Minutes of conversion left, rounded down (never promise a minute that
+ * isn't there): the smaller of what the monthly spend cap and the wallet
+ * still allow. `red` when fewer than `redBelowMin` are left: under 90
+ * minutes, one more interview may not fit. `creditUnknown` when the wallet
+ * is not known (no balance entered: creditLeftUsd gave null): then only the
+ * cap is counted, and the checklist must show it amber at best, never green,
+ * since the wallet does not refill each month and may hold far less. Without
+ * a usable price, or with neither a usable cap nor a known wallet,
+ * minutesLeft is null and nothing is red.
+ * @param {{capUsd: number|null, spentUsd: number, creditLeftUsd?: number|null, pricePerMin?: number, redBelowMin?: number}} budget
+ *   capUsd: the monthly spend cap (none: no cap); spentUsd: what the cap counts, this month's
+ *   spend (totals(now).capMonth.usd), unknown counts as 0; creditLeftUsd: see creditLeftUsd
+ * @returns {{minutesLeft: number|null, red: boolean, creditUnknown: boolean}}
+ */
+export function budgetStatus({ capUsd, spentUsd, creditLeftUsd: credit = null, pricePerMin = PRICE_PER_MIN, redBelowMin = 90 } = {}) {
+  const creditUnknown = !(typeof credit === "number" && Number.isFinite(credit));
+  const hasCap = Number.isFinite(capUsd) && capUsd > 0;
+  if (!(Number.isFinite(pricePerMin) && pricePerMin > 0) || (!hasCap && creditUnknown)) {
+    return { minutesLeft: null, red: false, creditUnknown };
   }
   const spent = Number.isFinite(spentUsd) && spentUsd > 0 ? spentUsd : 0;
+  let leftUsd = hasCap ? capUsd - spent : Infinity;
+  if (!creditUnknown && credit < leftUsd) leftUsd = credit;
   // The small allowance keeps $0.81 at $0.009/min at 90 minutes, not 89.99999999999999 → 89.
-  const minutesLeft = Math.max(0, Math.floor((capUsd - spent) / pricePerMin + 1e-9));
-  return { minutesLeft, red: minutesLeft < redBelowMin };
+  const minutesLeft = Math.max(0, Math.floor(leftUsd / pricePerMin + 1e-9));
+  return { minutesLeft, red: minutesLeft < redBelowMin, creditUnknown };
 }
 
 /**

@@ -13,9 +13,12 @@
  * Chromium adds a USB id to some labels ("… (0b0e:0348)") and changes ids
  * when site data is cleared, so a saved microphone is found by its id first
  * and then by its label without those decorations. Virtual microphones
- * (VB-CABLE, Krisp, Sanas, Voicemeeter, Steam, voice changers) are never
- * picked: the cable's output would loop the meeting's audio back into
- * itself, and another voice app would convert the voice twice. The cable is
+ * (VB-CABLE, Krisp, Sanas, Voicemeeter, Steam, voice changers) and loopback
+ * captures (Stereo Mix, What U Hear: everything the PC plays) are never
+ * picked: the cable's output or a loopback would loop the meeting's audio
+ * back into itself, and another voice app would convert the voice twice.
+ * Windows may move its default microphone to an enabled Stereo Mix when the
+ * headset goes, so that is warned about too. The cable is
  * known by its driver's name, "(VB-Audio Virtual Cable)", which stays when
  * the user renames "CABLE Input" or "CABLE Output" in Windows' sound
  * settings.
@@ -24,16 +27,28 @@
  */
 
 /**
+ * Loopback captures: a sound card's recording of everything the PC plays
+ * (Realtek's "Stereo Mix", "Stereomix" in German, "Mixage stéréo" in
+ * French, "Mezcla estéreo" in Spanish, "Missaggio stereo" in Italian;
+ * Creative's "What U Hear"; Conexant's "Wave Out Mix"; "… Loopback"). Not
+ * "Microphone (Yeti Stereo Microphone)": a real microphone.
+ */
+const LOOPBACK = /stereo[ -]?mix|mixage st[ée]r[ée]o|mezcla est[ée]reo|missaggio stereo|what u hear|wave out mix|loopback/i;
+
+/**
  * Labels of virtual microphones: another app's output, never the user's own
  * voice. The spec's list plus "vb-audio", which also covers VB-Audio's other
- * virtual devices (CABLE-A/B, Hi-Fi Cable, Voicemeeter's outputs), and the
+ * virtual devices (CABLE-A/B, Hi-Fi Cable, Voicemeeter's outputs), the
  * voice changers and voice filters people have installed (Voicemod, NVIDIA
  * Broadcast and RTX Voice, Elgato's Wave Link mixes, Teams' own device,
- * MorphVOX, Clownfish, Voxal, Voice.ai, MagicMic, Virtual Audio Cable). Not
- * "Elgato Wave:3" or "Virtual Desktop": real microphones.
+ * MorphVOX, Clownfish, Voxal, Voice.ai, MagicMic, Virtual Audio Cable), and
+ * the loopback captures (LOOPBACK). Not "Elgato Wave:3" or "Virtual
+ * Desktop": real microphones.
  */
-export const VIRTUAL_MIC =
-  /cable output|krisp|sanas|voicemeeter|steam streaming|vb-audio|voicemod|voice changer|nvidia broadcast|rtx voice|wave link|teams audio|morphvox|clownfish|voxal|voice\.ai|magicmic|virtual audio cable/i;
+export const VIRTUAL_MIC = new RegExp(
+  `cable output|krisp|sanas|voicemeeter|steam streaming|vb-audio|voicemod|voice changer|nvidia broadcast|rtx voice|wave link|teams audio|morphvox|clownfish|voxal|voice\\.ai|magicmic|virtual audio cable|${LOOPBACK.source}`,
+  "i",
+);
 
 /** Chromium's pseudo-devices that follow Windows' default and default communications device. */
 const PSEUDO_IDS = ["default", "communications"];
@@ -210,6 +225,8 @@ const OUTPUT_IS_CABLE =
   "Windows plays its sound into “CABLE Input”. You would not hear the interviewer, and they would hear themselves and your notification sounds. In Windows sound settings, make your headphones the default playback device.";
 const INPUT_IS_CABLE =
   "Windows' default microphone is “CABLE Output”, the app's own output. Apps that use the default microphone would hear the converted voice instead of you. In Windows sound settings, make your headset the default microphone, and pick “CABLE Output” only inside Zoom, Teams or Meet.";
+const INPUT_IS_LOOPBACK =
+  "Windows' default microphone records everything the PC plays (“Stereo Mix” or similar). Apps that use the default microphone would send the interviewer's own voice back to them. In Windows sound settings, make your headset the default microphone, or disable Stereo Mix.";
 
 /**
  * Plain-English warnings about set-ups that loop audio back (labels as
@@ -217,7 +234,8 @@ const INPUT_IS_CABLE =
  * so are cable endpoints the user renamed):
  * CABLE Output as the app's microphone (the app must refuse it: check
  * isCableOutput(micLabel) before starting), CABLE Input as Windows' default
- * playback device, and CABLE Output as Windows' default microphone. An empty
+ * playback device, CABLE Output as Windows' default microphone, and a
+ * loopback capture (Stereo Mix) as Windows' default microphone. An empty
  * array when all is well.
  * @param {{micLabel?: string, defaultInputLabel?: string, defaultOutputLabel?: string}} labels
  * @returns {string[]}
@@ -227,5 +245,6 @@ export function feedbackWarnings({ micLabel, defaultInputLabel, defaultOutputLab
   if (isCableOutput(micLabel)) warnings.push(MIC_IS_CABLE);
   if (isCableInput(defaultOutputLabel)) warnings.push(OUTPUT_IS_CABLE);
   if (isCableOutput(defaultInputLabel)) warnings.push(INPUT_IS_CABLE);
+  else if (LOOPBACK.test(String(defaultInputLabel ?? ""))) warnings.push(INPUT_IS_LOOPBACK);
   return warnings;
 }

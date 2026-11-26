@@ -17,12 +17,17 @@
  * expects the converted voice within ±40 ms of D, so D must neither jump on
  * one odd window nor wander:
  * - A narrow-window result is taken only when it looks like the same peak as
- *   before. One at the window's edge (a slope, not a peak), untrusted,
+ *   before. One at the window's edge (a slope, not a peak), untrusted, or
  *   scoring far below the recent estimates (the delay jumped and the window
- *   now holds a look-alike), or moving D more than SPARSE_MOVE_MS in a window
- *   with little speech (see SPARSE_SHARE) is checked at once with a
- *   whole-range search. Taking such results instead walks D, window by
- *   window, to a delay that is neither the old one nor the new one.
+ *   now holds a look-alike) is checked at once with a whole-range search.
+ *   Taking such results instead walks D, window by window, to a delay that
+ *   is neither the old one nor the new one.
+ * - A window with little speech (see SPARSE_SHARE) may confirm D but never
+ *   move it more than SPARSE_MOVE_MS: a short block of speech against
+ *   silence lifts every lag where the blocks overlap, so the look-alike near
+ *   D is the whole range's best match too. The result is not taken, and it
+ *   neither counts as untrusted nor votes for a far delay; the next window
+ *   with more speech decides.
  * - A whole-range result near D that scores far below the recent estimates
  *   may confirm D but not move it: while the engine sends something
  *   unrelated, the best match near D is a look-alike.
@@ -68,9 +73,10 @@ const SPEECH_RANGE_DB = 30;
  * A window with speech in less than this share of its frames holds little
  * speech: the first estimate after the user listened for a while sees a
  * short block of speech against silence, and that block lifts the score of
- * every lag near it. A side lobe then scores like the real peak, so a
- * narrow-window result from such a window that moves D more than
- * SPARSE_MOVE_MS is checked with a whole-range search. Smaller moves (a
+ * every lag near it. A side lobe then scores like the real peak, and the
+ * whole range agrees with it, so while locked such a window never moves D
+ * more than SPARSE_MOVE_MS (its narrow-window result is still checked with
+ * a whole-range search, which may find the delay jumped). Smaller moves (a
  * jitter buffer adapting by 10 ms) are taken as usual: even a wrong one keeps
  * D well inside the stall detector's ±40 ms.
  */
@@ -265,6 +271,11 @@ export class LatencyTracker {
       est = this._search(orig, conv, this.fullSearch[0], this.fullSearch[1]);
       if (est === null) return null;
     }
+    // A window with little speech may confirm D but never move it more than SPARSE_MOVE_MS: not
+    // taken, and it leaves the untrusted count, the far candidate and the relock run as they are.
+    if (this._locked && Math.abs(est.ms - this._delay) > SPARSE_MOVE_MS && this._sparse(orig, peak)) {
+      return { ms: est.ms, score: est.score, method, accepted: false };
+    }
 
     const accepted = this._decide(est, narrow);
     if (accepted) this._accept(est);
@@ -293,12 +304,15 @@ export class LatencyTracker {
   /** A narrow-window result that may not be the peak D was following. `orig`: the window searched, `peak`: its loudest frame. */
   _suspect(est, orig, peak) {
     if (est.edge || !(est.score >= this.minScore)) return true;
-    if (Math.abs(est.ms - this._delay) > SPARSE_MOVE_MS) {
-      let speech = 0;
-      for (let i = 0; i < orig.length; i++) if (orig[i] > peak - SPEECH_RANGE_DB && orig[i] > SOUND_MIN_DB) speech++;
-      if (speech < SPARSE_SHARE * orig.length) return true;
-    }
+    if (Math.abs(est.ms - this._delay) > SPARSE_MOVE_MS && this._sparse(orig, peak)) return true;
     return this._weak(est.score);
+  }
+
+  /** Does the window hold speech in less than SPARSE_SHARE of its frames? */
+  _sparse(orig, peak) {
+    let speech = 0;
+    for (let i = 0; i < orig.length; i++) if (orig[i] > peak - SPEECH_RANGE_DB && orig[i] > SOUND_MIN_DB) speech++;
+    return speech < SPARSE_SHARE * orig.length;
   }
 
   /**

@@ -725,7 +725,7 @@ test("a whole-range match near D that scores far below the recent ones may confi
   assert.deepEqual(step(t), { ms: 340, score: 0.9, method: "local", accepted: true });
 });
 
-test("in a window with little speech, a narrow-window result that moves D more than 20 ms is checked with the whole range", () => {
+test("in a window with little speech, a result that moves D more than 20 ms is checked with the whole range and not taken; a window with more speech decides", () => {
   // The first estimate after the user listened for a while: half a second of speech in 6 s. Its
   // block of speech lifts the score of every lag near it, so a side lobe looks like a peak.
   const QUIET_ORIG = new Float32Array(CHUNK).fill(-60);
@@ -750,20 +750,26 @@ test("in a window with little speech, a narrow-window result that moves D more t
   ]);
   assert.equal(t.delayMs, 300, "the look-alike did not move D");
 
-  // A small move from little speech is taken as usual; a bigger one once the whole range agrees.
+  // A small move from little speech is taken as usual. A bigger one is not, even when the whole
+  // range agrees (its look-alike near D is the whole range's best match too): such a window may
+  // confirm D, never move it more than 20 ms.
   const w2 = { peak: 300, score: 0.9 };
   const { t: t2, calls: c2 } = locked(w2);
   w2.peak = 315;
   assert.deepEqual(listenThenTalk(t2), { ms: 315, score: 0.9, method: "local", accepted: true });
   w2.peak = 345;
-  assert.deepEqual(listenThenTalk(t2), { ms: 345, score: 0.9, method: "full", accepted: true });
+  assert.deepEqual(listenThenTalk(t2), { ms: 345, score: 0.9, method: "full", accepted: false });
+  assert.equal(t2.delayMs, 315);
   assert.deepEqual(c2, [
     [240, 360],
     [255, 375],
     [-100, 1500],
   ]);
-  // With speech in half the window, the same move needs no whole-range search.
-  assert.equal(step(t2).method, "local");
+  // The next estimate's window still holds little speech: not taken either. Once speech fills
+  // half the window, the move is taken, with no whole-range search.
+  assert.deepEqual(step(t2), { ms: 345, score: 0.9, method: "full", accepted: false });
+  assert.equal(t2.delayMs, 315);
+  assert.deepEqual(step(t2), { ms: 345, score: 0.9, method: "local", accepted: true });
   w2.peak = 375;
   assert.deepEqual(step(t2), { ms: 375, score: 0.9, method: "local", accepted: true });
 });

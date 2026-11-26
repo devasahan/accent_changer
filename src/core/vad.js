@@ -13,7 +13,10 @@
  * the next sentence "too quiet" to be speech. `speaking` needs `attackMs` of
  * speech frames in a row to switch on (a click is not speech) and stays on
  * for `hangMs` after the last one (the gaps between words belong to the
- * sentence).
+ * sentence). A steady sound that starts later (a fan, the room after an
+ * unmute) and is within peakRangeDb of the voice counts as speech until the
+ * floor climbs to it at floorRiseDbPerSec, which takes several seconds for a
+ * sound 20-30 dB over the old floor.
  */
 
 /** Level of an all-zero frame; every level is at least this. */

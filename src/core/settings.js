@@ -29,7 +29,10 @@ export const DEFAULTS = Object.freeze({
   hotkeyConvert: "Ctrl+Alt+N",
   startWithWindows: true,
   lipSync: Object.freeze({ enabled: false, totalMs: null, obsOffsetMs: 0 }),
-  budget: Object.freeze({ capUsd: 10, keyExpiresOn: null }),
+  // creditUsd: the Sanas wallet's balance as the user read it in the Sanas Console (null: not
+  // entered, the checklist shows the credit as unknown); creditAtMin: the cost meter's all-time
+  // minutes when it was read (asked again after a top-up). See cost.js creditLeftUsd.
+  budget: Object.freeze({ capUsd: 10, keyExpiresOn: null, creditUsd: null, creditAtMin: null }),
   obsPath: "",
 });
 
@@ -330,6 +333,18 @@ export function validateSettings(input) {
     if (!absent(expires) && expires !== "") {
       if (typeof expires === "string" && isIsoDate(expires)) settings.budget.keyExpiresOn = expires;
       else errors.push("budget.keyExpiresOn must be a date like 2027-11-26; it was cleared.");
+    }
+    // The wallet's balance and the meter's minutes when it was read: both, or neither (unknown).
+    // A file from before they existed has neither, with no error.
+    const credit = budget.creditUsd;
+    const atMin = budget.creditAtMin;
+    if (!absent(credit) && credit !== "") {
+      if (!numberIn(credit, 0, Infinity)) errors.push("budget.creditUsd must be empty or the balance in dollars, $0 or more; it was cleared.");
+      else if (!numberIn(atMin, 0, Infinity)) errors.push("budget.creditUsd came without budget.creditAtMin (the minutes counted when it was read); enter the balance again.");
+      else {
+        settings.budget.creditUsd = credit;
+        settings.budget.creditAtMin = atMin;
+      }
     }
   } else if (!absent(budget)) errors.push("budget must be a group of settings; using the defaults.");
 

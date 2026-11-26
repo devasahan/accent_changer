@@ -11,12 +11,26 @@
  * - Convert: the converted voice comes in only when the engine's media flows,
  *   D is known, the stall detector has heard 3 s of healthy converted speech
  *   since (FaultPolicy decides) and everything between what the original
- *   plays and what the converted voice plays is a pause, so the switch cuts,
- *   skips and repeats no word. Equal-power crossfade of toConvertedMs.
+ *   plays and what the converted voice plays, plus the crossfade, is a pause
+ *   (with margins), so the switch cuts, skips and repeats no word.
+ *   Equal-power crossfade of toConvertedMs. In low-delay mode the original
+ *   plays the live edge, where the content its fade-out would play is not
+ *   written yet: it first steps back toConvertedMs + pauseMarginMs, so it
+ *   fades out on content the check covered (a word that starts just after
+ *   the decision is not heard now in the user's voice and again D later).
  * - A fault (the converted voice stalls, NaN or a burst, the engine drops, a
  *   fault the main thread reports): the user's own voice comes back at once
  *   (toOwnMs), replayed from where the converted voice stopped, and the
- *   OriginalTimeline catches up with the live mic by shortening pauses. In
+ *   OriginalTimeline catches up with the live mic by shortening pauses. A
+ *   fault the main thread reports comes late by design (its packet watchdog
+ *   waits 600 ms or more): it replays from where the stall detector's miss
+ *   run in progress began, or from the main thread's time since the last
+ *   packet (sinceMs) before the converted voice's position, if earlier (see
+ *   command()). Catching up takes pauses: one gives back at most half of
+ *   itself after its first 60 ms and keeps 150 ms, so on fluent speech
+ *   (pauses under about 250 ms) the user's voice can trail the live mic, or
+ *   in lip sync the lips, by about 0.3-1 s until the next longer pauses,
+ *   which can take tens of seconds. In
  *   an interview the converted voice comes back only after the user presses
  *   Convert again; in practice mode by itself, after FaultPolicy's backoff.
  * - The user's "own voice" (or "off") while converting replays the original
@@ -33,7 +47,10 @@
  * main Vad's speech runs (from a little before its flag rose to the end of
  * the last speech frame) are kept for the last few seconds, so "is the
  * converted voice in a pause?" is answered for content D (or L) ago, not for
- * the live mic.
+ * the live mic. A steady sound that starts later (a fan, the room after an
+ * unmute) counts as speech for several seconds (see vad.js); meanwhile the
+ * switch to the converted voice, the catch-up after a replay and D or L
+ * moves wait.
  *
  * Pure (no DOM, no Web Audio, no clock, no timers): time is the number of
  * samples processed, so it runs unchanged in the AudioWorklet and in Node
@@ -292,8 +309,12 @@ export class SafetyMixer {
    * - {type:"convert"}: the user wants the converted voice ("connecting" until it may come in).
    * - {type:"own"}: the user's own voice now ("own-manual"; idempotent).
    * - {type:"off"}: passthrough, engine not needed ("off").
-   * - {type:"engine", status:"media"|"down", reason}: packets flowing, or the engine dropped (a fault while converting).
-   * - {type:"fault", reason}: any other fault the main thread sees (a fault while converting).
+   * - {type:"engine", status:"media"|"down", reason, sinceMs}: packets flowing, or the engine dropped (a fault while
+   *   converting). sinceMs (optional): the main thread's time since the last packet, in ms. The original is replayed
+   *   from the earliest of: that long (plus the stall margin and replay lead) before the converted voice's position,
+   *   where the stall detector's miss run in progress began, and guessBackMs before the converted voice's position
+   *   (see _mainReplayFrom); never further back than historyMs.
+   * - {type:"fault", reason, sinceMs}: any other fault the main thread sees (a fault while converting); sinceMs as above.
    * - {type:"delay", ms}: a new D estimate (null = unknown); used from the next pause.
    * - {type:"lipSync", totalMs}: lip-sync total delay L (null = low-delay mode).
    * - {type:"mode", mode}: "interview" | "practice".
@@ -322,11 +343,11 @@ export class SafetyMixer {
           this._media = true;
         } else if (msg.status === "down") {
           this._media = false;
-          this._fault("engine-down", reasonOf(msg, "engine down"), this._convPos() - this._guessBack);
+          this._fault("engine-down", reasonOf(msg, "engine down"), this._mainReplayFrom(msg));
         }
         break;
       case "fault":
-        this._fault("main", reasonOf(msg, "fault"), this._convPos() - this._guessBack);
+        this._fault("main", reasonOf(msg, "fault"), this._mainReplayFrom(msg));
         break;
       case "delay":
         this._pendingD = typeof msg.ms === "number" && Number.isFinite(msg.ms) ? Math.max(0, msg.ms) : null;
@@ -436,7 +457,10 @@ export class SafetyMixer {
   }
 
   _render(origOut, convOut, out, n) {
-    this._timeline.read(origOut, this._Ls);
+    // While fading to the converted voice, the original stays on the content the pause check
+    // covered (see _tryReturn); afterwards it is unheard and catches up at pauses.
+    const fading = this._xTarget === 1 && this._x < 1;
+    this._timeline.read(origOut, fading ? Math.max(this._Ls, this._toConvLen + this._margin) : this._Ls);
     this._gainFrom = this._gainLin;
     this._updateGain(n);
     if (this._x > 0 || this._xTarget === 1) this._readConv(convOut, n);
@@ -489,6 +513,14 @@ export class SafetyMixer {
     ask.atPause = true;
     if (!this._policy.mayReturn(ask)) return;
     const reason = this._state === CONNECTING ? "ready" : "retry";
+    // The original's fade-out must play only content the pause check covered. At the live edge
+    // (low delay, caught up) the next toConvertedMs + margin are not written yet, and a word that
+    // starts there would be heard now in the user's voice and again D later in the converted one:
+    // step back that far (the read of this block then leaves the lag at the raised target, so no
+    // hold is inserted).
+    const tl = this._timeline;
+    const need = this._toConvLen + this._margin;
+    if (tl.lagSamples < need) tl.jumpTo(tl.writePos - tl.lagSamples - need);
     this._xTarget = 1;
     this._xStep = this._toConvStep;
     this._setState(CONVERTING, reason);
@@ -499,14 +531,20 @@ export class SafetyMixer {
    * position, the converted voice from where it is (content time); the
    * switch moves the listener from one to the other, so everything from the
    * earlier of the two to the later one plus the crossfade must be a pause
-   * (with margins). Only the two crossfades are not enough: when the
-   * replayed original still lags behind, a word between them would be
-   * skipped (or, the other way round, said twice).
+   * (with margins), and so must the content the original fades out on when
+   * it steps back from the live edge (_tryReturn). Only the two crossfades
+   * are not enough: when the replayed original still lags behind, a word
+   * between them would be skipped (or, the other way round, said twice).
    */
   _switchPause() {
-    const o = this._timeline.writePos - this._timeline.lagSamples;
+    const tl = this._timeline;
+    const o = tl.writePos - tl.lagSamples;
     const c = this._convPos();
-    return !this._speechIn(Math.min(o, c) - this._margin, Math.max(o, c) + this._toConvLen + this._margin);
+    // At the live edge the original first steps back toConvertedMs + margin (see _tryReturn): that is
+    // where its fade-out plays (it lies before c whenever D is over about 60 ms).
+    const back = tl.writePos - this._toConvLen - this._margin;
+    const from = o < c ? o : c;
+    return !this._speechIn((back < from ? back : from) - this._margin, Math.max(o, c) + this._toConvLen + this._margin);
   }
 
   // ---- D, L and the delay line ---------------------------------------------
@@ -558,6 +596,33 @@ export class SafetyMixer {
       this._cdLeft = heard ? this._cdLen : 0;
       this._convDelay = nextCd;
     }
+  }
+
+  /**
+   * Where to replay from for a fault the main thread reports (engine down, a
+   * packet watchdog, an SDK event). Such a report comes late by design (packets
+   * stalled for 600 ms or more), and the converted voice stopped before it:
+   * - where the stall detector's miss run in progress began (missStartSample),
+   *   when it has found speech missing but not yet missingMs of it;
+   * - msg.sinceMs (the main thread's time since the last packet) before the
+   *   converted voice's position, when given: this covers a stop in a
+   *   sentence's soft ending or in a pause, where no miss run has begun;
+   * - otherwise guessBackMs before the converted voice's position.
+   * The earliest of these, with the stall margin and the replay lead for the
+   * first two. Errs early: a little is said twice rather than lost.
+   */
+  _mainReplayFrom(msg) {
+    const pos = this._convPos();
+    const back = this._stallMargin + this._lead;
+    let from = pos - this._guessBack;
+    const miss = this._stall.missStartSample;
+    if (miss !== null && miss - back < from) from = miss - back;
+    const since = msg.sinceMs;
+    if (typeof since === "number" && Number.isFinite(since) && since > 0) {
+      const at = pos - Math.round((since * this.sampleRate) / 1000) - back;
+      if (at < from) from = at;
+    }
+    return from;
   }
 
   /** Content time of the converted voice at the next output sample. */

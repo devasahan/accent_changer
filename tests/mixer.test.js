@@ -308,6 +308,30 @@ function fricative(n, rmsDb, seed) {
   return out;
 }
 
+/**
+ * The utterances of take `seed` (its first `takeSeconds`), trimmed to their sound and laid out
+ * again from 0.5 s with the pauses `gapMs(k)` (ms) between them, `seconds` long. Returns the
+ * samples, the sound spans and where each utterance went ([on, off)).
+ */
+function retimed(seed, gapMs, seconds = 24, takeSeconds = 24) {
+  const { samples, utterances } = speech(seed, takeSeconds);
+  const x = new Float32Array(ms(seconds * 1000));
+  const parts = [];
+  let t = ms(500);
+  utterances.forEach((u, k) => {
+    let a = Math.round(u.start * SR);
+    let b = Math.round(u.end * SR);
+    while (a < b && samples[a] === 0) a++;
+    while (b > a && samples[b - 1] === 0) b--;
+    const part = samples.subarray(a, b);
+    if (t + part.length > x.length) return;
+    x.set(part, t);
+    parts.push({ on: t, off: t + part.length });
+    t += part.length + ms(gapMs(k));
+  });
+  return { x, spans: soundSpans(x), parts };
+}
+
 /** The click threshold: twice the largest sample-to-sample step either path has on its own (the converted at +6 dB). */
 function clickLimit(orig, conv) {
   return 2 * Math.max(maxStep(orig), 2 * maxStep(conv));
@@ -406,6 +430,66 @@ test("convert: switches only after 3 s of healthy converted speech and in a paus
   assert.ok(speechMs(isSpeech, ms(4700), T0 - ms(300)) >= 3000, `switched after ${speechMs(isSpeech, ms(4700), T0 - ms(300))} ms of healthy speech`);
 });
 
+test("low delay: the switch to the converted voice never fades the original out over a word that starts after the decision", () => {
+  // Pauses just longer than D + 40 ms (common between phrases): the check covers the content up
+  // to the live edge, and a word may start right after it. The original's fade-out must play
+  // content the check covered, or the word is heard now in the user's voice and again D later.
+  let switches = 0;
+  let onsets = 0;
+  for (const [D, gap] of [
+    [250, 45],
+    [250, 50],
+    [320, 45],
+    [320, 50],
+    [400, 45],
+    [400, 50],
+  ]) {
+    for (const seed of [1, 2, 3]) {
+      const { x, spans } = retimed(seed, () => D + gap);
+      const conv = engine(x, { delayMs: D, gainDb: -6, cutoffHz: null });
+      const { events, out } = run(x, conv, { script: START(D) });
+      const sw = firstState(events, "converting");
+      if (!sw) continue;
+      switches++;
+      const T = sw.from;
+      const hit = spans.find((sp) => sp.on >= T && sp.on < T + ms(60));
+      if (!hit) continue;
+      onsets++;
+      // The converted voice plays a pause there (content T - D): all the fade may carry is the original.
+      let peak = 0;
+      for (let i = T; i < T + ms(60); i++) peak = Math.max(peak, Math.abs(out[i]));
+      assert.ok(peak < 1e-3, `D ${D} gap ${gap} seed ${seed}: switched at ${(T / SR).toFixed(3)} s; a word starts ${((hit.on - T) / 48).toFixed(0)} ms into the fade and is heard now (peak ${peak.toFixed(4)}) and again ${D} ms later`);
+    }
+  }
+  assert.ok(switches >= 15, `only ${switches} switches`);
+  assert.ok(onsets >= 3, `only ${onsets} words starting in the fade`);
+});
+
+test("a word starting 10-40 ms before an otherwise valid switch point (not flagged yet, or just flagged) blocks the switch", () => {
+  const D = 300;
+  const { samples, utterances } = speech(2, 24);
+  const end = Math.round(utterances.find((u) => u.end > 10).end * SR);
+  const x = new Float32Array(end + ms(4000));
+  x.set(samples.subarray(0, end));
+  // The switch is decided at the end of the block after Convert: put that on a 10 ms frame edge.
+  const pos = Math.ceil((end + ms(1500)) / (4 * FRAME)) * 4 * FRAME;
+  const T = pos - BLOCK;
+  const word = new Float32Array(ms(200)); // a vowel: a 150 Hz buzz, 5 ms attack
+  for (let i = 0; i < word.length; i++) {
+    let v = 0;
+    for (let h = 1; h <= 8; h++) v += Math.sin((2 * Math.PI * 150 * h * i) / SR) / h;
+    word[i] = 0.1 * Math.min(1, i / ms(5)) * v;
+  }
+  for (const lead of [null, 10, 20, 30, 40]) {
+    const y = Float32Array.from(x);
+    if (lead !== null) y.set(word, pos - ms(lead));
+    const { events } = run(y, engine(y, { delayMs: D }), { script: [...START(D).slice(0, 2), [T, { type: "convert" }]] });
+    const sw = firstState(events, "converting");
+    if (lead === null) assert.equal(sw?.from, T, "without the word the switch is valid right there");
+    else assert.ok(sw && sw.from >= pos - ms(lead) + word.length, `a word ${lead} ms before the decision: switched ${((sw?.from ?? 0) - T) / 48} ms after Convert`);
+  }
+});
+
 test("a digital-silence stall mid-sentence: own-fault after 350-450 ms of the user's speech, every word replayed, no click (low delay and lip sync)", () => {
   let cases = 0;
   for (const D of [250, 400]) {
@@ -435,7 +519,8 @@ test("a digital-silence stall mid-sentence: own-fault after 350-450 ms of the us
         // Detection: after 350-450 ms of the user's speech since the stall (counting what was due by then).
         const lost = speechMs(isSpeech, at, own.at - Ds);
         assert.ok(lost >= 350 && lost <= 450, `${what}: own-fault after ${lost} ms of speech`);
-        assert.ok(own.at - (at + Ds) < ms(1000), `${what}: ${(own.at - at - Ds) / 48} ms after the stall arrived`);
+        // The plan's promise: the user's voice within about 0.75 s of the stall reaching the mixer.
+        assert.ok(own.at - (at + Ds) <= ms(750), `${what}: ${(own.at - at - Ds) / 48} ms after the stall arrived`);
         // The original caught up with the target lag again (shortening pauses only) ...
         const target = lip ?? 0;
         assert.ok(Math.abs(mixer.originalLagMs - target) < 0.01, `${what}: lag ${mixer.originalLagMs} ms at the end`);
@@ -469,6 +554,7 @@ test("a concealment-like stall (the last 20 ms repeated and fading, then noise a
       assert.ok(own, `${what}: no fault`);
       const lost = speechMs(isSpeech, at, own.at - Ds);
       assert.ok(lost >= 350 && lost <= 500, `${what}: own-fault after ${lost} ms of speech`);
+      assert.ok(own.at - (at + Ds) <= ms(750), `${what}: ${(own.at - at - Ds) / 48} ms after the stall arrived`);
       // Behind a concealment tail the stall start can be a few tens of ms late; the replay starts
       // the detector's tolerance (40 ms) earlier still, so its 30 ms fade-in is over by the stop
       // and everything from the stop on comes out verbatim.
@@ -537,6 +623,46 @@ test("catching up after a stall keeps soft word starts whole: the real Vad calls
     locate(out, x, want, fault.from).forEach((p, k) => {
       assert.ok(p >= 0, `${what}: the soft start at ${(want[k].on / SR).toFixed(3)} s is cut or crossfaded`);
     });
+  }
+});
+
+test("catching up on fluent speech (every pause under 250 ms, room noise): the original stays 0.3-1.1 s behind until longer pauses come", () => {
+  // Measured, so that a change shows: a pause gives back at most half of what the flag calls
+  // pause after its first 60 ms and keeps 150 ms, so pauses of 120-240 ms give back next to
+  // nothing. The user's voice trails the live mic (in lip sync, the lips) by the replay's lag
+  // until the next pauses of about 250 ms or more; pauses of 1 s bring it back in a few seconds.
+  const fluent = [150, 200, 120, 240, 180];
+  const { x, parts } = retimed(6, (k) => (k < 5 ? 900 : k < 14 ? fluent[k % fluent.length] : 1000), 40, 60);
+  const room = noise(x.length, -60, 17);
+  const mic = Float32Array.from(x, (v, i) => v + room[i]);
+  const levels = frameLevelsDb(mic, SR, 10);
+  let peak = -Infinity;
+  for (const v of levels) peak = Math.max(peak, v);
+  // A stall in a vowel in the middle of the first utterance of the fluent stretch; healthy again 1.5 s later.
+  let j = Math.floor((parts[5].on + parts[5].off) / 2 / FRAME);
+  while (levels[j] < peak - 6) j++;
+  const at = j * FRAME + 100;
+  const longFrom = parts[14].on; // the first 1 s pause ends here
+  for (const lip of [null, 450]) {
+    for (const D of [250, 400]) {
+      const conv = engine(mic, { delayMs: D, stopAt: at + ms(D), resumeAt: at + ms(D) + ms(1500) });
+      const excess = [];
+      const { events, mixer } = run(mic, conv, {
+        mixer: new SafetyMixer({ lipSyncMs: lip }),
+        script: START(D),
+        onBlock: (m, i, e) => excess.push([e, m.originalLagMs - (lip ?? 0)]),
+      });
+      const what = `D ${D}${lip ? ` lip sync ${lip}` : ""}`;
+      const fault = events.find((e) => e.type === "fault");
+      assert.ok(fault && fault.kind === "stall", `${what}: no stall fault`);
+      // From 1 s after the fault to the end of the fluent stretch: 0.3-1.1 s behind all along.
+      const during = excess.filter(([e]) => e > fault.at + ms(1000) && e < longFrom - ms(1000)).map(([, v]) => v);
+      assert.ok(during.length > 0 && Math.min(...during) >= 300 && Math.max(...during) <= 1100, `${what}: ${Math.round(Math.min(...during))}-${Math.round(Math.max(...during))} ms behind during the fluent stretch`);
+      // The 1 s pauses after it bring it back within 8 s.
+      const back = excess.find(([e, v]) => e > longFrom && v < 0.5);
+      assert.ok(back && back[0] - longFrom <= ms(8000), `${what}: back ${back ? ((back[0] - longFrom) / SR).toFixed(1) : "never"} s after the longer pauses began`);
+      assert.ok(Math.abs(mixer.originalLagMs - (lip ?? 0)) < 0.01, `${what}: lag at the end`);
+    }
   }
 });
 
@@ -672,6 +798,24 @@ test("practice mode goes back by itself after the backoff (0.5 s, then 1 s), 3 s
   }
 });
 
+test("{type:'mode', mode:'practice'} on an interview-mode mixer: after a fault it goes back by itself", () => {
+  const D = 300;
+  const { samples, utterances } = speech(6, 40);
+  const [at] = stallPoints(samples, utterances, rng(41), 1, 11);
+  const conv = engine(samples, { delayMs: D, stopAt: at + ms(D), resumeAt: at + ms(D) + ms(1200) });
+  for (const [mode, back] of [
+    ["practice", true],
+    ["interview", false],
+  ]) {
+    const { events } = run(samples, conv, { script: [...START(D), [ms(2000), { type: "mode", mode }]] });
+    const fault = events.find((e) => e.type === "fault");
+    assert.ok(fault && fault.kind === "stall", `${mode}: no stall fault`);
+    const ret = firstState(events, "converting", fault.from + 1);
+    if (back) assert.ok(ret && ret.reason === "retry", `${mode}: did not go back by itself`);
+    else assert.equal(ret, null, `${mode}: went back by itself`);
+  }
+});
+
 test("going back while the replayed original still lags behind: the switch skips no word and repeats none", () => {
   // A timeline that never shortens a pause: after the replay the original stays ~0.7 s behind
   // the live mic, behind the converted voice. Going back to the converted voice jumps from the
@@ -741,6 +885,56 @@ test("NaN or Infinity in the converted stream: own-fault in the same block; the 
   for (let t = ms(500); t < mic.length; t += ms(777)) mic[t] = NaN;
   const { out } = run(mic, engine(samples, { delayMs: 300 }), { script: START(300) });
   assert.ok(out.every(Number.isFinite));
+});
+
+test("a +20 dB burst in the converted voice while converting: a 'level burst' fault within 32 ms, replayed from before it, output at most -1 dBFS; +15 dB passes", () => {
+  for (const [D, seed] of [
+    [250, 1],
+    [400, 2],
+  ]) {
+    const { samples, utterances } = speech(seed, 24);
+    const [at] = stallPoints(samples, utterances, rng(5 * seed + D), 1, 11);
+    const burst = (gain) => {
+      const conv = engine(samples, { delayMs: D });
+      const a = at + ms(D); // arrival time of the burst: content `at` of the converted voice
+      for (let i = a; i < a + ms(30); i++) conv[i] *= gain;
+      return { a, ...run(samples, conv, { script: START(D), until: a + ms(1500) }) };
+    };
+    const what = `D ${D} seed ${seed}`;
+    const { a, events, out } = burst(10);
+    assert.ok(firstState(events, "converting").from < a, `${what}: not converting before the burst`);
+    const fault = events.find((e) => e.type === "fault");
+    assert.ok(fault, `${what}: no fault`);
+    assert.deepEqual([fault.kind, fault.reason], ["bad-output", "level burst"], what);
+    assert.ok(fault.at - a <= ms(32), `${what}: fault ${(fault.at - a) / 48} ms after the burst began`);
+    assert.equal(firstState(events, "own-fault").from, fault.from, what);
+    assert.ok(fault.replayFrom <= at, `${what}: replay from ${(fault.replayFrom - at) / 48} ms after the burst's content`);
+    for (let i = 0; i < out.length; i++) if (!(Math.abs(out[i]) <= LIMIT * (1 + 1e-6))) assert.fail(`${what}: sample ${i} = ${out[i]}`);
+    const quieter = burst(10 ** (15 / 20));
+    assert.equal(quieter.events.find((e) => e.type === "fault"), undefined, `${what}: +15 dB made a fault`);
+  }
+});
+
+test("a single huge sample (1e6) in the converted voice while converting is clipped: 20 ms later the output is back at full level", () => {
+  // Unclipped, the limiter would take its gain down to about 1e-6 and duck the voice for ~100 ms.
+  const D = 300;
+  const { samples, utterances } = speech(3, 24);
+  const conv = engine(samples, { delayMs: D, gainDb: 0, cutoffHz: null });
+  const [at] = stallPoints(samples, utterances, rng(33), 1, 11);
+  const a = at + ms(D);
+  conv[a] = 1e6;
+  const { events, out } = run(samples, conv, { script: START(D), until: a + ms(1000) });
+  assert.ok(firstState(events, "converting").from < a, "not converting before the spike");
+  assert.ok(!events.some((e) => e.type === "fault"), "a fault");
+  // The output is the converted voice (gain correction 0 dB here) times the limiter's gain.
+  let s = 0;
+  let cc = 0;
+  for (let i = a + ms(20); i < a + ms(30); i++) {
+    s += out[i] * conv[i];
+    cc += conv[i] * conv[i];
+  }
+  const g = s / cc;
+  assert.ok(g > 0.9 && g <= 1.0001, `gain ${g.toFixed(3)} 20 ms after the spike`);
 });
 
 /**
@@ -897,11 +1091,15 @@ test("equal-power crossfades: two uncorrelated noises at the same level keep the
     conv.set(noise(total - speechEnd - ms(D), -60, 12), speechEnd + ms(D));
     const convertAt = speechEnd + ms(800);
     const ownAt = speechEnd + ms(2000);
-    const { events, out, mixer } = run(orig, conv, {
+    const { events, out, mixer, before } = run(orig, conv, {
       script: [...START(D).slice(0, 2), [convertAt, { type: "convert" }], [ownAt, { type: "own" }]],
     });
     const sw = firstState(events, "converting");
     assert.ok(sw && sw.from === convertAt, `D ${D}: switch at ${sw && sw.from} instead of ${convertAt}`);
+    // Low delay: the original fades out on content the pause check covered, toConvertedMs +
+    // pauseMarginMs back from the live edge. It jumps there in the switch block and holds that lag
+    // through the fade: no silence goes in under the fade.
+    for (let t = sw.from + BLOCK; t <= sw.from + ms(60); t += BLOCK) assert.equal(before(t).lag, ms(100), `D ${D}: lag ${before(t).lag} ${t - sw.from} samples into the fade`);
     assert.equal(mixer.gainDb, 0, `D ${D}: the copy is at the original's level`);
     const back = firstState(events, "own-manual");
     assert.equal(back.from, ownAt);
@@ -1003,6 +1201,64 @@ test("a new D waits for a pause of the original while the converted voice is hea
   assert.equal(m2.delayMs, null);
 });
 
+test("a null D while the converted voice is heard keeps the D in use: a later stall still faults after 350-450 ms of speech", () => {
+  const D = 300;
+  const Ds = ms(D);
+  const { samples, utterances } = speech(6, 40);
+  const isSpeech = speechFrames(samples);
+  const [at] = stallPoints(samples, utterances, rng(51), 1, 20);
+  const conv = engine(samples, { delayMs: D, stopAt: at + Ds });
+  let nullAt = null;
+  let dAfterNull = null;
+  const { events, mixer } = run(samples, conv, {
+    script: START(D),
+    onBlock: (m, i) => {
+      if (nullAt === null && m.state === "converting" && i > ms(12000)) {
+        m.command({ type: "delay", ms: null });
+        nullAt = i;
+        dAfterNull = m.delayMs;
+      }
+    },
+  });
+  assert.ok(nullAt !== null && nullAt < at, "never converting before the null D");
+  assert.equal(dAfterNull, D, "the null D replaced the D in use");
+  const own = firstState(events, "own-fault");
+  assert.ok(own, "no fault: the stall went unwatched");
+  assert.equal(events.find((e) => e.type === "fault").kind, "stall");
+  const lost = speechMs(isSpeech, at, own.at - Ds);
+  assert.ok(lost >= 350 && lost <= 450, `own-fault after ${lost} ms of speech`);
+  // Off the air it is taken: D unknown from then on.
+  assert.equal(mixer.delayMs, null);
+});
+
+test("a main-thread fault while connecting: health starts over at 0, and the switch waits for 3 s more of healthy speech", () => {
+  const D = 300;
+  const Ds = ms(D);
+  const { samples } = speech(6, 40);
+  const isSpeech = speechFrames(samples);
+  const conv = engine(samples, { delayMs: D });
+  let faultAt = null;
+  let healthBefore = null;
+  let healthAfter = null;
+  const { events } = run(samples, conv, {
+    script: START(D),
+    onBlock: (m, i, e) => {
+      if (faultAt === null && m.state === "connecting" && m.healthyMs >= 2500) {
+        healthBefore = m.healthyMs;
+        m.command({ type: "fault", reason: "5% concealed" });
+        healthAfter = m.healthyMs;
+        faultAt = e;
+      }
+    },
+  });
+  assert.ok(faultAt !== null, "never 2.5 s of health while connecting");
+  assert.ok(healthBefore >= 2500 && healthAfter === 0, `health ${healthBefore} -> ${healthAfter}`);
+  assert.ok(!events.some((e) => e.type === "fault"), "a fault event while not converting");
+  const T0 = firstState(events, "converting").from;
+  assert.ok(T0 > faultAt, "switched before the fault");
+  assert.ok(speechMs(isSpeech, faultAt, T0 - Ds) >= 3000 - 300, `switched after ${speechMs(isSpeech, faultAt, T0 - Ds)} ms of speech since the fault`);
+});
+
 test("engine down or a main-thread fault while converting: own voice at once, replayed from 100 ms before the converted voice; while connecting: health starts over", () => {
   for (const [D, kind, msg] of [
     [250, "engine-down", { type: "engine", status: "down", reason: "ice failed" }],
@@ -1032,6 +1288,49 @@ test("engine down or a main-thread fault while converting: own voice at once, re
   assert.ok(!events.some((e) => e.type === "fault"));
   const T0 = firstState(events, "converting").from;
   assert.ok(T0 > ms(6000) && speechMs(isSpeech, ms(6000), T0 - ms(300)) >= 3000 - 300, `switched at ${T0 / SR} s`);
+});
+
+test("a fault the main thread reports late (the packets stopped 450-600 ms earlier): the replay starts before the stop, nothing after it is lost", () => {
+  // The stall detector needs 350 ms of the user's speech; the main thread's watchdog may report
+  // first. The replay must start where the converted voice stopped: sinceMs before the converted
+  // voice's position, or where the detector's miss run began (also for a report that carries no
+  // sinceMs), not 100 ms before the position.
+  let cases = 0;
+  for (const [lip, conceal, D, seed] of [
+    [null, false, 250, 1],
+    [null, true, 400, 2],
+    [450, false, 400, 2],
+    [450, true, 250, 1],
+  ]) {
+    const after = D === 250 ? 600 : 450; // the report reaches the worklet this long after the last audio
+    const { samples, utterances } = speech(seed, 24);
+    const u = utterances.find((v) => v.start > 11 && v.end - v.start > 0.8 && v.end < 21);
+    const uOn = Math.round(u.start * SR);
+    const uOff = Math.round(u.end * SR);
+    for (const [where, at, sinceMs] of [
+      ["mid-sentence", Math.round((uOn + uOff) / 2), after],
+      ["mid-sentence, no sinceMs", Math.round((uOn + uOff) / 2), undefined],
+      ["250 ms before the sentence ends", uOff - ms(250), after],
+      ["150 ms before the sentence ends", uOff - ms(150), after],
+      ["300 ms before the sentence starts", uOn - ms(300), after],
+    ]) {
+      const conv = engine(samples, { delayMs: D, stopAt: at + ms(D), conceal, seed });
+      let F = at + ms(D) + ms(after);
+      F -= F % BLOCK;
+      const msg = { type: "engine", status: "down", reason: "packets stalled", sinceMs };
+      const until = Math.min(samples.length, uOff + ms(lip ?? 0) + ms(2500));
+      const { events, out } = run(samples, conv, { mixer: new SafetyMixer({ lipSyncMs: lip }), script: [...START(D), [F, msg]], until });
+      const what = `D ${D} seed ${seed}${lip ? ` lip sync ${lip}` : ""}${conceal ? ", concealment" : ""}, stop ${where}`;
+      assert.ok(firstState(events, "converting").from < at, `${what}: not converting before the stop`);
+      const fault = events.find((e) => e.type === "fault");
+      assert.ok(fault && fault.from <= F, `${what}: no fault by the report`);
+      // Every piece of sound from the stop to the end of the sentence, verbatim and in order.
+      const spans = soundSpans(samples, at, uOff);
+      locate(out, samples, spans, fault.from).forEach((p, k) => assert.ok(p >= 0, `${what}: ${fault.kind} fault, replay from stop ${((fault.replayFrom - at) / 48).toFixed(0)} ms: speech [${spans[k].on}, ${spans[k].off}) lost or changed`));
+      cases++;
+    }
+  }
+  assert.equal(cases, 20);
 });
 
 test("own voice while converting: the original goes on from the converted voice's words (nothing lost); own and off are idempotent", () => {

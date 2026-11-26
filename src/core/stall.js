@@ -29,19 +29,47 @@
  *   Speech rises and falls with its syllables; steady sound the Vad still
  *   takes for speech (a fan that just started, the room after an unmute,
  *   while the Vad's noise floor climbs) never does, and the converter rightly
- *   returns nothing for it. The speech peak (SpeechPeak) learns only from
- *   such frames, and a cough, a click or one loud word cannot lift it far
- *   above the voice. Quieter frames (breaths, the Vad's hangover in a pause,
+ *   returns nothing for it. One exception: a steady frame within VOWEL_DB
+ *   (6 dB) of the peak counts too once the converter has carried
+ *   CARRIED_FRAMES (5) decided frames of the same stretch of speech (since
+ *   the Vad's flag last rose). That is the middle of a drawn-out vowel, an
+ *   "uhhh", or voiced connected speech whose syllables dip by less than
+ *   modulationDb; a fan or a room the converter leaves out never had a
+ *   carried frame. (A steady noise that starts while the user talks and
+ *   comes within about 6 dB of the voice's peak can still pass for such a
+ *   vowel and count as missing.)
+ *   Quieter frames (breaths, the Vad's hangover in a pause,
  *   soft syllable edges) carry no evidence: the converter may drop a breath,
  *   and a converted whisper cannot be told from noise. They never start a
  *   miss run or reset one. Only a syllable edge next to a decided frame (down
  *   to `edgeRangeDb`) adds to a run already going, when nothing voice-level
  *   came back for it.
+ * - The speech peak (SpeechPeak) the ranges are measured from learns from
+ *   modulated speech frames until the converter has carried PEAK_BOOT_FRAMES
+ *   (100) frames, and from then on only from the frames it carried: another
+ *   voice in the room, a TV or music that the converter leaves out must not
+ *   pull the peak down to its own level (every frame of it would then count
+ *   as missing). A voice that really got quieter is still followed: after
+ *   PEAK_FALLBACK_FRAMES (200) speech frames without a carried one, a
+ *   modulated frame under the judging range that the converted stream
+ *   carried at the frame's own level teaches the peak too. A cough, a click
+ *   or one loud word cannot lift the peak far above the voice: it stays
+ *   within peakCapDb of the level the loudest fifth of the last `peakSpanMs`
+ *   (5 s) of that speech reaches, so even a coughing fit or a long laugh is
+ *   too short a part of the span to set it.
  * - It is matched when the loudest converted frame of its span is at least
  *   orig + offsetDb - dropDb AND voice-level: within `voiceRangeDb` of the
- *   converted speech peak (the user's speech peak + offsetDb). The second
- *   test keeps the noise that a stalled stream decays into (packet-loss
- *   concealment, comfort noise at -50 dBFS) from passing for speech.
+ *   converted speech peak (the user's speech peak + offsetDb) AND, when the
+ *   original dipped by modulationDb within modulationMs before the frame,
+ *   the converted stream dips too: somewhere within ±coverLagMs of where
+ *   that dip was due it is at least DIP_DB (6 dB) under the span's loudest
+ *   frame. The level tests keep the noise that a stalled stream decays into
+ *   (packet-loss concealment, comfort noise at -50 dBFS) from passing for
+ *   speech while it is far under the voice; the dip test catches it when it
+ *   comes close to the voice's level (a quiet mic, a quiet converter), and
+ *   a stuck converter that loops a piece of the voice at full level. The
+ *   dip is looked for only backwards: where a later dip is due, the
+ *   converted frames have not all arrived yet.
  * - When a run of misses starts, the ±tol span and a fading concealment
  *   tail have usually "matched" the first frames after the real stop. So the
  *   detector looks back for the last converted frames that really carried
@@ -50,23 +78,45 @@
  *   tolMs + concealMs of it, so one false miss in healthy speech stays far
  *   from a stall). That point, in content time, is `stallStartSample`; it
  *   errs early, so a replay repeats a little rather than losing a word.
- *   It assumes the converted voice arrives exactly D late: when it is later
- *   than D (by up to the tolMs the spans accept), or a concealment tail kept
- *   the voice's level and shape for a few frames, it is that much late. The
- *   mixer replays from tolMs earlier still.
+ *   Converted and original frames are paired at the lag the stream really
+ *   followed while it was whole (the coverage's steady lag, see below),
+ *   which may differ from D by tens of ms (a jitter buffer that just grew
+ *   or shrank; a lag within a frame of D counts as D); a later lag moves
+ *   the start earlier by that much, an earlier one never moves it later. When nothing within `lookBackMs`
+ *   carried the voice (the converter stopped in a sentence's soft ending
+ *   and the miss run began only in the next sentence, after a pause), the
+ *   look-back walks on across the pause, up to FAR_BACK_MS (1.2 s), to the
+ *   previous sentence's last loud frame: if the converted voice did not
+ *   carry it, the voice stopped in that sentence, and the start is its last
+ *   pair of alive frames; if it did, the start stays at the far end of
+ *   lookBackMs, so a stall that began in the pause repeats nothing. Behind
+ *   a concealment tail that kept the voice's level and shape for a few
+ *   frames the start is that much late (the mixer replays from tolMs
+ *   earlier still); when such a tail carried the last loud frame before a
+ *   pause, a stop in the soft ending after it is still placed in the pause,
+ *   and the rest of that ending (up to about 60 ms of sound) is not replayed.
  * - A stream that keeps losing pieces (sustained underruns, every other
  *   block missing) still has a voice-level frame in nearly every ±tol span.
  *   So for each matched frame the detector also looks at the converted audio
  *   exactly where the frame is due, at each lag within ±coverLagMs (wider
  *   than the span: a jitter buffer that grew by 100 ms is still found; this
  *   look waits until those frames have arrived): a hole is digital silence
- *   the original does not have, or a level far under the expected one. When,
- *   over the last `choppyMs` of decided speech, even the best-fitting lag
- *   finds holes in more than `choppyShare` of it, the stream is choppy: its
- *   matched frames earn no health and reset nothing, and the share of each
- *   frame that is missing counts toward a stall, from the first hole of the
- *   choppy stretch. Isolated holes (a block lost now and then) stay far
- *   under that share.
+ *   the original does not have, or (as LEVEL_HOLE, 2/3 of one) a level far
+ *   under the expected one: a converter band-limited to 3-4 kHz takes the
+ *   fricatives that far down, and that alone must not make a healthy stream
+ *   choppy. When, over the last `choppyMs` of decided speech, even the
+ *   best-fitting lag finds holes in more than `choppyShare` (20 %) of it,
+ *   the stream is choppy: its matched frames earn no health and reset
+ *   nothing, and the share of each frame that is missing counts toward a
+ *   stall. The run starts at the first hole after the stream was last whole
+ *   (WHOLE_MS, 400 ms, of matched speech in a row without a hole at the lag
+ *   it followed), at most lookBackMs before the newest cluster of holes and
+ *   as far back as the history reaches, so the garbled words before the
+ *   stream counted as choppy are replayed too (in the mixer, as far back as
+ *   its replay history reaches). Isolated holes (a block lost now and then)
+ *   stay far under that share; a healthy stream whose delay drifts by
+ *   ±40 ms (a jitter buffer adapting) comes close to it, and may be counted
+ *   as choppy for a few hundred ms.
  */
 
 import { SILENCE_DB, SpeechPeak, frameDb } from "./vad.js";
@@ -89,6 +139,9 @@ const JUMP_QUIET_DB = -50;
  */
 const BELOW_ALL_DB = SILENCE_DB - 0.5;
 
+/** Over every frame level (even a frame of huge finite samples): where a search for the quietest frame starts. Not whole, as above. */
+const ABOVE_ALL_DB = 1000.5;
+
 /** Largest per-frame step of the offset estimate (dB): one odd frame cannot drag it. */
 const OFFSET_STEP_DB = 6;
 
@@ -101,6 +154,15 @@ const DROPOUT_MS = 0.6;
 /** Coverage: a frame missing less than this share has no hole worth the name (a few samples). */
 const HOLE_MIN = 0.05;
 
+/**
+ * Coverage: a frame whose level is far under the expected one, but with no digital silence in it,
+ * is this much of a hole. A converter band-limited to 3-4 kHz takes a fricative ("s", "f") 20 dB
+ * or more under the original's: that is not a lost block, and with a whole hole per such frame a
+ * healthy band-limited stream would hover around choppyShare. At 2/3, level holes alone make a
+ * stream choppy only above 1.5 x choppyShare (30 %), lost blocks at choppyShare (20 %).
+ */
+const LEVEL_HOLE = 2 / 3;
+
 /** Coverage: this many clean decided frames in a row separate one cluster of holes from the next. */
 const CLUSTER_GAP = 8;
 
@@ -112,6 +174,27 @@ const STEADY_FRAMES = 100;
 
 /** Sound within this of the speech peak is something a listener would miss (the Vad's own speech range). */
 const SOUND_RANGE_DB = 25;
+
+/** Coverage: this much matched speech in a row without a hole (at the lag the stream followed) and the stream counts as whole (ms). */
+const WHOLE_MS = 400;
+
+/** A steady frame within this of the speech peak is a vowel, not steady noise, inside speech the converter carries (dB). */
+const VOWEL_DB = 6;
+
+/** ... once the converter has carried this many decided frames since the Vad's flag last rose. */
+const CARRIED_FRAMES = 5;
+
+/** The speech peak learns from all modulated speech until the converter has carried this many frames ... */
+const PEAK_BOOT_FRAMES = 100;
+
+/** ... and after that from carried frames only, or, after this many speech frames without one, from quieter frames it carried at their own level. */
+const PEAK_FALLBACK_FRAMES = 200;
+
+/** A converted voice dips by at least this (dB) where the original dipped by modulationDb. */
+const DIP_DB = 6;
+
+/** When nothing within lookBackMs carried the voice, the stall-start look-back walks on across a pause this far (ms). */
+const FAR_BACK_MS = 1200;
 
 export class StallDetector {
   /**
@@ -131,17 +214,20 @@ export class StallDetector {
    * @param {number} [options.modulationDb=10] decided speech frames stand this far above the quietest original frame ...
    * @param {number} [options.modulationMs=250] ... within this either side (steady sound is never speech evidence)
    * @param {number} [options.aliveDb=6] stall-start look-back: a converted frame within this of its own expected level still carried the voice
-   * @param {number} [options.lookBackMs=500] the look-back searches this far back (pauses included)
+   * @param {number} [options.lookBackMs=500] the look-back searches this far back (pauses included); across a pause to the
+   *   sentence before, up to 1.2 s (see the file header)
    * @param {number} [options.concealMs=100] at most tolMs + this of earlier matched speech is turned into missing speech
    * @param {number} [options.healthResetMs=30] a miss run this long resets healthyMs
    * @param {number} [options.offsetTauMs=2000] time constant of the level-offset estimate, in matched speech
    * @param {number} [options.maxOffsetDb=12] the offset estimate is clamped to ±this
    * @param {number} [options.peakHoldMs=2000] the speech peak holds this long (in decided speech time) ...
    * @param {number} [options.peakDecayDbPerSec=3] ... then sinks this fast
-   * @param {number} [options.peakSpanMs=2500] ... and stays within peakCapDb of the level the loudest fifth of this much speech reaches
+   * @param {number} [options.peakSpanMs=5000] ... and stays within peakCapDb of the level the loudest fifth of this much speech reaches
+   *   (twice the Vad's span: a coughing fit or a long laugh must not fill a fifth of it)
    * @param {number} [options.peakCapDb=4]
    * @param {number} [options.choppyMs=400] the coverage check looks at this much recent decided speech ...
-   * @param {number} [options.choppyShare=0.3] ... and calls the stream choppy when more than this share of it has holes ...
+   * @param {number} [options.choppyShare=0.2] ... and calls the stream choppy when more than this share of it has holes
+   *   (a healthy stream reaches about 0.11, 0.2 while its delay drifts by ±40 ms; a stream losing one block in four, 0.25) ...
    * @param {number} [options.coverLagMs=150] ... at the best lag within ±this of D
    * @param {number} [options.quietRefDb=10] jump test: the reference level never goes below the converted speech peak minus this
    * @param {number} [options.maxDelayMs=1000] jump test with D unknown: the original's loudest frame in this span is the reference
@@ -168,10 +254,10 @@ export class StallDetector {
     maxOffsetDb = 12,
     peakHoldMs = 2000,
     peakDecayDbPerSec = 3,
-    peakSpanMs = 2500,
+    peakSpanMs = 5000,
     peakCapDb = 4,
     choppyMs = 400,
-    choppyShare = 0.3,
+    choppyShare = 0.2,
     coverLagMs = 150,
     quietRefDb = 10,
     maxDelayMs = 1000,
@@ -192,6 +278,8 @@ export class StallDetector {
     this.modFrames = frames(modulationMs);
     this.aliveDb = aliveDb;
     this.backFrames = Math.max(this.tol + 1, frames(lookBackMs));
+    this.farBackFrames = Math.max(this.backFrames, frames(FAR_BACK_MS));
+    this.wholeFrames = Math.max(1, frames(WHOLE_MS));
     this.recreditMax = this.tol + frames(concealMs);
     this.healthResetFrames = Math.max(1, Math.ceil(healthResetMs / this.frameMs - 1e-9));
     this.offsetAlpha = Math.min(1, this.frameMs / Math.max(this.frameMs, offsetTauMs));
@@ -244,6 +332,8 @@ export class StallDetector {
     this._ds = 0; // D in samples
     this._offset = 0;
     this._learned = 0; // matched frames the offset has learned from
+    this._uttMatched = 0; // matched frames since the Vad's speech flag last rose (for steady vowels)
+    this._unmatched = 0; // speech frames (the Vad's flag) decided since the last matched one (for the peak's fallback)
     this._clearCoverage();
     this.reset();
   }
@@ -330,10 +420,13 @@ export class StallDetector {
     this._cdrop[slot] = convDropped < len ? convDropped / len : 1;
     this._speech[slot] = speechCount * 2 >= len ? 1 : 0;
     this._state[slot] = UNDECIDED;
-    // The speech peak learns from frame k - modFrames, now that the frames after it are here
-    // to tell whether it is speech evidence (modulated) or steady sound.
+    // Until the converter has carried some speech, the speech peak learns from frame k - modFrames,
+    // now that the frames after it are here to tell whether it is speech evidence (modulated) or
+    // steady sound. After that only from the frames the converter carried (_matched), see the header.
     const jm = k - this.modFrames;
-    if (jm >= 0 && this._speech[jm % this.cap] && this._modulated(jm)) this._sp.push(this._orig[jm % this.cap], true);
+    if (this._learned < PEAK_BOOT_FRAMES && jm >= 0 && this._speech[jm % this.cap] && this._modulated(jm)) {
+      this._sp.push(this._orig[jm % this.cap], true);
+    }
 
     const d = this._delayFrames(delayMs);
     if (d !== this._d) {
@@ -382,12 +475,29 @@ export class StallDetector {
   _decide(j, d) {
     const cap = this.cap;
     const slot = j % cap;
-    if (!this._speech[slot]) return; // a pause: neither counts nor resets
+    if (!this._speech[slot]) {
+      this._uttMatched = 0; // a pause: neither counts nor resets, and the speech after it starts afresh
+      return;
+    }
     const o = this._orig[slot];
     const peak = this._sp.db;
-    if (!(peak > SILENCE_DB) || o < peak - this.edgeRangeDb) return;
-    if (!this._modulated(j)) return; // steady sound: no evidence either way
+    if (!(peak > SILENCE_DB)) return;
     const loud = peak - this.speechRangeDb;
+    if (
+      ++this._unmatched > PEAK_FALLBACK_FRAMES &&
+      o < loud &&
+      this._learned > PEAK_BOOT_FRAMES &&
+      this._modulated(j) &&
+      this._dueMax(j, d) >= o + this._offset - this.dropDb
+    ) {
+      // Speech under the judging range that the converted stream carried at its own level: the
+      // user's voice got quieter (the peak must follow it), not a sound the converter leaves out.
+      this._sp.push(o, true);
+    }
+    if (o < peak - this.edgeRangeDb) return;
+    // Steady sound is no evidence either way, unless it is at vowel level inside a stretch of
+    // speech the converter has been carrying (a drawn-out vowel; see the file header).
+    if (!this._modulated(j) && !(o >= peak - VOWEL_DB && this._uttMatched >= CARRIED_FRAMES)) return;
     if (o < loud) {
       // Too quiet to show that the converted voice is there. But the edge of a syllable is
       // speech time all the same: while a miss run is going and nothing voice-level came
@@ -405,7 +515,7 @@ export class StallDetector {
     }
     const cmax = this._dueMax(j, d);
     const expected = o + this._offset - this.dropDb;
-    if (cmax >= expected && cmax >= peak + this._offset - this.voiceRangeDb) {
+    if (cmax >= expected && cmax >= peak + this._offset - this.voiceRangeDb && this._convDips(j, d, cmax)) {
       if (this._choppy) {
         // The span found voice, but the stream keeps losing pieces: no health and no reset,
         // and the share it has been losing lately counts as missing.
@@ -415,12 +525,43 @@ export class StallDetector {
         this._addMiss(this._chopShare);
       } else {
         this._state[slot] = MATCHED;
+        this._uttMatched++;
         this._matched(j, cmax);
       }
     } else {
       this._state[slot] = MISSING;
       this._missing(j, d);
     }
+  }
+
+  /**
+   * Does the converted stream dip where the original last dipped? The newest
+   * original frame at least modulationDb under frame j within modulationMs
+   * before it is looked for in the converted stream within ±coverLag of
+   * where it was due (D may be stale): some converted frame there must be at
+   * least DIP_DB under `cmax`, the loudest frame of j's span. Steady
+   * concealment or comfort noise, and a converter looping a piece of the
+   * voice, do not dip; a converted voice does. With no dip of the original
+   * in reach (a drawn-out vowel) there is nothing to test. Only backwards:
+   * where a later dip is due, the converted frames have not arrived yet.
+   */
+  _convDips(j, d, cmax) {
+    const cap = this.cap;
+    const floor = this._orig[j % cap] - this.modulationDb;
+    let q = -1;
+    for (let i = j, lo = Math.max(0, j - this.modFrames, this._frames - cap); i >= lo; i--) {
+      if (this._orig[i % cap] <= floor) {
+        q = i;
+        break;
+      }
+    }
+    if (q < 0) return true;
+    let cmin = ABOVE_ALL_DB;
+    for (let k = Math.max(0, q + d - this.coverLag), end = Math.min(q + d + this.coverLag, this._frames - 1); k <= end; k++) {
+      const c = this._conv[k % cap];
+      if (c < cmin) cmin = c;
+    }
+    return cmax - cmin >= DIP_DB;
   }
 
   /** Loudest converted frame of the span where original frame j is due. */
@@ -476,7 +617,8 @@ export class StallDetector {
         let h = 1; // before the stream began: nothing there
         if (k >= 0) {
           const s = k % cap;
-          h = this._conv[s] < expected ? 1 : this._cdrop[s] - own;
+          h = this._cdrop[s] - own; // digital silence the original does not have
+          if (this._conv[s] < expected && h < LEVEL_HOLE) h = LEVEL_HOLE;
           if (h < 0) h = 0;
         }
         w[base + l] = h;
@@ -484,6 +626,16 @@ export class StallDetector {
         steady[l] += a * (h - steady[l]);
       }
       this._covM++;
+    }
+    // Where losses began, for _choppyRun: the first hole after the stream was last whole
+    // (wholeFrames of matched speech in a row without a hole at the lag it followed). Frames
+    // the span missed are left out, as in the share: a stall's misses are the miss run's
+    // business, and an odd false miss in healthy speech must not mark where losses began.
+    if (!miss) {
+      if (w[base + this._bestLag(this._steady)] > HOLE_MIN) {
+        if (this._wholeRun >= this.wholeFrames) this._firstHole = j;
+        this._wholeRun = 0;
+      } else this._wholeRun++;
     }
     const best = this._bestLag(sum);
     const m = this._covM;
@@ -508,19 +660,29 @@ export class StallDetector {
 
   /**
    * The stream just turned choppy. Its matched frames were missing pieces
-   * all along: the miss run goes back to the first hole of the newest
-   * cluster of holes (no CLUSTER_GAP clean frames in between), with the
-   * missing share of every frame since. The holes are read at the lag the
-   * stream followed while it was whole: near the start of the losses the
-   * coverage's own best lag is a poor guide (a lag that maps the first lost
-   * frames onto audio from before the loss "fits" better, and would put the
-   * start late). A run already going keeps the earlier start and the larger
-   * count.
+   * all along: the miss run goes back to the first hole after the stream was
+   * last whole (see _coverage), at most lookBackMs before the first hole of
+   * the newest cluster of holes (no CLUSTER_GAP clean frames in between),
+   * and never past the history; the count is the missing share of the
+   * cluster's frames. (A stream that is never whole for WHOLE_MS, say a
+   * band-limited one whose fricatives count as holes, keeps an old first
+   * hole: unbounded, a stall or a main-thread fault in its choppy moments
+   * would replay seconds of speech.) A loss pattern that hovers around choppyShare turns
+   * choppy only now and then, seconds after the losses began, and every
+   * pause ends a cluster: the newest cluster alone would put the start that
+   * late. The holes are read at the lag the stream followed while it was
+   * whole: near the start of the losses the coverage's own best lag is a
+   * poor guide (a lag that maps the first lost frames onto audio from before
+   * the loss "fits" better, and would put the start late). A run already
+   * going keeps the earlier start and the larger count.
    */
   _choppyRun() {
     const lag = this._bestLag(this._steady);
-    const first = this._cluster(lag);
+    let first = this._cluster(lag);
     if (first === Infinity) return;
+    if (this._firstHole >= 0 && this._firstHole < first) {
+      first = Math.max(this._firstHole, first - this.backFrames, this._frames - this.cap + 1 + this.coverLag);
+    }
     const start = this._holeStart(first, lag) * this.frameLen; // the start of that frame
     if (this._missRun === 0 || start < this._runStart) this._runStart = start;
     if (this._clusterHoles > this._missRun) this._missRun = this._clusterHoles;
@@ -596,6 +758,8 @@ export class StallDetector {
     this._choppy = false;
     this._chopShare = 0; // the coverage's hole share at the best lag
     this._clusterHoles = 0;
+    this._wholeRun = this.wholeFrames; // matched frames in a row without a hole (counted as whole to begin with)
+    this._firstHole = -1; // content frame of the first hole after the stream was last whole (-1: none)
   }
 
   _matched(j, cmax) {
@@ -610,6 +774,9 @@ export class StallDetector {
     const step = Math.max(-OFFSET_STEP_DB, Math.min(OFFSET_STEP_DB, cmax - omax - this._offset));
     const next = this._offset + alpha * step;
     this._offset = Math.max(-this.maxOffsetDb, Math.min(this.maxOffsetDb, next));
+    // After the bootstrap the speech peak learns from what the converter carried (see the header).
+    if (this._learned > PEAK_BOOT_FRAMES) this._sp.push(this._orig[j % this.cap], true);
+    this._unmatched = 0;
     this._healthy++;
     this._following = true;
     this._missRun = 0;
@@ -622,12 +789,20 @@ export class StallDetector {
       // before the stop, or by a concealment tail: find where the voice really stopped.
       // At most recreditMax of them are taken back, the latest first, so that a single
       // false miss in healthy speech can never come near a stall.
-      const k = this._lastAlive(j0, d);
+      // Frames are paired at the lag the stream really followed while it was whole (D may be
+      // stale by tens of ms). A later lag moves the start earlier by that much; an earlier one
+      // leaves it where D puts it, so it never errs late. A lag one frame from D is D: a
+      // band-limited converter makes the average settle a frame off when D is right, and
+      // pairing at it finds fewer alive frames (longer false miss runs that reset the health).
+      let off = this._bestLag(this._steady) - this.coverLag;
+      if (off < 2 && off > -2) off = 0;
+      const k = this._lastAlive(j0, d, d + off);
       const len = this.frameLen;
-      this._runStart = Math.max(0, k * len - this._ds); // the start of that frame: errs early
+      const ds = this._ds + (off > 0 ? off : 0) * len;
+      this._runStart = Math.max(0, k * len - ds); // the start of that frame: errs early
       let run = 1;
       // Speech after that frame (it carried the voice, at least in part) was missing.
-      const from = Math.max(Math.ceil(((k + 1) * len - this._ds) / len), j0 - this.backFrames, 0);
+      const from = Math.max(Math.ceil(((k + 1) * len - ds) / len), j0 - this.backFrames, 0);
       for (let j = j0 - 1, left = this.recreditMax; j >= from && left > 0; j--) {
         const slot = j % this.cap;
         if (this._state[slot] === MATCHED) {
@@ -655,16 +830,31 @@ export class StallDetector {
   /**
    * The last converted frame (arrival index) that still carried the voice
    * before the span of j0, the first missing frame of a run: where the
-   * converted voice stopped. Searched back up to lookBackMs, pauses included;
-   * when nothing in reach carried it, the far end of the search.
+   * converted voice stopped. Converted frame k is paired with original frame
+   * k - da (da: the lag the stream followed; d: the D in use). Searched back
+   * up to lookBackMs, pauses included. When nothing in reach carried it, the
+   * search walks on across non-speech (a pause, soft frames) to the previous
+   * sentence's last loud frame, at most farBackFrames back: if the converted
+   * voice did not carry that frame, it stopped inside that sentence, and the
+   * answer is its last alive pair; otherwise (or with nothing loud in reach)
+   * the far end of the lookBackMs search, so a stop in a pause repeats nothing.
    */
-  _lastAlive(j0, d) {
+  _lastAlive(j0, d, da) {
+    const cap = this.cap;
     const hi = j0 + d - this.tol - 1;
-    const lo = Math.max(0, hi - this.backFrames + 1, this._frames - this.cap + d + 1);
+    const oldest = this._frames - cap + (da > d ? da : d) + 1; // both frames of a pair still in the history
+    const lo = Math.max(0, hi - this.backFrames + 1, oldest);
     // Two alive frames in a row: a concealment tail can cross the original's own decay for one frame.
     let k = hi;
-    while (k > lo && !(this._alive(k, d) && this._alive(k - 1, d))) k--;
-    return k;
+    while (k > lo && !(this._alive(k, da) && this._alive(k - 1, da))) k--;
+    if (k > lo) return k;
+    const far = Math.max(0, hi - this.farBackFrames + 1, oldest);
+    const loud = this._sp.db - this.speechRangeDb;
+    let m = lo;
+    while (m > far && !(m - da >= 0 && this._orig[(m - da) % cap] >= loud)) m--;
+    if (m <= far || this._alive(m, da)) return k;
+    while (m > far && !(this._alive(m, da) && this._alive(m - 1, da))) m--;
+    return m > far ? m : k;
   }
 
   /**
@@ -723,6 +913,18 @@ export class StallDetector {
   /** Content-time sample index (the original's sample count) where the converted voice stopped; null if not stalled. */
   get stallStartSample() {
     return this._stalled ? this._stallStart : null;
+  }
+
+  /**
+   * While a miss run is open (missMs > 0, stalled or not yet): the content-time
+   * sample index where it started, placed as stallStartSample is (where the
+   * converted voice stopped carrying the user's speech; it errs early). Null
+   * when no miss run is open. For a fault found elsewhere before the detector
+   * has counted missingMs of speech (the main thread's packet watchdog): the
+   * replay must start there, not where the listener is now.
+   */
+  get missStartSample() {
+    return this._missRun > 0 ? this._runStart : null;
   }
 
   /** True if the converted stream had NaN/Inf, or a burst of >= jumpDb for >= jumpMs while not stalled; sticky until reset(). */
