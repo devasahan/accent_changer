@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Accent Changer</title>
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="main.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Accent Changer · Diagnostics</h1>
+    <p>This test build checks that the app works on your laptop. Do steps 1 to 4, then press <strong>Copy results</strong> and send them with your notes. It uses no Sanas minutes.</p>
+    <p id="status" role="status" data-kind="info">Loading…</p>
+  </header>
+  <main>
+    <section>
+      <h2>1 · This app</h2>
+      <dl id="appInfo"></dl>
+    </section>
+
+    <section>
+      <h2>2 · Microphone</h2>
+      <p class="hint">The app should get the microphone without asking you. If Windows or the app asks anyway, write that in your notes.</p>
+      <p class="row"><button id="btnMic" type="button">Check the microphone</button></p>
+      <dl id="micInfo"></dl>
+    </section>
+
+    <section>
+      <h2>3 · Sanas key</h2>
+      <p id="keyInfo" class="hint"></p>
+      <div class="row">
+        <label>API key from the Sanas Console (paste it once)
+          <input id="key" type="password" autocomplete="off" spellcheck="false">
+        </label>
+        <button id="btnSaveKey" type="button">Save key</button>
+        <button id="btnDeleteKey" type="button" class="quiet">Remove key</button>
+      </div>
+      <p class="hint">The key is checked with Sanas, then kept in Windows Credential Manager. It is never shown again, and never saved in a file.</p>
+    </section>
+
+    <section>
+      <h2>4 · Connect to Sanas (free: no audio)</h2>
+      <p class="hint">Checks that Sanas accepts the saved key and this app's address. Before this, add <code>http://tauri.localhost</code> under Allowed origins in the Sanas Console.</p>
+      <p class="row"><button id="btnConnect" type="button">Connect only</button></p>
+      <p id="connectInfo"></p>
+    </section>
+
+    <section>
+      <h2>5 · Copy results</h2>
+      <p class="row">
+        <button id="btnCopy" type="button">Copy results</button>
+        <span id="copyInfo" class="hint"></span>
+      </p>
+      <details>
+        <summary>Show the results</summary>
+        <pre id="results"></pre>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

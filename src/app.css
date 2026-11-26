@@ -1,0 +1,89 @@
+:root {
+  --bg: #f7f7f5;
+  --card: #ffffff;
+  --text: #1d1d1b;
+  --muted: #5f5f5a;
+  --line: #deded8;
+  --accent: #1f6f5c;
+  --warn: #8a5a00;
+  --error: #a4262c;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --card: #20201e;
+    --text: #ececea;
+    --muted: #a5a59f;
+    --line: #383834;
+    --accent: #5cc4a6;
+    --warn: #e0b050;
+    --error: #ff7b80;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+header, main { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+header { padding-top: 18px; }
+h1 { font-size: 1.3rem; margin: 0 0 4px; }
+h2 { font-size: 1.05rem; margin: 0 0 8px; }
+
+section {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 14px 0;
+}
+
+#status { font-weight: 600; min-height: 1.5em; }
+[data-kind="error"] { color: var(--error); }
+[data-kind="warn"] { color: var(--warn); }
+[data-kind="ok"] { color: var(--accent); }
+
+label { display: flex; flex-direction: column; gap: 3px; font-size: 0.9rem; color: var(--muted); }
+input, button { font: inherit; color: var(--text); }
+input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  min-width: 18em;
+}
+button {
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+button.quiet { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button:disabled { opacity: 0.4; cursor: default; }
+
+.row { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 8px 0; }
+.hint { color: var(--muted); font-size: 0.9rem; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 6px 0; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+ul { margin: 4px 0; padding-left: 20px; }
+
+pre {
+  max-height: 260px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}

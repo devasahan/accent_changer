@@ -9,3 +9,7 @@ node_modules/
 sanas-check-*.json
 # Test output (headless browser runs)
 tests/browser/out/
+# The app's build output (scripts/copy-frontend.mjs, cargo)
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/

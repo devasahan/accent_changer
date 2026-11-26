@@ -1,6 +1,6 @@
 # Step 0 findings: is Sanas good enough?
 
-Status: **documentation checks done; the probe has been reviewed and fixed; laptop measurements pending.** The checklist at the bottom decides GO or NO-GO.
+Status: **documentation checks done; the probe has been reviewed, fixed and extended to compare Sanas with two ready-made apps; laptop measurements pending.** The checklist and the decision rule at the bottom decide what happens next.
 
 ## What the Sanas docs say (read 2026-11-26)
 
@@ -33,6 +33,21 @@ Found by reading the vendored SDK 1.0.0 and running it against a local fake SIP 
 | Nothing watches for a server that keeps the call up but stops sending audio. | The app's own "no converted audio while you speak" check is needed (already in the plan's safety mixer). |
 | The output plays through an AudioContext of its own, at the **default playback device's** sample rate. | A Bluetooth headset in call mode as the Windows default would band-limit the converted voice. |
 
+## The ready-made apps to compare (read 2026-11-26)
+
+Both need no build. If one of them beats Sanas cloud on your laptop, you can use it directly.
+
+| | Sanas desktop app ("Sanas For All") | Krisp |
+|---|---|---|
+| For individuals? | Yes. [sanas.ai/get-sanas](https://www.sanas.ai/get-sanas): "now available for small businesses and individuals"; 0–49 agents leads to "Start your 7-day trial now" (verified) | Yes, individual plans [unverified: krisp.ai is blocked from here] |
+| Terms | [EULA](https://www.sanas.ai/end-user-license-agreement) §2.1: an individual user gets a license "solely for your own, non-business, use" (verified) | not read |
+| Where it runs | On the laptop's CPU. Requirements list CPU and RAM only:<ul><li>minimum: i3/i5 6th gen, 4 cores, 8 GB;</li><li>recommended: 8 cores, 3.2 GHz base clock, 16 GB, CPU use under 60 %.</li></ul>(help.sanas.ai, verified) | On the laptop [unverified] |
+| Model and voice | AT5.7: US English, "Universal" source accents, 16 kHz, "reduced processing latency". Voice Personalization keeps your voice. | Indian English to US English, about 200 ms claimed [unverified] |
+| Price | 7-day trial; the price after it is not published | Core about $8/month paid yearly or $16 monthly, with 1 h/day of conversion; Advanced about $15 / $30 with 4 h/day; 7-day trial [unverified] |
+| Unknown until measured | Delay and CPU load on your laptop; whether the trial includes conversion of your own voice | Real delay and CPU load |
+
+Your NVIDIA T1200 GPU doesn't change this. All three run their accent model in the cloud or on the CPU. No open-source model converts an accent live while keeping your voice: the live voice tools change only whose voice it sounds like, and the accent models run offline only.
+
 ## What the probe measures
 
 `node spike/serve.mjs`, then http://localhost:8080/spike/ in Edge (see the README). The probe sends your recorded script through Sanas at live speed and compares what went in with what came back, recorded side by side:
@@ -48,9 +63,18 @@ Found by reading the vendored SDK 1.0.0 and running it against a local fake SIP 
 
   Most misses fall largely in a pause between words. No false gaps appeared in any of the clean runs. The number in brackets is the longest gap.
 - **Bandwidth, level change, WebRTC stats** (round-trip time, jitter buffer, loss, concealment, codec, Sanas server address).
-- **Stability**: one connection for 10 minutes. A drop is a `disconnected` or `failed` call, or a whole loop with no converted audio while the call claims to be up. Each drop is followed by a reconnect, whose time is measured. Delay figures pool every sentence of every loop, so one slow stretch shows in p95 and max.
+- **Stability**: one connection for 65 minutes (an interview's length; 10 minutes for a quick look). A drop is a `disconnected` or `failed` call, or a whole loop with no converted audio while the call claims to be up. Each drop is followed by a reconnect, whose time is measured. Delay figures pool every sentence of every loop, so one slow stretch shows in p95 and max.
 - **Start-up**: time until the audio connection is up (not just until Sanas answers).
+- **Quiet test** (Live): the longest stretch without converted speech, and whether it came back after it. Sanas documents no idle timeout, so the README asks for 15 minutes of silence.
+- **Other apps** (step 7, "Read the script"): your headset microphone and the other app's virtual microphone, recorded side by side while you read the script aloud. They are analysed like a Sanas run (delay per sentence, gaps, bandwidth, level) and rated the same way.
+  - The delay here is the app's whole path, up to its microphone.
+  - The Sanas cloud delay (step 3) leaves out the microphone and the virtual cable that our app adds (Gate 1 allows up to 120 ms for those). Add that before comparing.
+- **Sanas address check** (server, free: it asks only for the project's entitlements): whether Sanas accepts `http://tauri.localhost` and `https://tauri.localhost`, the page addresses the app would use.
+  - This page's own address is a check that must pass.
+  - An unlisted address is a check that must fail.
+  - Otherwise the result says "inconclusive", and the app's own test (Step 1) decides.
 - **Your rating** per sentence and per run: natural, still your voice, every word right.
+- **Blind listener** per run: of 5 converted lines, how many a friend heard with every word right, and how many sound like you.
 
 ## Review of the probe (2026-11-26)
 
@@ -78,6 +102,27 @@ GO needs every row to pass (from the plan).
 | Gaps in speech (3 runs) | ≤ 1 per run | more | ⏳ |
 | Listening test (10 sentences) | ≥ 8/10 (6–7 = your call) | ≤ 5/10 or words mangled | ⏳ |
 | Price | ≤ $0.05/min | more | ✅ $0.009/min |
-| Stability (10 min) | no drop and no silent loop; reconnect ≤ 5 s | drops with no recovery | ⏳ |
+| Stability (65 min) | no drop and no silent loop; reconnect ≤ 5 s | drops with no recovery | ⏳ |
+| Quiet test (15 min) | converted voice comes back at once | it doesn't, or the call drops | ⏳ |
 
-Decision: **pending** the laptop runs. If NO-GO, the fallback is Krisp's own app (the probe's step 7 can measure its delay).
+Also recorded. These decide how the app is built, not GO / NO-GO:
+
+| Check | Result |
+|---|---|
+| Sanas address check: does Sanas accept `http://tauri.localhost` or `https://tauri.localhost`? If both are refused, the app needs a fallback route (plan, Step 1) | ⏳ |
+| Region: `sanas.sipHosts` and `webrtc.remote` in the results file (Mumbai is nearer than Ohio) | ⏳ |
+| AT5.2 bandwidth at 48 kHz (`bandwidthSigHz`) | ⏳ |
+
+## Decision rule: build our app, or use a ready-made one?
+
+Build the rest of our app (plan Steps 2 and 4–9) only if Sanas cloud passes the GO checklist above **and** one of these holds:
+
+1. It rates at least as well as the best ready-made app, blind listener included, with at most about 100 ms more delay. Count our app's own path in that delay.
+2. After hearing both, you still prefer our own app, for cost or lightness.
+3. The ready-made apps are unavailable, too expensive, or their terms don't allow this use.
+
+An app on the laptop that pushes total CPU above about 60 % in a Zoom video call counts as worse (Sanas's own guidance).
+
+Otherwise use the winner directly. For lip sync, set OBS "Video Delay (Async)" to its measured delay (README: "Your interview with a ready-made app"). Wrapping it in our app would only add delay.
+
+Decision: **pending** the laptop runs.

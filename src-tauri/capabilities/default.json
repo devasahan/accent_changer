@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the app's own page may call: Tauri's core APIs. The app's key and token commands are its own.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
