@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { SafetyMixer } from "../src/core/mixer.js";
 import { frameLevelsDb } from "../src/core/vad.js";
 import { envelopeDb } from "../src/core/delay-estimate.js";
@@ -1218,4 +1219,50 @@ test("cheap enough for the audio thread: 1 s of audio (375 blocks) in well under
   // About 2 ms here: a stall, a replay, catching up and an automatic return included.
   assert.ok(perSecond < 30, `${perSecond.toFixed(2)} ms per second of audio`);
   assert.equal(m.state, "converting");
+});
+
+test("allocation: once compiled, a block allocates under 40 bytes while converting (no arrays or objects per block)", () => {
+  // Measured in a fresh process with --expose-gc: heap growth over a pass of 20 s of audio,
+  // after four passes that let the engine compile everything; the best of three.
+  const script = `
+    const { SafetyMixer } = await import(${JSON.stringify(new URL("../src/core/mixer.js", import.meta.url).href)});
+    const { synthSpeech } = await import(${JSON.stringify(new URL("./helpers/synth.js", import.meta.url).href)});
+    const B = 128;
+    const { samples } = synthSpeech({ seconds: 20, seed: 6 });
+    const conv = new Float32Array(samples.length);
+    for (let i = 14400; i < conv.length; i++) conv[i] = 0.5 * samples[i - 14400];
+    const n = Math.floor(samples.length / B);
+    const O = [];
+    const C = [];
+    for (let b = 0; b < n; b++) {
+      O.push(samples.subarray(b * B, (b + 1) * B));
+      C.push(conv.subarray(b * B, (b + 1) * B));
+    }
+    const out = new Float32Array(B);
+    const m = new SafetyMixer();
+    for (const msg of [{ type: "delay", ms: 300 }, { type: "engine", status: "media" }, { type: "convert" }]) m.command(msg);
+    const pass = () => {
+      for (let b = 0; b < n; b++) {
+        m.process(O[b], C[b], out);
+        m.takeEvents();
+      }
+    };
+    for (let r = 0; r < 4; r++) pass();
+    let best = Infinity;
+    for (let t = 0; t < 3; t++) {
+      gc();
+      gc();
+      const before = process.memoryUsage().heapUsed;
+      pass();
+      best = Math.min(best, (process.memoryUsage().heapUsed - before) / n);
+    }
+    console.log(JSON.stringify({ bytesPerBlock: best, state: m.state }));
+  `;
+  const r = spawnSync(process.execPath, ["--expose-gc", "--max-semi-space-size=64", "--input-type=module", "-e", script], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const { bytesPerBlock, state } = JSON.parse(r.stdout);
+  assert.equal(state, "converting");
+  // A Float32Array per block would be over 600 bytes, a small object 30-60; the envelope
+  // events (four a second) and the odd boxed number come to about 13.
+  assert.ok(bytesPerBlock < 40, `${bytesPerBlock.toFixed(1)} bytes per block`);
 });

@@ -37,8 +37,12 @@
  *
  * Pure (no DOM, no Web Audio, no clock, no timers): time is the number of
  * samples processed, so it runs unchanged in the AudioWorklet and in Node
- * tests. Allocation-free per block, apart from the events it queues (a few
- * per second).
+ * tests. It creates no arrays or objects per block, apart from the events it
+ * queues (a few per second). The engine can still box a number now and then
+ * (a double passed to a call it does not inline): the hot paths pass doubles
+ * through fields instead. In Node 22 a block allocates about 13 bytes on
+ * average, the events included (tests/mixer.test.js keeps it under 40), so a
+ * young-generation collection comes along only every few minutes.
  */
 
 import { Vad, frameDb } from "./vad.js";

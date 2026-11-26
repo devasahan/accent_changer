@@ -62,14 +62,14 @@ const PEAK_BINS = Math.round((PEAK_TOP_DB - SILENCE_DB) / PEAK_BIN_DB) + 1;
  * It is the loudest speech frame heard lately (it jumps up, holds, then sinks
  * slowly; time passes only for the frames it is given, so a long silence
  * leaves it alone), but never more than `capDb` above the level that the
- * loudest fifth (1 - `quantile`) of the last `windowMs` of speech frames
+ * loudest fifth (1 - `quantile`) of the last `spanMs` of speech frames
  * reach. A cough, a click, a plosive pop or one shouted word is a few percent
- * of that window: it cannot lift the peak far above the voice, so the voice's
+ * of that span: it cannot lift the peak far above the voice, so the voice's
  * own frames stay inside every range measured from the peak. A voice that
- * really gets louder lifts the reference once it fills a fifth of the window;
+ * really gets louder lifts the reference once it fills a fifth of the span;
  * a voice that gets quieter brings the peak down by the hold and the decay.
  *
- * Allocation-free: a ring of the window's levels (as histogram bins) and the
+ * Allocation-free: a ring of the span's levels (as histogram bins) and the
  * histogram.
  */
 export class SpeechPeak {
@@ -78,17 +78,18 @@ export class SpeechPeak {
    * @param {number} [options.frameMs=10] time per frame given to push()
    * @param {number} [options.holdMs=2000] the loudest frame holds this long (in frames given) ...
    * @param {number} [options.decayDbPerSec=3] ... then sinks this fast
-   * @param {number} [options.windowMs=2500] speech frames the reference level is taken over
-   * @param {number} [options.quantile=0.8] the reference: the level this share of the window stays under
-   * @param {number} [options.capDb=4] the peak is at most this far above the reference (the loudest
-   *   frames of real speech are typically 4-6 dB over it, so it holds the voice's own peak)
+   * @param {number} [options.spanMs=2500] speech frames the reference level is taken over
+   * @param {number} [options.quantile=0.8] the reference: the level this share of the span stays under
+   * @param {number} [options.capDb=4] the peak is at most this far above the reference. The loudest
+   *   frames of real speech are typically 4-6 dB over it: the cap stops a cough, and trims the
+   *   voice's own peak by a dB or two at most (which only widens the ranges measured from it)
    */
-  constructor({ frameMs = 10, holdMs = 2000, decayDbPerSec = 3, windowMs = 2500, quantile = 0.8, capDb = 4 } = {}) {
+  constructor({ frameMs = 10, holdMs = 2000, decayDbPerSec = 3, spanMs = 2500, quantile = 0.8, capDb = 4 } = {}) {
     this.holdFrames = Math.max(0, Math.round(holdMs / frameMs));
     this.decayDb = (decayDbPerSec * frameMs) / 1000;
     this.capDb = capDb;
-    this._share = Math.min(1, Math.max(0, 1 - quantile)); // the loudest share of the window that sets the reference
-    this._ring = new Uint16Array(Math.max(1, Math.round(windowMs / frameMs)));
+    this._share = Math.min(1, Math.max(0, 1 - quantile)); // the loudest share of the span that sets the reference
+    this._ring = new Uint16Array(Math.max(1, Math.round(spanMs / frameMs)));
     this._hist = new Uint16Array(PEAK_BINS);
     this.reset();
   }
@@ -96,7 +97,7 @@ export class SpeechPeak {
   /** Forget everything: no speech heard. */
   reset() {
     this._hist.fill(0);
-    this._n = 0; // levels in the window
+    this._n = 0; // levels in the span
     this._w = 0; // next ring slot
     this._max = -Infinity; // the loudest recent speech frame (held, then sinking)
     this._hold = 0;
@@ -106,7 +107,7 @@ export class SpeechPeak {
 
   /**
    * One frame for which time passes: its level (dB), and whether it is speech
-   * (only speech raises the peak and joins the window; any frame given lets
+   * (only speech raises the peak and joins the span; any frame given lets
    * the hold run down and the peak sink toward it).
    * @param {number} level
    * @param {boolean} speech
@@ -140,7 +141,7 @@ export class SpeechPeak {
     ring[this._w] = b;
     if (++this._w === ring.length) this._w = 0;
     this._hist[b]++;
-    // The reference: walking down from the top, the bin where the loudest share of the window is reached.
+    // The reference: walking down from the top, the bin where the loudest share of the span is reached.
     const want = Math.max(1, Math.ceil(this._share * this._n - 1e-9));
     let seen = 0;
     let k = PEAK_BINS - 1;
@@ -169,7 +170,7 @@ export class Vad {
    * @param {number} [options.peakRangeDb=25] speech frames are within this of the recent speech peak
    * @param {number} [options.peakHoldMs=2000] the peak holds this long (counted in frames above the threshold) ...
    * @param {number} [options.peakDecayDbPerSec=3] ... then sinks this fast while there is sound
-   * @param {number} [options.peakWindowMs=2500] ... and is at most peakCapDb above the level the loudest fifth
+   * @param {number} [options.peakSpanMs=2500] ... and is at most peakCapDb above the level the loudest fifth
    *   of this much recent speech reaches (a cough or a click cannot lift it: see SpeechPeak)
    * @param {number} [options.peakCapDb=4]
    * @param {number} [options.floorRiseDbPerSec=3] the noise floor rises this fast (it falls at once)
@@ -184,7 +185,7 @@ export class Vad {
     peakRangeDb = 25,
     peakHoldMs = 2000,
     peakDecayDbPerSec = 3,
-    peakWindowMs = 2500,
+    peakSpanMs = 2500,
     peakCapDb = 4,
     floorRiseDbPerSec = 3,
   } = {}) {
@@ -200,7 +201,7 @@ export class Vad {
       frameMs: this.frameMs,
       holdMs: peakHoldMs,
       decayDbPerSec: peakDecayDbPerSec,
-      windowMs: peakWindowMs,
+      spanMs: peakSpanMs,
       capDb: peakCapDb,
     });
     this.floorRiseDb = (floorRiseDbPerSec * this.frameMs) / 1000;

@@ -12,10 +12,11 @@
  * never reach the meeting: NaN/Inf samples, or a sudden +20 dB burst.
  *
  * Pure (no DOM, no Web Audio, no timers), and it creates no arrays or
- * objects per block: it runs inside the AudioWorklet and in Node tests. Time
- * is counted in samples pushed. Content time (original) and arrival time
- * (converted) share one clock: frame k of the original was spoken at the
- * moment frame k of the converted arrived.
+ * objects per block (about 2 bytes per block of boxed numbers in Node 22):
+ * it runs inside the AudioWorklet and in Node tests. Time is counted in
+ * samples pushed. Content time (original) and arrival time (converted) share
+ * one clock: frame k of the original was spoken at the moment frame k of the
+ * converted arrived.
  *
  * Decision rules, per frame j of the original (spoken at content time j):
  * - It is decided only once the whole span of converted frames where it is
@@ -137,7 +138,7 @@ export class StallDetector {
    * @param {number} [options.maxOffsetDb=12] the offset estimate is clamped to ±this
    * @param {number} [options.peakHoldMs=2000] the speech peak holds this long (in decided speech time) ...
    * @param {number} [options.peakDecayDbPerSec=3] ... then sinks this fast
-   * @param {number} [options.peakWindowMs=2500] ... and stays within peakCapDb of the level the loudest fifth of this much speech reaches
+   * @param {number} [options.peakSpanMs=2500] ... and stays within peakCapDb of the level the loudest fifth of this much speech reaches
    * @param {number} [options.peakCapDb=4]
    * @param {number} [options.choppyMs=400] the coverage check looks at this much recent decided speech ...
    * @param {number} [options.choppyShare=0.3] ... and calls the stream choppy when more than this share of it has holes ...
@@ -167,7 +168,7 @@ export class StallDetector {
     maxOffsetDb = 12,
     peakHoldMs = 2000,
     peakDecayDbPerSec = 3,
-    peakWindowMs = 2500,
+    peakSpanMs = 2500,
     peakCapDb = 4,
     choppyMs = 400,
     choppyShare = 0.3,
@@ -212,7 +213,7 @@ export class StallDetector {
       frameMs: this.frameMs,
       holdMs: peakHoldMs,
       decayDbPerSec: peakDecayDbPerSec,
-      windowMs: peakWindowMs,
+      spanMs: peakSpanMs,
       capDb: peakCapDb,
     });
 
@@ -442,8 +443,8 @@ export class StallDetector {
    * the share: misses are the miss run's business (a stall is not "choppy",
    * and with a stale D the voice is still there at another lag). The stream
    * is choppy while even the best-fitting lag finds holes in more than
-   * choppyShare of the matched frames of the window; entering that state
-   * moves the miss run back to where the holes began.
+   * choppyShare of the matched frames among the entries; entering that
+   * state moves the miss run back to where the holes began.
    */
   _coverage(j, d) {
     const cap = this.cap;
@@ -488,7 +489,7 @@ export class StallDetector {
     const m = this._covM;
     const was = this._choppy;
     const limit = (was ? CHOPPY_EXIT * this.choppyShare : this.choppyShare) * m;
-    // A few frames are no evidence yet: a quarter of the window matched at least.
+    // A few frames are no evidence yet: a quarter of the entries matched at least.
     this._choppy = m * 4 >= len && sum[best] > limit;
     this._chopShare = m > 0 ? sum[best] / m : 0;
     if (this._choppy && !was) this._choppyRun();
@@ -511,7 +512,7 @@ export class StallDetector {
    * cluster of holes (no CLUSTER_GAP clean frames in between), with the
    * missing share of every frame since. The holes are read at the lag the
    * stream followed while it was whole: near the start of the losses the
-   * window's own best lag is a poor guide (a lag that maps the first lost
+   * coverage's own best lag is a poor guide (a lag that maps the first lost
    * frames onto audio from before the loss "fits" better, and would put the
    * start late). A run already going keeps the earlier start and the larger
    * count.
@@ -529,7 +530,7 @@ export class StallDetector {
   }
 
   /**
-   * The first hole the window saw is in a decided frame; the losses may have
+   * The first hole the coverage saw is in a decided frame; the losses may have
    * begun a little earlier, in sound no decision looks at (a syllable's soft
    * tail, a consonant). Walks back from content frame j0 over the frames
    * that carry sound the converted voice should carry (speech, within
@@ -589,11 +590,11 @@ export class StallDetector {
     this._covW.fill(0);
     this._covSum.fill(0);
     this._steady.fill(0);
-    this._covN = 0; // entries in the window
+    this._covN = 0; // entries in the coverage (the last choppyMs of decided speech)
     this._covM = 0; // ... of them matched by their span
     this._covAt = 0;
     this._choppy = false;
-    this._chopShare = 0; // the window's hole share at the best lag
+    this._chopShare = 0; // the coverage's hole share at the best lag
     this._clusterHoles = 0;
   }
 

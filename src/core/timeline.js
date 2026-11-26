@@ -23,7 +23,8 @@
  * fading out over `fadeMs`, so the content after it comes out untouched.
  *
  * Positions are content time: the count of original samples written so far.
- * Pure and allocation-free per block, so it runs unchanged in an AudioWorklet.
+ * Pure, and it creates no arrays or objects per block (once the engine has
+ * compiled it, nothing at all), so it runs unchanged in an AudioWorklet.
  */
 
 const PLAY = 0; // reading at full gain
