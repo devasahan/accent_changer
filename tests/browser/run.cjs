@@ -258,11 +258,11 @@ async function main() {
     check(live.delayMs >= MOCK_DELAY_MS && live.delayMs < MOCK_DELAY_MS + 150, "live delay measured from the microphone", `${live.delayMs} ms`);
     check((await openSessions()) === 0, "Stop closed the live session");
 
-    // 5a · the quiet test: 14 s of silence, then speech. The converted voice comes back...
+    // 5a · the quiet test: talk, 14 s of silence, then speech. The converted voice comes back...
     const quietCall = async ({ engineGoesQuiet }) => {
       await page.click("#btnLive");
       await page.waitForFunction(() => window.__spike.state.mode === "live", null, { timeout: 10000 });
-      await page.waitForTimeout(4000);
+      await page.waitForTimeout(7000);
       await micVolume(0);
       await page.waitForTimeout(14000);
       if (engineGoesQuiet) await spike(() => (window.__spike.state.live.handle.fromEngine.mediaStream.getAudioTracks()[0].enabled = false));
