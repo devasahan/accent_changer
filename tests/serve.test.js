@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { CSP, checkKey, cleanKeyInput, portFromArgs, startSpikeServer } from "../spike/serve.mjs";
+import {
+  APP_ORIGINS,
+  CONTROL_ORIGIN,
+  CSP,
+  checkKey,
+  checkOrigin,
+  cleanKeyInput,
+  originReport,
+  portFromArgs,
+  runOriginCheck,
+  startSpikeServer,
+} from "../spike/serve.mjs";
 
 const KEY = "sk_test_DO_NOT_LEAK_123";
 
@@ -167,7 +178,11 @@ test("the key prompt drops escape sequences and control keys, and undoes a doubl
 
 test("the start-up key check tells accepted, refused and unknown apart", async () => {
   const answer = (status, body) => async () => new Response(JSON.stringify(body), { status });
-  assert.deepEqual(await checkKey({ key: KEY, fetchImpl: answer(200, { access_token: "t" }) }), { ok: true });
+  assert.deepEqual(await checkKey({ key: KEY, fetchImpl: answer(200, { access_token: "t", user_id: "u1", group_id: "g1" }) }), {
+    ok: true,
+    session: { accessToken: "t", userId: "u1", groupId: "g1" },
+  });
+  assert.deepEqual(await checkKey({ key: KEY, fetchImpl: answer(200, { access_token: "t" }) }), { ok: true, session: null });
   assert.deepEqual(await checkKey({ key: KEY, fetchImpl: answer(401, { message: "Invalid API key" }) }), { refused: true, status: 401 });
   assert.equal((await checkKey({ key: KEY, fetchImpl: answer(503, {}) })).unknown, true);
   const offline = async () => {
@@ -193,4 +208,137 @@ test("--port takes both spellings and refuses nonsense instead of falling back",
   assert.deepEqual(portFromArgs([], { PORT: "9000" }), { port: 9000, from: "PORT" });
   assert.match(portFromArgs(["--port", "eighty"], {}).error, /not a port number/);
   assert.match(portFromArgs(["--port"], {}).error, /needs a number/);
+});
+
+// ---------- origin check ----------
+
+const SESSION = { accessToken: "secret-token", userId: "u1", groupId: "g/1" };
+const PAGE = "http://localhost:8080";
+
+/**
+ * A fake Sanas portal. `allowed` lists the origins on the project's list;
+ * `cors` decides what CORS headers an allowed origin gets.
+ */
+function fakePortal({ allowed = [PAGE, ...APP_ORIGINS], cors = "echo", allowHeaders = "authorization, content-type", status = 200 } = {}) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const origin = init.headers.Origin;
+    calls.push({ url, method: init.method, headers: init.headers });
+    const ok = allowed.includes(origin);
+    const corsHeaders = {};
+    if (ok && cors === "echo") corsHeaders["access-control-allow-origin"] = origin;
+    if (ok && cors === "star") corsHeaders["access-control-allow-origin"] = "*";
+    if (init.method === "OPTIONS") {
+      if (ok && cors !== "none") corsHeaders["access-control-allow-headers"] = allowHeaders;
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+    if (!ok) {
+      return new Response(JSON.stringify({ errorCode: "FORBIDDEN", message: "Origin not allowed for this group" }), { status: 403, headers: corsHeaders });
+    }
+    if (status !== 200) return new Response(JSON.stringify({ message: "nope" }), { status, headers: corsHeaders });
+    return new Response(JSON.stringify({ data: { groupName: "me", settings: {} } }), { status: 200, headers: corsHeaders });
+  };
+  return { fetchImpl, calls };
+}
+
+test("the origin check asks like the SDK does: preflight, then GET with the token", async () => {
+  const portal = fakePortal();
+  const r = await checkOrigin({ origin: APP_ORIGINS[0], session: SESSION, fetchImpl: portal.fetchImpl });
+  assert.equal(r.verdict, "accepted");
+  assert.equal(portal.calls.length, 2);
+  const [pre, get] = portal.calls;
+  assert.equal(pre.url, "https://portal-api.sanas.ai/api/v1/sdk/groups/g%2F1/entitlements");
+  assert.equal(pre.method, "OPTIONS");
+  assert.equal(pre.headers.Origin, "http://tauri.localhost");
+  assert.equal(pre.headers["Access-Control-Request-Method"], "GET");
+  assert.equal(pre.headers["Access-Control-Request-Headers"], "authorization");
+  assert.equal(pre.headers.Authorization, undefined, "a preflight carries no token");
+  assert.equal(get.method, "GET");
+  assert.equal(get.headers.Authorization, "Bearer secret-token");
+  assert.equal(get.url, pre.url);
+});
+
+test("the origin check tells accepted, refused, CORS-blocked and unknown apart", async () => {
+  const check = (origin, portal) => checkOrigin({ origin, session: SESSION, fetchImpl: portal.fetchImpl });
+  assert.equal((await check(APP_ORIGINS[0], fakePortal())).verdict, "accepted");
+  assert.equal((await check(APP_ORIGINS[0], fakePortal({ cors: "star" }))).verdict, "accepted");
+  const refused = await check(APP_ORIGINS[0], fakePortal({ allowed: [PAGE] }));
+  assert.equal(refused.verdict, "refused");
+  assert.equal(refused.get.status, 403);
+  // Sanas answers, but a browser would block it.
+  assert.equal((await check(APP_ORIGINS[0], fakePortal({ cors: "none" }))).verdict, "no-cors");
+  assert.equal((await check(APP_ORIGINS[0], fakePortal({ allowHeaders: "*" }))).verdict, "no-cors", '"*" does not cover Authorization');
+  assert.equal((await check(APP_ORIGINS[0], fakePortal({ allowHeaders: "content-type" }))).verdict, "no-cors");
+  // Other answers can't tell anything.
+  const expired = await check(APP_ORIGINS[0], fakePortal({ status: 401 }));
+  assert.equal(expired.verdict, "error");
+  assert.match(expired.note, /HTTP 401/);
+  const otherForbidden = await checkOrigin({
+    origin: APP_ORIGINS[0],
+    session: SESSION,
+    fetchImpl: async (url, init) =>
+      init.method === "OPTIONS"
+        ? new Response(null, { status: 204 })
+        : new Response(JSON.stringify({ errorCode: "FORBIDDEN", message: "API key revoked" }), { status: 403 }),
+  });
+  assert.equal(otherForbidden.verdict, "error", "a 403 that is not about the origin is not a refusal");
+  const offline = await checkOrigin({
+    origin: APP_ORIGINS[0],
+    session: SESSION,
+    fetchImpl: async () => {
+      throw new TypeError("fetch failed");
+    },
+  });
+  assert.equal(offline.verdict, "error");
+  assert.match(offline.note, /could not reach portal-api/);
+});
+
+test("the origin report needs both controls before it says anything about the app", async () => {
+  const run = (portal) => runOriginCheck({ session: SESSION, pageOrigin: PAGE, fetchImpl: portal.fetchImpl });
+  const good = await run(fakePortal());
+  assert.equal(good.appReady, true);
+  assert.match(good.conclusion, /the app can load its page from http:\/\/tauri\.localhost and https:\/\/tauri\.localhost/);
+  assert.equal(good.results.length, 4);
+  assert.equal(good.lines.length, 4);
+  assert.match(good.lines[3], /refused, as it should be/);
+
+  const httpsOnly = await run(fakePortal({ allowed: [PAGE, APP_ORIGINS[1]] }));
+  assert.equal(httpsOnly.appReady, true);
+  assert.match(httpsOnly.conclusion, /from https:\/\/tauri\.localhost\./);
+  assert.match(httpsOnly.lines[1], /refused: not in Allowed origins/);
+
+  const noApp = await run(fakePortal({ allowed: [PAGE] }));
+  assert.equal(noApp.appReady, false);
+  assert.match(noApp.conclusion, /refused both app addresses/);
+
+  const pageRefused = await run(fakePortal({ allowed: APP_ORIGINS }));
+  assert.equal(pageRefused.appReady, null);
+  assert.match(pageRefused.conclusion, /Add exactly  http:\/\/localhost:8080/);
+
+  const noCheck = await run(fakePortal({ allowed: [PAGE, ...APP_ORIGINS, CONTROL_ORIGIN] }));
+  assert.equal(noCheck.appReady, null, "Sanas accepting an unlisted address makes the check meaningless");
+  assert.match(noCheck.conclusion, /Inconclusive/);
+  assert.match(noCheck.lines[3], /accepted, though it is on no list/);
+
+  const report = originReport([], PAGE);
+  assert.equal(report.appReady, null);
+  assert.match(report.lines[0], /not checked/);
+});
+
+test("the server shares the origin check with the page, without the token", async () => {
+  const portal = fakePortal();
+  const check = await runOriginCheck({ session: SESSION, pageOrigin: PAGE, fetchImpl: portal.fetchImpl });
+  let current = null;
+  await withServer({ getOriginCheck: () => current }, async (port) => {
+    const before = await request(port, { path: "/origin-check" });
+    assert.equal(before.status, 200);
+    assert.deepEqual(JSON.parse(before.body), { ran: false });
+    current = check;
+    const after = await request(port, { path: "/origin-check" });
+    const body = JSON.parse(after.body);
+    assert.equal(body.ran, true);
+    assert.equal(body.appReady, true);
+    assert.ok(!after.body.includes("secret-token"), "the token stays in the server");
+    assert.ok(!after.body.includes("g%2F1"), "no project ids either");
+  });
 });

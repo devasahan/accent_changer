@@ -1,0 +1,38 @@
+[package]
+name = "accent-changer"
+version = "0.1.0"
+description = "Accent Changer: a live US accent for your own interview calls"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+
+[lib]
+name = "accent_changer_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-log = "2.10"
+tauri-plugin-opener = "2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+keyring = "4.2"
+# Windows' own TLS and proxy settings (SChannel), not a bundled certificate list:
+# antivirus HTTPS scanning and company proxies keep working, and the binary stays small.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "system-proxy"] }
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,6 +1,6 @@
 {
   "name": "accent-changer",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "description": "Accent Changer: a live US-English accent for your own interview calls on Windows (Sanas Accent Translation + VB-CABLE virtual mic).",
   "type": "module",
@@ -10,6 +10,13 @@
   "scripts": {
     "test": "node --test tests/*.test.js",
     "test:browser": "node tests/browser/run.cjs",
-    "spike": "node spike/serve.mjs"
+    "test:app": "node tests/browser/app.cjs",
+    "spike": "node spike/serve.mjs",
+    "dev": "node spike/serve.mjs",
+    "build:frontend": "node scripts/copy-frontend.mjs",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.6"
   }
 }

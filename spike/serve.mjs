@@ -12,12 +12,18 @@
  *   node spike/serve.mjs --port 8090  another port (add that origin in Sanas)
  */
 import http from "node:http";
+import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const SANAS_IDENTITY_URL = "https://identity.sanas.ai/oauth2/api-key/login";
+export const SANAS_PORTAL_URL = "https://portal-api.sanas.ai";
+/** The addresses the Windows app will load its page from (Tauri: http, or https with useHttpsScheme). */
+export const APP_ORIGINS = ["http://tauri.localhost", "https://tauri.localhost"];
+/** An address nobody lists. Sanas must refuse it, or the origin check can't tell anything. */
+export const CONTROL_ORIGIN = "https://origin-check.accent-changer.invalid";
 const SERVED_DIRS = new Set(["spike", "src"]);
 const TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -45,6 +51,10 @@ export const CSP = [
   "frame-ancestors 'none'",
 ].join("; ");
 
+// The app's own CSP, from the Tauri config: Edge dev mode serves the app's
+// pages (src/) under exactly the policy they get inside the app.
+export const APP_CSP = JSON.parse(readFileSync(path.join(ROOT, "src-tauri", "tauri.conf.json"), "utf8")).app.security.csp;
+
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", ...headers });
   res.end(body);
@@ -58,7 +68,14 @@ function sendJson(res, status, value) {
  * Request handler for a server on `port`. `getApiKey` returns the key (or
  * an empty string); `fetchImpl` is replaceable for tests.
  */
-export function createHandler({ port, getApiKey, fetchImpl = globalThis.fetch, identityUrl = SANAS_IDENTITY_URL, log = () => {} }) {
+export function createHandler({
+  port,
+  getApiKey,
+  getOriginCheck = () => null,
+  fetchImpl = globalThis.fetch,
+  identityUrl = SANAS_IDENTITY_URL,
+  log = () => {},
+}) {
   const hosts = new Set([`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`]);
   const origins = new Set([...hosts].map((h) => `http://${h}`));
   let lastTokenAt = 0;
@@ -129,7 +146,7 @@ export function createHandler({ port, getApiKey, fetchImpl = globalThis.fetch, i
       "Cross-Origin-Resource-Policy": "same-origin",
     };
     if (type.startsWith("text/html")) {
-      headers["Content-Security-Policy"] = CSP;
+      headers["Content-Security-Policy"] = top === "src" ? APP_CSP : CSP;
       headers["Permissions-Policy"] = "microphone=(self), camera=()";
     }
     res.writeHead(200, headers);
@@ -144,6 +161,8 @@ export function createHandler({ port, getApiKey, fetchImpl = globalThis.fetch, i
       if (url.pathname === "/token") return await token(req, res);
       if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "Method not allowed", { Allow: "GET, HEAD" });
       if (url.pathname === "/health") return sendJson(res, 200, { ok: true, keyLoaded: Boolean(getApiKey()) });
+      // Which page addresses Sanas accepts (no secrets in it): the probe saves it in its results.
+      if (url.pathname === "/origin-check") return sendJson(res, 200, getOriginCheck() ?? { ran: false });
       if (url.pathname === "/" || url.pathname === "/spike") return send(res, 302, "", { Location: "/spike/" });
       return await serveFile(url.pathname, req, res);
     } catch (err) {
@@ -177,10 +196,10 @@ function listen(server, port, host) {
  * open that program instead of this page. Port 0 picks a free port (IPv4
  * only), for tests.
  */
-export async function startSpikeServer({ port = 8080, getApiKey = () => "", fetchImpl, log } = {}) {
+export async function startSpikeServer({ port = 8080, getApiKey = () => "", getOriginCheck, fetchImpl, log } = {}) {
   const first = http.createServer();
   const actual = await listen(first, port, "127.0.0.1");
-  const handler = createHandler({ port: actual, getApiKey, fetchImpl, log });
+  const handler = createHandler({ port: actual, getApiKey, getOriginCheck, fetchImpl, log });
   first.on("request", handler);
   const servers = [first];
   const close = () => Promise.all(servers.map((s) => new Promise((resolve) => s.close(() => resolve()))));
@@ -276,8 +295,10 @@ export function promptHidden(question, input = process.stdin, output = process.s
 
 /**
  * Ask Sanas once whether it accepts `key` (a token exchange: no audio
- * minutes). { ok } when it does, { refused, status } when it says no,
- * { unknown, message } when it can't be asked right now.
+ * minutes). { ok, session } when it does (session: the short-lived token
+ * and ids, or null if the answer lacks them; never log it), { refused,
+ * status } when it says no, { unknown, message } when it can't be asked
+ * right now.
  */
 export async function checkKey({ key, fetchImpl = globalThis.fetch, identityUrl = SANAS_IDENTITY_URL }) {
   let res;
@@ -293,10 +314,139 @@ export async function checkKey({ key, fetchImpl = globalThis.fetch, identityUrl 
   }
   if (res.ok) {
     const body = await res.json().catch(() => null);
-    return body?.access_token ? { ok: true } : { unknown: true, message: "unexpected answer from Sanas" };
+    if (!body?.access_token) return { unknown: true, message: "unexpected answer from Sanas" };
+    const session =
+      typeof body.user_id === "string" && body.user_id && typeof body.group_id === "string" && body.group_id
+        ? { accessToken: body.access_token, userId: body.user_id, groupId: body.group_id }
+        : null;
+    return { ok: true, session };
   }
   if ([400, 401, 403].includes(res.status)) return { refused: true, status: res.status };
   return { unknown: true, message: `Sanas answered HTTP ${res.status}` };
+}
+
+/** The portal's "origin not allowed" answer, matched like the Sanas SDK does (index.js, isOriginForbiddenResponse). */
+function isOriginForbidden(status, body) {
+  return status === 403 && body?.errorCode === "FORBIDDEN" && typeof body.message === "string" && /origin not allowed/i.test(body.message);
+}
+
+const allowsOrigin = (headers, origin) => {
+  const value = headers.get("access-control-allow-origin");
+  return value === "*" || value === origin;
+};
+
+/** Browsers need Authorization listed by name: a "*" there does not cover it. */
+const allowsAuthorization = (headers) =>
+  (headers.get("access-control-allow-headers") ?? "")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .includes("authorization");
+
+/**
+ * Ask Sanas for the project's entitlements the way a page on `origin` would
+ * (the SDK's first call when it connects): a CORS preflight, then the GET.
+ * Free: no audio minutes. `verdict` is "accepted" (a browser page there
+ * would get the answer), "refused" (Sanas says the origin is not allowed),
+ * "no-cors" (Sanas answered, but without the CORS headers a browser needs)
+ * or "error" (could not tell; see `note`).
+ */
+export async function checkOrigin({ origin, session, fetchImpl = globalThis.fetch, portalUrl = SANAS_PORTAL_URL, timeoutMs = 10000 }) {
+  const url = `${portalUrl}/api/v1/sdk/groups/${encodeURIComponent(session.groupId)}/entitlements`;
+  const result = { origin, verdict: "error", note: "", preflight: null, get: null };
+  try {
+    const pre = await fetchImpl(url, {
+      method: "OPTIONS",
+      headers: { Origin: origin, "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    await pre.arrayBuffer().catch(() => {});
+    result.preflight = {
+      status: pre.status,
+      allowOrigin: pre.headers.get("access-control-allow-origin"),
+      allowHeaders: pre.headers.get("access-control-allow-headers"),
+    };
+    const res = await fetchImpl(url, {
+      method: "GET",
+      headers: { Origin: origin, Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    let body = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // not JSON
+    }
+    result.get = { status: res.status, allowOrigin: res.headers.get("access-control-allow-origin") };
+    if (isOriginForbidden(res.status, body)) {
+      result.verdict = "refused";
+    } else if (!res.ok || !body?.data) {
+      result.note = `Sanas answered HTTP ${res.status}`;
+    } else {
+      const preflightOk = pre.ok && allowsOrigin(pre.headers, origin) && allowsAuthorization(pre.headers);
+      result.verdict = preflightOk && allowsOrigin(res.headers, origin) ? "accepted" : "no-cors";
+    }
+  } catch (err) {
+    result.note = err?.name === "TimeoutError" ? `no answer within ${timeoutMs / 1000} s` : "could not reach portal-api.sanas.ai";
+  }
+  return result;
+}
+
+const ORIGIN_ROLES = (pageOrigin) => [
+  [pageOrigin, "this page"],
+  [APP_ORIGINS[0], "the app"],
+  [APP_ORIGINS[1], "the app, backup"],
+  [CONTROL_ORIGIN, "test address, not on your list"],
+];
+
+/**
+ * Turn checkOrigin results into lines to print and one conclusion. The page's
+ * own origin must be accepted and the unlisted control refused; otherwise
+ * the check can't tell anything about the app's origins.
+ */
+export function originReport(results, pageOrigin) {
+  const by = new Map(results.map((r) => [r.origin, r]));
+  const describe = (r) => {
+    if (!r) return "not checked";
+    if (r.origin === CONTROL_ORIGIN) {
+      if (r.verdict === "refused") return "refused, as it should be";
+      if (r.verdict === "accepted") return "accepted, though it is on no list";
+    }
+    if (r.verdict === "accepted") return "accepted";
+    if (r.verdict === "refused") return "refused: not in Allowed origins";
+    if (r.verdict === "no-cors") return "Sanas answered, but a browser would block the answer (CORS)";
+    return `could not check (${r.note})`;
+  };
+  const roles = ORIGIN_ROLES(pageOrigin);
+  const width = Math.max(...roles.map(([o]) => o.length));
+  const lines = roles.map(([origin, role]) => `  ${origin.padEnd(width)}  (${role})  ${describe(by.get(origin))}`);
+  const page = by.get(pageOrigin);
+  const control = by.get(CONTROL_ORIGIN);
+  const appOk = APP_ORIGINS.filter((o) => by.get(o)?.verdict === "accepted");
+  let conclusion;
+  let appReady = null; // true / false when the check could tell, null when it couldn't
+  if (page?.verdict === "refused") {
+    conclusion = `Sanas refused this page's own address. Add exactly  ${pageOrigin}  under Allowed origins, then start the server again.`;
+  } else if (page?.verdict !== "accepted") {
+    conclusion = "Inconclusive: Sanas did not accept this page's own address in this check. The app's own test will tell.";
+  } else if (control?.verdict !== "refused") {
+    conclusion = "Inconclusive: Sanas did not refuse an address that is on no list, so this check can't tell. The app's own test will.";
+  } else if (appOk.length) {
+    appReady = true;
+    conclusion = `Good: the app can load its page from ${appOk.join(" and ")}.`;
+  } else {
+    appReady = false;
+    conclusion = `Sanas refused both app addresses. Add exactly  ${APP_ORIGINS.join("  and  ")}  under Allowed origins (no slash at the end). If the Console won't save them, say so in your results notes.`;
+  }
+  return { lines, conclusion, appReady };
+}
+
+/** Check the page's own origin, both app origins and the control at once. */
+export async function runOriginCheck({ session, pageOrigin, fetchImpl, portalUrl }) {
+  const origins = ORIGIN_ROLES(pageOrigin).map(([o]) => o);
+  const results = await Promise.all(origins.map((origin) => checkOrigin({ origin, session, fetchImpl, portalUrl })));
+  const report = originReport(results, pageOrigin);
+  return { ran: true, at: new Date().toISOString(), pageOrigin, results, conclusion: report.conclusion, appReady: report.appReady, lines: report.lines };
 }
 
 /** --port 8090, --port=8090 or the PORT variable; an error message for anything else. */
@@ -337,10 +487,10 @@ async function askForKey() {
         "Can't ask for the key here: this window isn't an interactive terminal (Git Bash's mintty, an editor's console…). " +
           "Run  node spike/serve.mjs  in PowerShell or Windows Terminal, or set SANAS_API_KEY for this window.",
       );
-      return "";
+      return { key: "", session: null };
     }
     const { value, ignored, doubled } = answer;
-    if (!value) return "";
+    if (!value) return { key: "", session: null };
     const notes = [doubled && "it was pasted twice, so one copy is used", ignored && `${ignored} control key(s) ignored`].filter(Boolean);
     console.log(`Got a ${value.length}-character key ending in ${tail(value)}${notes.length ? ` (${notes.join("; ")})` : ""}.`);
     if (/\s/.test(value)) {
@@ -350,17 +500,17 @@ async function askForKey() {
     const verdict = await checkKey({ key: value });
     if (verdict.ok) {
       console.log("Sanas accepted the key. It is kept in this window's memory only.");
-      return value;
+      return { key: value, session: verdict.session };
     }
     if (verdict.refused) {
       console.log(`Sanas refused this key (HTTP ${verdict.status}). Paste it again: once, then Enter.`);
       continue;
     }
     console.log(`Could not check the key with Sanas (${verdict.message}). Using it anyway; the page will say if it is refused.`);
-    return value;
+    return { key: value, session: null };
   }
   console.log("Sanas refused the key three times. Check it in the Sanas Console (expired? revoked?), then start the server again.");
-  return "";
+  return { key: "", session: null };
 }
 
 function portHelp(port, err) {
@@ -384,16 +534,23 @@ async function main() {
   const { port } = parsed;
   if (parsed.from === "PORT") console.log(`Using port ${port} from the PORT environment variable.`);
   let key = "";
+  let originCheck = null;
   const stamp = () => new Date().toTimeString().slice(0, 8);
   let server;
   try {
     // Bind first, so a busy port doesn't cost a paste of the key.
-    server = await startSpikeServer({ port, getApiKey: () => key, log: (m) => console.log(`[${stamp()}] ${m}`) });
+    server = await startSpikeServer({
+      port,
+      getApiKey: () => key,
+      getOriginCheck: () => originCheck,
+      log: (m) => console.log(`[${stamp()}] ${m}`),
+    });
   } catch (err) {
     console.error(portHelp(port, err) ?? `Could not start the server on port ${port}: ${err?.message ?? err}`);
     process.exit(1);
   }
   const fromEnv = (process.env.SANAS_API_KEY ?? "").trim();
+  let session = null;
   if (fromEnv) {
     console.log(`Using the key from the SANAS_API_KEY environment variable (${tail(fromEnv)}).`);
     console.log("To paste another key instead, open a new window, run  Remove-Item Env:SANAS_API_KEY  (PowerShell), and start the server again.");
@@ -402,8 +559,17 @@ async function main() {
     else if (verdict.refused) console.log(`Sanas refused that key (HTTP ${verdict.status}).`);
     else console.log(`Could not check the key with Sanas (${verdict.message}).`);
     key = fromEnv;
+    session = verdict.ok ? verdict.session : null;
   } else {
-    key = await askForKey();
+    ({ key, session } = await askForKey());
+  }
+  if (session) {
+    console.log("");
+    console.log("Checking which page addresses Sanas accepts (free: no audio minutes)…");
+    originCheck = await runOriginCheck({ session, pageOrigin: `http://localhost:${server.port}` });
+    for (const line of originCheck.lines) console.log(line);
+    console.log(originCheck.conclusion);
+    console.log("(The page saves this check in its results JSON.)");
   }
   console.log("");
   console.log(`Accent Changer spike is running. Open  http://localhost:${server.port}/spike/  in Microsoft Edge or Chrome.`);

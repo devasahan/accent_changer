@@ -10,7 +10,7 @@
 <body>
   <header>
     <h1>Accent Changer · Step 0: is Sanas good enough?</h1>
-    <p>Wear headphones. Sanas credit is used only while a step runs (about $0.009 per minute).</p>
+    <p>Wear headphones. Sanas credit is used only while a step runs (about $0.009 per minute). Step 7 measures Krisp or the Sanas desktop app the same way, for comparison.</p>
     <p id="status" role="status" data-kind="info">Loading…</p>
   </header>
   <main>
@@ -57,6 +57,7 @@
         <button id="btnConnect" type="button">Connect to Sanas</button>
         <span id="connInfo"></span>
       </p>
+      <p id="originInfo" class="hint"></p>
     </section>
 
     <section id="s-record">
@@ -95,6 +96,7 @@
 
     <section id="s-listen">
       <h2>4 · Listen and rate</h2>
+      <label id="rateRunLabel" class="inline hidden">Run to rate and play <select id="rateRun"></select></label>
       <p id="rateFor" class="hint"></p>
       <p class="row">
         <button id="btnPlayOrig" type="button">▶ Original</button>
@@ -103,6 +105,12 @@
       </p>
       <ol id="utts"></ol>
       <p>Score: <strong id="score">–</strong> / 10 &nbsp;(a line counts when all three boxes are ticked)</p>
+      <p>Blind listener: a friend who knows your voice hears 5 converted lines of this run without seeing the script, and says what they heard.</p>
+      <p class="row">
+        <label class="inline">Lines with every word right <input id="blindWords" type="number" min="0" max="5" step="1" placeholder="0–5"></label>
+        <label class="inline">Lines that sound like you <input id="blindVoice" type="number" min="0" max="5" step="1" placeholder="0–5"></label>
+        <span class="hint">of 5</span>
+      </p>
       <label class="block">Notes (what sounded wrong?)
         <textarea id="notes" rows="3"></textarea>
       </label>
@@ -119,10 +127,10 @@
     </section>
 
     <section id="s-long">
-      <h2>6 · Stability: 10 minutes without a break</h2>
-      <p>Plays your recording again and again through one Sanas connection (about $0.09 for 10 minutes). If the connection drops, the page reconnects and counts the drop.</p>
+      <h2>6 · Stability: one long connection</h2>
+      <p>Plays your recording again and again through one Sanas connection: 10 minutes cost about $0.09, 65 minutes about $0.60. If the connection drops, the page reconnects and counts the drop. Leave the PC awake and plugged in.</p>
       <p class="row">
-        <label class="inline">Minutes <input id="longMinutes" type="number" value="10" min="1" max="60"></label>
+        <label class="inline">Minutes <input id="longMinutes" type="number" value="10" min="1" max="90"></label>
         <button id="btnLong" type="button">Start</button>
         <button id="btnStopLong" type="button">Stop</button>
         <progress id="longProgress" max="1" value="0"></progress>
@@ -131,11 +139,22 @@
     </section>
 
     <section id="s-pair">
-      <h2>7 · Measure another microphone (optional)</h2>
-      <p>Compares your microphone with another one. "CABLE Output": the page plays your microphone into VB-CABLE and measures the cable's delay. "Krisp Microphone": measures Krisp's delay. Press the button, then say "pa-ta-ka" a few times with pauses.</p>
+      <h2>7 · Measure another app's microphone (Krisp, the Sanas desktop app, VB-CABLE)</h2>
+      <p>Pick that app's microphone, for example “Krisp Microphone”. The page records your headset microphone and that one at the same time and compares them. In the other app, use your headset as its microphone.</p>
       <p class="row">
         <label class="inline">Other microphone <select id="pairDevice"></select></label>
-        <button id="btnPair" type="button">Record 12 s</button>
+      </p>
+      <p><strong>Read the script:</strong> press the button, read the whole script from step 2 aloud with a short pause between lines, then press Stop. The result appears in step 3's table and in step 4 for rating, like a Sanas run.</p>
+      <p class="row">
+        <button id="btnRead" type="button">Read the script</button>
+        <button id="btnStopRead" type="button">Stop</button>
+        <meter id="readLevelA" title="your microphone" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter>
+        <meter id="readLevelB" title="the other microphone" min="-60" max="0" low="-30" high="-6" optimum="-12" value="-60"></meter>
+        <span id="readInfo"></span>
+      </p>
+      <p><strong>Quick check:</strong> 12 seconds of “pa-ta-ka” with pauses; measures the delay only. With “CABLE Output” the page plays your microphone into VB-CABLE first and measures the cable.</p>
+      <p class="row">
+        <button id="btnPair" type="button">Quick check (12 s)</button>
         <span id="pairInfo"></span>
       </p>
     </section>
@@ -144,10 +163,10 @@
       <h2>8 · Save</h2>
       <p class="row">
         <button id="btnSaveJson" type="button">Download results (JSON)</button>
-        <button id="btnSaveWav" type="button">Download last run (WAV)</button>
+        <button id="btnSaveWav" type="button">Download WAV of the run being rated</button>
         <span id="costInfo"></span>
       </p>
-      <p class="hint">The JSON is the file to share. It has no audio: it holds the measurements, your ratings and notes, the settings with your device names, the browser version, the script text only if you changed it, and the page log. WAV files are your voice: keep them on your PC.</p>
+      <p class="hint">The JSON is the file to share. It has no audio: it holds the measurements, your ratings and notes, the settings with your device names, the browser version, the script text only if you changed it, the Sanas address check, and the page log. WAV files are your voice: keep them on your PC.</p>
       <details>
         <summary>Log</summary>
         <pre id="log"></pre>

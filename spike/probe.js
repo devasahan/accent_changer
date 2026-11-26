@@ -4,7 +4,9 @@
  * Records you reading a script, sends that recording through the engine at
  * live speed, and measures what comes back against what went in: delay,
  * holes, level, bandwidth, and the WebRTC link (RTT, jitter buffer, loss).
- * Also: live listening, a long stability run, and a device-pair delay check.
+ * Also: live listening, a long stability run, and step 7, which measures
+ * another app's virtual microphone (Krisp, the Sanas desktop app) the same
+ * way while you read the script aloud, so the engines can be compared.
  */
 import { socketHosts, watchStats } from "./webrtc-stats.js"; // first: watches WebRTC before the SDK opens any
 import { analyzeRun, estimateDelay, median, percentile } from "../src/core/delay-estimate.js";
@@ -15,6 +17,12 @@ import { connectSanas, disconnectSanas, mockEngine, sanasEngine } from "./engine
 const PRICE_PER_MIN = 0.009; // AT5.2 on Sanas Cloud (developer.sanas.ai pricing, 2026-10-01)
 const TAIL_SEC = 2.5; // keep recording after the script ends, to catch the delayed output
 const DELAY_LIMIT_MS = 380; // GO needs a median at or under this (spike/FINDINGS.md)
+const LONG_MAX_MIN = 90; // the README asks for one 65-minute run
+const READ_MAX_SEC = 300; // "Read the script" stops by itself after 5 minutes
+const KEEP_AUDIO_RUNS = 6; // runs whose audio stays playable here (25-50 MB each)
+const SPEECH_DB = -45; // a level above this counts as speech for the live and read hints
+// Other apps' virtual microphones: never picked as your "real" microphone by default.
+const VIRTUAL_MIC = /cable output|krisp|sanas|voicemeeter|steam streaming/i;
 const NO_AUDIO = /no converted audio/;
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22,12 +30,16 @@ const round = (v, digits = 0) => (Number.isFinite(v) ? Number(v.toFixed(digits))
 
 const state = {
   ctx: null,
-  mode: "idle", // idle | busy | recording | running | starting | live | long | pair
+  mode: "idle", // idle | busy | recording | running | starting | live | long | pair | read
   recording: null,
   recordingSession: null,
   runs: [],
-  last: null, // newest script run: { ref, sig, analysis, sampleRate, run, number }
-  pair: null,
+  last: null, // the run being rated and played: { ref, sig, analysis, sampleRate, run, number }
+  audio: new Map(), // run number → the same, for the newest KEEP_AUDIO_RUNS runs with audio
+  pairs: [], // step 7 quick checks
+  pairChosen: false, // the other-microphone choice was made by hand
+  read: null, // step 7 "Read the script" while it records
+  originCheck: null, // the server's check of which page addresses Sanas accepts
   live: null,
   liveStart: null, // AbortController while live is starting
   long: null,
@@ -74,6 +86,8 @@ const BUTTONS = {
   btnLong: () => state.mode === "idle" && Boolean(state.recording),
   btnStopLong: () => state.mode === "long" && !state.long?.stopping,
   btnPair: () => state.mode === "idle",
+  btnRead: () => state.mode === "idle",
+  btnStopRead: () => state.mode === "read",
   btnSaveJson: () => true,
   btnSaveWav: () => Boolean(state.last || state.recording),
 };
@@ -83,6 +97,7 @@ const SETUP_IDS = ["engine", "model", "rate", "jitter", "mockDelay", "mockFail",
 function refreshButtons() {
   for (const [id, enabled] of Object.entries(BUTTONS)) $(id).disabled = !enabled();
   for (const id of SETUP_IDS) $(id).disabled = state.mode !== "idle";
+  $("rateRun").disabled = !["idle", "long"].includes(state.mode);
   const mock = $("engine").value === "mock";
   for (const el of document.querySelectorAll(".mock-only")) el.classList.toggle("hidden", !mock);
   updateCost();
@@ -248,6 +263,27 @@ function peakDb(samples) {
   return peak > 0 ? 20 * Math.log10(peak) : -Infinity;
 }
 
+function rmsDb(samples) {
+  let sum = 0;
+  for (const v of samples) sum += v * v;
+  return 10 * Math.log10(sum / Math.max(1, samples.length) + 1e-12);
+}
+
+/** The level of `source` in dBFS (-60 at most quiet), read on demand. */
+function levelMeter(ctx, source) {
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+  source.connect(analyser);
+  const buf = new Float32Array(analyser.fftSize);
+  return {
+    read() {
+      analyser.getFloatTimeDomainData(buf);
+      return Math.max(-60, rmsDb(buf));
+    },
+    dispose: () => analyser.disconnect(),
+  };
+}
+
 // ---------- settings and engines ----------
 
 function numberOrUndefined(id) {
@@ -363,11 +399,17 @@ async function listDevices() {
   fill($("mic"), inputs);
   fill($("pairDevice"), inputs);
   fill($("out"), devices.filter((d) => d.kind === "audiooutput"), "Default output");
-  // Never pick the virtual cable as the "real" microphone by default.
+  // Never pick a virtual microphone (VB-CABLE, Krisp, Sanas…) as the "real" one by default.
   const mic = $("mic");
-  if (/cable output|krisp/i.test(mic.selectedOptions[0]?.textContent ?? "")) {
-    const real = [...mic.options].find((o) => !/cable output|krisp/i.test(o.textContent));
+  if (VIRTUAL_MIC.test(mic.selectedOptions[0]?.textContent ?? "")) {
+    const real = [...mic.options].find((o) => !VIRTUAL_MIC.test(o.textContent));
     if (real) mic.value = real.value;
+  }
+  // And for step 7, start from another app's microphone if there is one.
+  const pair = $("pairDevice");
+  if (!state.pairChosen) {
+    const other = [...pair.options].find((o) => VIRTUAL_MIC.test(o.textContent));
+    if (other) pair.value = other.value;
   }
   state.defaultOutputRate = readDefaultOutputRate();
 }
@@ -387,6 +429,7 @@ action("btnConnect", "busy", async () => {
 });
 
 $("out").addEventListener("change", () => applySink());
+$("pairDevice").addEventListener("change", () => (state.pairChosen = true));
 $("engine").addEventListener("change", refreshButtons);
 navigator.mediaDevices?.addEventListener?.("devicechange", () => listDevices().catch(() => {}));
 
@@ -400,20 +443,14 @@ action("btnRecord", "busy", async () => {
     const source = ctx.createMediaStreamSource(stream);
     const rec = makeRecorder(ctx, 1);
     source.connect(rec.node, 0, 0);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    source.connect(analyser);
-    const buf = new Float32Array(analyser.fftSize);
+    const level = levelMeter(ctx, source);
     const t0 = performance.now();
     rec.start();
     const meter = setInterval(() => {
-      analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (const v of buf) sum += v * v;
-      $("recLevel").value = Math.max(-60, 10 * Math.log10(sum / buf.length + 1e-12));
+      $("recLevel").value = level.read();
       $("recInfo").textContent = `Recording… ${((performance.now() - t0) / 1000).toFixed(0)} s`;
     }, 100);
-    session = { stream, source, rec, analyser, meter };
+    session = { stream, source, rec, level, meter };
   } catch (err) {
     stopTracks(stream);
     throw err;
@@ -429,8 +466,8 @@ action("btnStopRecord", "busy", async () => {
   clearInterval(r.meter);
   const [samples] = await r.rec.stop();
   r.rec.dispose();
+  r.level.dispose();
   r.source.disconnect();
-  r.analyser.disconnect();
   stopTracks(r.stream);
   state.recordingSession = null;
   state.recording = samples;
@@ -582,7 +619,7 @@ function renderRuns() {
       const spread = r.ok ? `${Math.round(r.delayMedianMs ?? NaN)} / ${Math.round(r.delayP95Ms ?? NaN)}` : "–";
       const cells = [
         String(i + 1),
-        r.kind === "script" ? r.engine : `${r.engine} (${r.kind})`,
+        r.kind === "script" ? r.engine : `${r.engine} (${r.kind === "read" ? "read aloud" : r.kind})`,
         r.settings.engine === "sanas" ? `${r.settings.sampleRate / 1000} kHz` : "–",
         r.ok ? String(Math.round(r.delayMs)) : r.reason ?? "failed",
         r.kind === "long" && r.ok ? `${spread} (max ${Math.round(r.delayMaxMs ?? NaN)})` : spread,
@@ -623,9 +660,8 @@ action("btnRun", "running", async () => {
       perUtterance: summary.utterances.map(() => ({ natural: false, voice: false, words: false })),
     };
     state.runs.push(summary);
-    state.last = { ref: result.ref, sig: result.sig, analysis: result.analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length };
+    keepAudio({ ref: result.ref, sig: result.sig, analysis: result.analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length });
     renderRuns();
-    renderUtterances();
     $("runProgress").value = 1;
     const n = state.runs.length;
     if (result.droppedReason) {
@@ -673,6 +709,59 @@ async function play(samples) {
   refreshButtons();
 }
 
+/** Keep a run's audio playable (the newest KEEP_AUDIO_RUNS runs) and rate it next. */
+function keepAudio(entry) {
+  state.audio.set(entry.number, entry);
+  for (const number of state.audio.keys()) {
+    if (state.audio.size <= KEEP_AUDIO_RUNS) break;
+    state.audio.delete(number);
+    log(`Run ${number}: its audio was let go to save memory (its numbers and ratings stay).`);
+  }
+  stopPlayback();
+  state.last = entry;
+  renderRateChoices();
+  renderUtterances();
+}
+
+function runLabel(entry) {
+  const r = entry.run;
+  const rate = r.settings.engine === "sanas" ? `, ${r.settings.sampleRate / 1000} kHz` : "";
+  return `Run ${entry.number} · ${r.engine}${rate}${r.kind === "read" ? ", read aloud" : ""}`;
+}
+
+function renderRateChoices() {
+  const select = $("rateRun");
+  select.replaceChildren(...[...state.audio.values()].map((e) => new Option(runLabel(e), String(e.number))));
+  if (state.last) select.value = String(state.last.number);
+  $("rateRunLabel").classList.toggle("hidden", state.audio.size < 2);
+}
+
+$("rateRun").addEventListener("change", () => {
+  const entry = state.audio.get(Number($("rateRun").value));
+  if (!entry || entry === state.last) return;
+  stopPlayback();
+  state.last = entry;
+  renderUtterances();
+});
+
+/** A blind-listener count: a whole number from 0 to 5, or null when empty. */
+function blindCount(id) {
+  const raw = $(id).value.trim();
+  if (raw === "" || !Number.isFinite(Number(raw))) return null;
+  return Math.min(5, Math.max(0, Math.round(Number(raw))));
+}
+
+for (const id of ["blindWords", "blindVoice"]) {
+  $(id).addEventListener("input", () => {
+    const rating = state.last?.run.rating;
+    if (rating) rating.blind = { lines: 5, allWordsRight: blindCount("blindWords"), soundsLikeYou: blindCount("blindVoice") };
+  });
+  $(id).addEventListener("change", () => {
+    const n = blindCount(id);
+    $(id).value = n == null ? "" : String(n);
+  });
+}
+
 function slice(samples, startSec, endSec, sampleRate) {
   const a = Math.max(0, Math.round(startSec * sampleRate));
   const b = Math.min(samples.length, Math.round(endSec * sampleRate));
@@ -690,9 +779,13 @@ function updateScore() {
 function renderUtterances() {
   const list = $("utts");
   const last = state.last;
+  const blind = last?.run.rating?.blind;
+  $("blindWords").value = blind?.allWordsRight ?? "";
+  $("blindVoice").value = blind?.soundsLikeYou ?? "";
+  $("blindWords").disabled = $("blindVoice").disabled = !last?.run.rating;
   if (!last?.analysis?.ok) {
     list.replaceChildren();
-    $("rateFor").textContent = "";
+    $("rateFor").textContent = last ? `Run ${last.number} has nothing to rate: ${last.run.reason ?? "no result"}.` : "";
     updateScore();
     return;
   }
@@ -790,15 +883,23 @@ action("btnLive", "starting", async () => {
   const stats = watchStats();
   const t0 = performance.now();
   const delays = [];
+  // For the idle test (stay quiet for 15 minutes, then speak): when converted
+  // speech followed yours, and when your microphone last had speech.
+  const track = { heard: [], lastSpeechSec: null };
   const timer = setInterval(() => {
     const [ref, sig] = rec.recent(12);
     const est = ref.length > ctx.sampleRate * 4 ? estimateDelay(ref, sig, ctx.sampleRate) : null;
-    if (est && est.score >= 0.3) delays.push(est.lagMs);
-    const secs = ((performance.now() - t0) / 1000).toFixed(0);
+    const secs = (performance.now() - t0) / 1000;
+    if (est && est.score >= 0.3) {
+      delays.push(est.lagMs);
+      track.heard.push(round(secs, 1));
+    }
+    const last3 = Math.round(ctx.sampleRate * 3);
+    if (ref.length >= last3 && rmsDb(ref.subarray(ref.length - last3)) > SPEECH_DB) track.lastSpeechSec = round(secs, 1);
     const link = handle.droppedReason ? `dropped (${handle.droppedReason})` : handle.getState();
-    $("liveInfo").textContent = `${secs} s · ${handle.engine} ${link} · delay ${est && est.score >= 0.3 ? `${Math.round(est.lagMs)} ms` : "– (speak)"}`;
+    $("liveInfo").textContent = `${secs.toFixed(0)} s · ${handle.engine} ${link} · delay ${est && est.score >= 0.3 ? `${Math.round(est.lagMs)} ms` : "– (speak)"}`;
   }, 3000);
-  state.live = { cfg, mic, micNode, handle, rec, stats, timer, t0, delays };
+  state.live = { cfg, mic, micNode, handle, rec, stats, timer, t0, delays, track };
   state.mode = "live";
   setStatus(`Live: speak. Press Stop when done.${note}`, note ? "warn" : "ok");
 });
@@ -822,6 +923,9 @@ action("btnStopLive", null, async () => {
     const dropped = l.handle.droppedReason;
     await l.handle.stop();
     state.live = null;
+    const endSec = round((performance.now() - l.t0) / 1000, 1);
+    const quiet = longestQuiet(l.track.heard, endSec);
+    const lastHeard = l.track.heard.at(-1);
     state.runs.push({
       at: new Date().toISOString(),
       kind: "live",
@@ -830,7 +934,11 @@ action("btnStopLive", null, async () => {
       ok: l.delays.length > 0,
       reason: l.delays.length ? null : "no speech detected",
       dropped: dropped ?? null,
-      durationSec: round((performance.now() - l.t0) / 1000, 1),
+      durationSec: endSec,
+      quietLongestSec: quiet.sec,
+      convertedAfterQuiet: quiet.resumed,
+      speechAfterLastConversionSec:
+        l.track.lastSpeechSec != null && lastHeard != null ? round(Math.max(0, l.track.lastSpeechSec - lastHeard), 1) : null,
       delayMs: round(median(l.delays), 1),
       delayMedianMs: round(median(l.delays), 1),
       delayP95Ms: round(percentile(l.delays, 95), 1),
@@ -841,12 +949,32 @@ action("btnStopLive", null, async () => {
       warmupMs: l.handle.warmupMs,
     });
     renderRuns();
-    if (dropped) setStatus(`Live stopped. ${l.handle.engine} had dropped the call (${dropped}).`, "warn");
-    else setStatus("Live stopped.", "ok");
+    const quietNote =
+      quiet.sec >= 300
+        ? ` Longest stretch without converted speech: ${(quiet.sec / 60).toFixed(1)} min; converted speech ${quiet.resumed ? "came back after it" : "did not come back after it"}.`
+        : "";
+    if (dropped) setStatus(`Live stopped. ${l.handle.engine} had dropped the call (${dropped}).${quietNote}`, "warn");
+    else setStatus(`Live stopped.${quietNote}`, quietNote && !quiet.resumed ? "warn" : "ok");
   } finally {
     state.mode = "idle";
   }
 });
+
+/**
+ * The longest stretch without converted speech in a live call (`heard`:
+ * seconds when converted speech followed yours), and whether converted
+ * speech came back after it.
+ */
+function longestQuiet(heard, endSec) {
+  let best = { sec: 0, resumed: false };
+  let previous = 0;
+  for (const t of heard) {
+    if (t - previous > best.sec) best = { sec: round(t - previous, 1), resumed: true };
+    previous = t;
+  }
+  if (endSec - previous > best.sec) best = { sec: round(endSec - previous, 1), resumed: false };
+  return best;
+}
 
 // ---------- 6 · long stability run ----------
 
@@ -862,7 +990,7 @@ action("btnLong", "long", async () => {
 async function longRun() {
   const cfg = settings();
   const note = outputRateWarning(cfg);
-  const minutes = Math.min(60, Math.max(1, numberOrUndefined("longMinutes") ?? 10));
+  const minutes = Math.min(LONG_MAX_MIN, Math.max(1, numberOrUndefined("longMinutes") ?? 10));
   const ctx = await ensureCtx();
   const engine = engineFor(cfg);
   const failures = [];
@@ -1011,24 +1139,38 @@ async function feedCable(stream) {
   };
 }
 
-action("btnPair", "pair", async () => {
-  const ctx = await ensureCtx();
-  const otherId = $("pairDevice").value;
+/**
+ * Your microphone and the other one for step 7. For "CABLE Output" the page
+ * plays your microphone into VB-CABLE, so the cable itself is measured.
+ */
+async function openPair() {
   const otherLabel = $("pairDevice").selectedOptions[0]?.textContent ?? "";
   const viaCable = /cable output/i.test(otherLabel);
   const a = await getMic($("mic").value);
   let b = null;
   let feed = null;
   try {
-    b = await getMic(otherId);
+    b = await getMic($("pairDevice").value);
     if (viaCable) feed = await feedCable(a); // your microphone → CABLE Input → CABLE Output
   } catch (err) {
     stopTracks(a);
     stopTracks(b);
     throw err;
   }
-  const na = ctx.createMediaStreamSource(a);
-  const nb = ctx.createMediaStreamSource(b);
+  return { a, b, feed, otherLabel, viaCable };
+}
+
+function closePair(p) {
+  p.feed?.close();
+  stopTracks(p.a);
+  stopTracks(p.b);
+}
+
+action("btnPair", "pair", async () => {
+  const ctx = await ensureCtx();
+  const p = await openPair();
+  const na = ctx.createMediaStreamSource(p.a);
+  const nb = ctx.createMediaStreamSource(p.b);
   const rec = makeRecorder(ctx, 2);
   na.connect(rec.node, 0, 0);
   nb.connect(rec.node, 0, 1);
@@ -1044,32 +1186,131 @@ action("btnPair", "pair", async () => {
     rec.dispose();
     na.disconnect();
     nb.disconnect();
-    feed?.close();
-    stopTracks(a);
-    stopTracks(b);
+    closePair(p);
   }
   const [ref, sig] = recorded;
   const r = analyzeRun({ ref, sig, sampleRate: ctx.sampleRate });
   const reason = !r.reason
     ? null
     : NO_AUDIO.test(r.reason)
-      ? `“${otherLabel}” stayed silent`
+      ? `“${p.otherLabel}” stayed silent`
       : "your microphone stayed silent: say “pa-ta-ka” during the 12 s";
-  state.pair = {
+  state.pairs.push({
     at: new Date().toISOString(),
-    device: otherLabel,
-    viaCable,
+    device: p.otherLabel,
+    viaCable: p.viaCable,
     ok: r.ok,
     reason,
     delayMs: round(r.delayMs, 1),
     score: round(r.delayScore, 3),
     levelDiffDb: round(r.levelDiffDb, 1),
-  };
-  const what = viaCable ? "Your microphone through CABLE Input → CABLE Output" : otherLabel;
+  });
+  const what = p.viaCable ? "Your microphone through CABLE Input → CABLE Output" : p.otherLabel;
   $("pairInfo").textContent = r.ok
     ? `${what}: ${Math.round(r.delayMs)} ms later than your microphone (match ${r.delayScore.toFixed(2)}).`
     : `Could not measure: ${reason}.`;
   setStatus(r.ok ? "Measured." : `Could not measure: ${reason}.`, r.ok ? "ok" : "warn");
+});
+
+// "Read the script": the whole script read aloud, measured like a Sanas run.
+action("btnRead", "busy", async () => {
+  if ($("pairDevice").value === $("mic").value) {
+    throw new Error("Pick the other app's microphone (for example “Krisp Microphone”) as the other microphone in step 7: it is now the same as yours.");
+  }
+  const ctx = await ensureCtx();
+  const p = await openPair();
+  const r = { ...p, youSpoke: false, otherHeard: false, autoStopped: false };
+  try {
+    r.na = ctx.createMediaStreamSource(p.a);
+    r.nb = ctx.createMediaStreamSource(p.b);
+    r.rec = makeRecorder(ctx, 2);
+    r.na.connect(r.rec.node, 0, 0);
+    r.nb.connect(r.rec.node, 0, 1);
+    r.levels = [levelMeter(ctx, r.na), levelMeter(ctx, r.nb)];
+  } catch (err) {
+    closePair(p);
+    throw err;
+  }
+  r.cfg = {
+    engine: "device",
+    device: p.otherLabel,
+    viaCable: p.viaCable,
+    micLabel: $("mic").selectedOptions[0]?.textContent ?? "",
+    outputLabel: $("out").selectedOptions[0]?.textContent ?? "",
+    defaultOutputRate: state.defaultOutputRate,
+  };
+  r.rec.start();
+  r.t0 = performance.now();
+  r.timer = setInterval(() => {
+    const [you, other] = r.levels.map((m) => m.read());
+    $("readLevelA").value = you;
+    $("readLevelB").value = other;
+    if (you > SPEECH_DB) r.youSpoke = true;
+    if (other > SPEECH_DB) r.otherHeard = true;
+    const secs = (performance.now() - r.t0) / 1000;
+    const silent = r.youSpoke && !r.otherHeard && secs > 8;
+    $("readInfo").textContent =
+      `Reading… ${secs.toFixed(0)} s` + (silent ? ` · “${r.otherLabel}” is silent: is that app running, with accent conversion on?` : "");
+    if (secs >= READ_MAX_SEC && !r.autoStopped) {
+      r.autoStopped = true;
+      $("btnStopRead").click();
+    }
+  }, 200);
+  state.read = r;
+  state.mode = "read";
+  setStatus(`Recording your microphone and “${p.otherLabel}”. Read the whole script aloud, then press Stop.`);
+});
+
+action("btnStopRead", "busy", async () => {
+  const r = state.read;
+  if (!r) return;
+  state.read = null;
+  clearInterval(r.timer);
+  let recorded;
+  try {
+    recorded = await r.rec.stop();
+  } finally {
+    r.rec.dispose();
+    r.levels.forEach((m) => m.dispose());
+    r.na.disconnect();
+    r.nb.disconnect();
+    closePair(r);
+    $("readLevelA").value = -60;
+    $("readLevelB").value = -60;
+  }
+  const [ref, sig] = recorded;
+  const ctx = state.ctx;
+  const analysis = analyzeRun({ ref, sig, sampleRate: ctx.sampleRate });
+  const summary = summarize(
+    { analysis, webrtc: null, engineState: null, stoppedEarly: false, droppedReason: null },
+    { kind: "read", engine: r.otherLabel, warmupMs: null, autoStopped: r.autoStopped },
+    r.cfg,
+  );
+  if (!analysis.ok) {
+    summary.reason = NO_AUDIO.test(analysis.reason ?? "")
+      ? `“${r.otherLabel}” stayed silent`
+      : "your microphone picked up no speech";
+  }
+  summary.rating = {
+    score10: null,
+    perUtterance: summary.utterances.map(() => ({ natural: false, voice: false, words: false })),
+  };
+  state.runs.push(summary);
+  keepAudio({ ref, sig, analysis, sampleRate: ctx.sampleRate, run: summary, number: state.runs.length });
+  renderRuns();
+  const n = state.runs.length;
+  if (!analysis.ok) {
+    $("readInfo").textContent = `Could not measure: ${summary.reason}.`;
+    const hint = NO_AUDIO.test(analysis.reason ?? "")
+      ? " Is that app running, with your headset as its microphone and accent conversion on?"
+      : " Check that your headset microphone is picked in step 1.";
+    setStatus(`Run ${n}: could not measure: ${summary.reason}.${hint}`, "error");
+    return;
+  }
+  const seconds = ref.length / ctx.sampleRate;
+  $("readInfo").textContent = `${r.otherLabel}: ${Math.round(summary.delayMs)} ms later than your microphone, ${summary.gapCount} gap(s).`;
+  const short = seconds < 30 ? " It was short: read the whole script (about a minute) so the numbers mean something." : "";
+  setStatus(`Run ${n} (${r.otherLabel}, read aloud): delay ${Math.round(summary.delayMs)} ms. Rate it in step 4.${short}`, short ? "warn" : "ok");
 });
 
 // ---------- 8 · save ----------
@@ -1087,7 +1328,7 @@ function buildResults() {
   const script = $("script").value;
   return {
     tool: "accent-changer spike",
-    schema: 2,
+    schema: 3,
     createdAt: new Date().toISOString(),
     browser: browserName(),
     settings: settings(),
@@ -1101,9 +1342,10 @@ function buildResults() {
       ? { seconds: round(state.recording.length / (state.ctx?.sampleRate ?? 48000), 1), peakDb: round(peakDb(state.recording), 1) }
       : null,
     script: script.trim() === DEFAULT_SCRIPT.trim() ? "default" : script,
-    runs: state.runs, // script runs carry their own rating
+    runs: state.runs, // script and read-aloud runs carry their own rating
     notes: $("notes").value,
-    pair: state.pair,
+    pairs: state.pairs,
+    originCheck: state.originCheck,
     errors: state.errors,
     log: state.log.slice(-300),
   };
@@ -1122,7 +1364,8 @@ function download(name, blob) {
 
 const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
 
-action("btnSaveJson", null, () => {
+action("btnSaveJson", null, async () => {
+  await loadOriginCheck();
   download(`sanas-check-${stamp()}.json`, new Blob([JSON.stringify(buildResults(), null, 2)], { type: "application/json" }));
 });
 
@@ -1131,6 +1374,21 @@ action("btnSaveWav", null, () => {
   const wav = state.last ? encodeWav([state.last.ref, state.last.sig], rate) : encodeWav([state.recording], rate);
   download(`sanas-check-${stamp()}${state.last ? "-original-left-converted-right" : "-recording"}.wav`, new Blob([wav], { type: "audio/wav" }));
 });
+
+/** The server's check of which page addresses Sanas accepts (it runs when the key is accepted). */
+async function loadOriginCheck() {
+  try {
+    const res = await fetch("/origin-check", { cache: "no-store" });
+    if (!res.ok) return;
+    const check = await res.json();
+    if (!check?.ran) return;
+    if (state.originCheck?.at !== check.at) log(`Sanas address check: ${check.conclusion}`);
+    state.originCheck = check;
+    $("originInfo").textContent = `Sanas address check for the app: ${check.conclusion}`;
+  } catch {
+    // an older server: nothing to show
+  }
+}
 
 // ---------- start ----------
 
@@ -1149,5 +1407,6 @@ if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
 } else {
   setStatus("Ready. Start with “Allow microphone”.", "info");
   listDevices().catch(() => {});
+  loadOriginCheck();
 }
 refreshButtons();

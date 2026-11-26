@@ -35,7 +35,17 @@ async function main() {
   const wavPath = path.join(OUT, "fake-mic.wav");
   fs.writeFileSync(wavPath, encodeWav([speech.samples], 48000));
 
-  const server = await startSpikeServer({ port: 0, getApiKey: () => "" });
+  // A finished Sanas address check, as the server holds it after a key was accepted.
+  const originCheck = {
+    ran: true,
+    at: "2026-11-26T10:00:00.000Z",
+    pageOrigin: "http://localhost:8080",
+    results: [],
+    appReady: true,
+    conclusion: "Good: the app can load its page from http://tauri.localhost.",
+    lines: [],
+  };
+  const server = await startSpikeServer({ port: 0, getApiKey: () => "", getOriginCheck: () => originCheck });
   const base = `http://localhost:${server.port}`;
   const browser = await chromium.launch({
     args: [
@@ -68,6 +78,9 @@ async function main() {
     await page.goto(`${base}/spike/`);
     await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
     check(true, "page loads and says Ready");
+    await page.waitForFunction(() => /app can load/.test(document.querySelector("#originInfo").textContent), null, { timeout: 5000 });
+    check(true, "the page shows the server's Sanas address check");
+    check((await page.locator("#longMinutes").getAttribute("max")) === "90", "the long run allows 90 minutes");
 
     await page.selectOption("#engine", "mock");
     await page.fill("#mockDelay", String(MOCK_DELAY_MS));
@@ -130,6 +143,11 @@ async function main() {
     await waitIdle(10000);
     const live = await lastRun();
     check(live.kind === "live" && live.ok, "live run recorded", liveText);
+    check(
+      Number.isFinite(live.quietLongestSec) && typeof live.convertedAfterQuiet === "boolean" && "speechAfterLastConversionSec" in live,
+      "the live run keeps what the idle test needs",
+      JSON.stringify({ q: live.quietLongestSec, c: live.convertedAfterQuiet, s: live.speechAfterLastConversionSec }),
+    );
     check(live.delayMs >= MOCK_DELAY_MS && live.delayMs < MOCK_DELAY_MS + 150, "live delay measured from the microphone", `${live.delayMs} ms`);
     check((await openSessions()) === 0, "Stop closed the live session");
 
@@ -202,13 +220,56 @@ async function main() {
       JSON.stringify({ loops: stopped.loops, gaps: stopped.gapCount, perLoop: stopped.perLoop }),
     );
 
-    // 7 · device pair: the same fake microphone twice
+    // 7 · quick check: the same fake microphone twice
     const firstMic = await page.locator("#mic").inputValue();
     await page.selectOption("#pairDevice", firstMic);
     await page.click("#btnPair");
     await waitIdle(30000);
-    const pair = await spike(() => window.__spike.state.pair);
-    check(pair && pair.ok && Math.abs(pair.delayMs) < 60, "device pair measures two inputs", JSON.stringify(pair));
+    const pair = await spike(() => window.__spike.state.pairs.at(-1));
+    check(pair && pair.ok && Math.abs(pair.delayMs) < 60, "quick check measures two inputs", JSON.stringify(pair));
+
+    // 7b · read the script with "another app's" microphone: needs a different device
+    const runsBeforeRead = await spike(() => window.__spike.state.runs.length);
+    expectErrors = true;
+    await page.click("#btnRead");
+    await waitIdle(5000);
+    check(/same as yours/.test(await status()), "Read the script refuses your own microphone as the other one", await status());
+    expectErrors = false;
+    const inputs = await page.locator("#mic option").evaluateAll((os) => os.map((o) => ({ value: o.value, label: o.textContent })));
+    const one = inputs.find((o) => /Fake Audio Input 1/.test(o.label));
+    const two = inputs.find((o) => /Fake Audio Input 2/.test(o.label));
+    await page.selectOption("#mic", one.value);
+    await page.selectOption("#pairDevice", two.value);
+    await page.dblclick("#btnRead");
+    await page.waitForFunction(() => window.__spike.state.mode === "read", null, { timeout: 10000 });
+    check(await page.locator("#btnStopRead").isEnabled(), "Stop is available while reading");
+    await page.waitForTimeout(9000);
+    const readLevel = await page.locator("#readLevelA").evaluate((m) => m.value);
+    await page.click("#btnStopRead");
+    await waitIdle(15000);
+    const read = await lastRun();
+    check((await spike(() => window.__spike.state.runs.length)) === runsBeforeRead + 1, "a double click on Read the script made one run");
+    check(read.kind === "read" && read.ok && read.engine === two.label, "the read-aloud run is analysed like a Sanas run", JSON.stringify({ kind: read.kind, ok: read.ok, reason: read.reason, engine: read.engine }));
+    check(Math.abs(read.delayMs) < 1000 && read.utterances.length >= 3, "it has a delay and lines", `${read.delayMs} ms, ${read.utterances.length} lines`);
+    check(readLevel > -60, "the level meters move while reading", String(readLevel));
+    check(read.settings.engine === "device" && read.settings.device === two.label, "it keeps the device it measured");
+    check(/read aloud/.test(await page.locator("#runs tbody tr").last().textContent()), "the table marks it as read aloud");
+    check((await page.locator("#utts li").count()) === read.utterances.length, "its lines are ready to rate");
+    check(/Rating run \d+ \(Fake Audio Input 2\)/.test(await page.locator("#rateFor").textContent()), "and the page says which run is rated");
+
+    // 4b · switch back to run 1 and score its blind-listener test
+    check(await page.locator("#rateRunLabel").isVisible(), "the run picker appears once two runs have audio");
+    await page.selectOption("#rateRun", "1");
+    check(/Rating run 1/.test(await page.locator("#rateFor").textContent()), "picking run 1 rates run 1 again");
+    check((await page.locator("#utts li").first().locator("input[type=checkbox]").first().isChecked()), "run 1 kept its ticks");
+    await page.fill("#blindWords", "4");
+    await page.fill("#blindVoice", "9");
+    await page.locator("#blindVoice").blur();
+    const blind = await spike(() => window.__spike.state.runs[0].rating.blind);
+    check(blind && blind.allWordsRight === 4 && blind.soundsLikeYou === 5 && blind.lines === 5, "blind-listener counts are stored with run 1 (capped at 5)", JSON.stringify(blind));
+    check((await page.locator("#blindVoice").inputValue()) === "5", "the capped count is shown");
+    await page.selectOption("#rateRun", String(runsBeforeRead + 1));
+    check((await page.locator("#blindWords").inputValue()) === "", "the read-aloud run has its own blind-listener counts");
 
     // 8 · downloads
     const [jsonDl] = await Promise.all([page.waitForEvent("download"), page.click("#btnSaveJson")]);
@@ -217,7 +278,8 @@ async function main() {
     const text = fs.readFileSync(jsonPath, "utf8");
     const results = JSON.parse(text);
     const runCount = await spike(() => window.__spike.state.runs.length);
-    check(results.schema === 2 && results.runs.length === runCount && runCount >= 5, "results JSON has every run", `${results.runs.length} of ${runCount}`);
+    check(results.schema === 3 && results.runs.length === runCount && runCount >= 6, "results JSON has every run", `${results.runs.length} of ${runCount}`);
+    check(results.originCheck?.appReady === true && Array.isArray(results.pairs) && results.pairs.length === 1, "it holds the address check and the quick check");
     check(results.runs[0].rating?.perUtterance.length === results.runs[0].utterances.length, "each script run carries its own rating");
     check(
       results.script === "default" && /\d/.test(results.browser) && !/Mozilla/.test(results.browser),
