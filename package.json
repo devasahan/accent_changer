@@ -1,8 +1,8 @@
 {
-  "name": "accent-switch",
+  "name": "accent-changer",
   "version": "0.0.1",
   "private": true,
-  "description": "AccentSwitch: a live US-English accent for your own interview calls on Windows (Sanas Accent Translation + VB-CABLE virtual mic).",
+  "description": "Accent Changer: a live US-English accent for your own interview calls on Windows (Sanas Accent Translation + VB-CABLE virtual mic).",
   "type": "module",
   "engines": {
     "node": ">=20"

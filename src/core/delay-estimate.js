@@ -40,10 +40,20 @@ export function median(values) {
   return percentile(values, 50);
 }
 
-/** Loudness levels that separate speech from pauses in one recording. */
+/**
+ * Loudness levels that separate speech from pauses in one recording.
+ * Digital silence at the very start and end (the probe pads its recordings
+ * with zeros) is left out: it is not the room's noise, and in a short take
+ * it would pull the floor down to -120 dB and make every noise frame "speech".
+ */
 function levels(db) {
-  const floor = percentile(db, 10) ?? SILENCE_DB;
-  const peak = percentile(db, 99.5) ?? SILENCE_DB;
+  let a = 0;
+  let b = db.length;
+  while (a < b && db[a] <= SILENCE_DB) a++;
+  while (b > a && db[b - 1] <= SILENCE_DB) b--;
+  const body = typeof db.subarray === "function" ? db.subarray(a, b) : db.slice(a, b);
+  const floor = percentile(body, 10) ?? SILENCE_DB;
+  const peak = percentile(body, 99.5) ?? SILENCE_DB;
   return { floor, peak, threshold: Math.max(floor + 10, peak - 40) };
 }
 
@@ -165,15 +175,37 @@ export function estimateDelayFromEnvelopes(refDb, sigDb, hopMs, { minLagMs = -10
 
 /**
  * Speech frames of a recording: louder than its own pause level, with short
- * dips (between syllables) bridged and tiny blips dropped.
+ * dips (between syllables) bridged and tiny blips dropped. Sounds that never
+ * come within `quietRunDb` of the recording's peak (breaths, lip smacks,
+ * chair creaks) are not speech: words have vowels near full level.
  */
-export function speechMask(db, hopMs, { bridgeMs = 60, minMs = 30 } = {}) {
-  const { threshold } = levels(db);
+export function speechMask(db, hopMs, { bridgeMs = 60, minMs = 30, quietRunDb = 20 } = {}) {
+  const { threshold, peak } = levels(db);
   const mask = new Uint8Array(db.length);
   for (let i = 0; i < db.length; i++) mask[i] = db[i] > threshold ? 1 : 0;
   fillRuns(mask, 0, Math.round(bridgeMs / hopMs), 1);
   fillRuns(mask, 1, Math.round(minMs / hopMs), 0);
+  if (Number.isFinite(quietRunDb)) dropQuietRuns(mask, db, peak - quietRunDb);
   return mask;
+}
+
+/** Clear the runs of `mask` whose loudest frame stays below `minDb`. */
+function dropQuietRuns(mask, db, minDb) {
+  let i = 0;
+  while (i < mask.length) {
+    if (!mask[i]) {
+      i++;
+      continue;
+    }
+    let j = i;
+    let loudest = -Infinity;
+    while (j < mask.length && mask[j]) {
+      if (db[j] > loudest) loudest = db[j];
+      j++;
+    }
+    if (loudest < minDb) mask.fill(0, i, j);
+    i = j;
+  }
 }
 
 /** Turn interior runs of `value` shorter than `maxLen` frames into `fill`. */
@@ -190,27 +222,6 @@ function fillRuns(mask, value, maxLen, fill) {
     if (j - i < maxLen && (interior || value === 1)) mask.fill(fill, i, j);
     i = j;
   }
-}
-
-/** Shrink (negative frames) or grow (positive) the true runs of a mask. */
-function morph(mask, frames) {
-  const out = new Uint8Array(mask.length);
-  const k = Math.abs(frames);
-  for (let i = 0; i < mask.length; i++) {
-    let v = frames >= 0 ? 0 : 1;
-    for (let j = Math.max(0, i - k); j <= Math.min(mask.length - 1, i + k); j++) {
-      if (frames >= 0 && mask[j]) {
-        v = 1;
-        break;
-      }
-      if (frames < 0 && !mask[j]) {
-        v = 0;
-        break;
-      }
-    }
-    out[i] = v;
-  }
-  return out;
 }
 
 /** Utterances: speech separated by pauses of at least `pauseMs`. Frame ranges [start, end). */
@@ -257,10 +268,20 @@ function windowCorrelation(a, aStart, b, bStart, len) {
 }
 
 /**
- * Delay of each utterance on its own, searched within ±searchMs of the
- * overall delay: shows whether the delay drifts or jumps during a run.
+ * Delay of each utterance on its own, searched from `minLagMs` up to
+ * `searchMs` either side of the overall delay: shows whether the delay
+ * drifts or jumps during a run (a jitter buffer that grew after a network
+ * hiccup, for example). `edge` marks a best match at the end of the search
+ * window: the true delay is outside it, so the number is not usable.
  */
-export function utteranceDelays(refDb, sigDb, hopMs, lagMs, segs, { searchMs = 300, marginMs = 150, rangeDb = 50 } = {}) {
+export function utteranceDelays(
+  refDb,
+  sigDb,
+  hopMs,
+  lagMs,
+  segs,
+  { searchMs = 1000, minLagMs = -100, marginMs = 150, rangeDb = 50 } = {},
+) {
   const clamp = (db) => {
     let max = -Infinity;
     for (const v of db) if (v > max) max = v;
@@ -271,18 +292,20 @@ export function utteranceDelays(refDb, sigDb, hopMs, lagMs, segs, { searchMs = 3
   const margin = Math.round(marginMs / hopMs);
   const search = Math.round(searchMs / hopMs);
   const center = Math.round(lagMs / hopMs);
+  const lo = Math.min(0, Math.max(-search, Math.round(minLagMs / hopMs) - center)); // offsets from the overall delay
   return segs.map((seg) => {
     const start = Math.max(0, seg.start - margin);
     const end = Math.min(a.length, seg.end + margin);
     const len = end - start;
-    const r = new Float64Array(2 * search + 1);
-    for (let k = -search; k <= search; k++) r[k + search] = windowCorrelation(a, start, b, start + center + k, len);
+    const r = new Float64Array(search - lo + 1);
+    for (let k = lo; k <= search; k++) r[k - lo] = windowCorrelation(a, start, b, start + center + k, len);
     const p = peakOf(r);
     return {
       startSec: (seg.start * hopMs) / 1000,
       endSec: (seg.end * hopMs) / 1000,
-      lagMs: (center + p.position - search) * hopMs,
+      lagMs: (center + lo + p.position) * hopMs,
       score: p.value,
+      edge: p.index === 0 || p.index === r.length - 1,
     };
   });
 }
@@ -290,45 +313,93 @@ export function utteranceDelays(refDb, sigDb, hopMs, lagMs, segs, { searchMs = 3
 /**
  * Holes: stretches where the converted output is silent while the original
  * had speech at the matching moment. A pause both share is not a hole.
- * Reports each silent run of the output that swallowed at least `minGapMs`
- * of speech.
+ *
+ * Each speech frame of the original is expected in the output at its own
+ * utterance's delay (`segLags`, frame ranges with a lagMs), else at `lagMs`:
+ * a sentence that arrives late is late, not missing. Every silent run of
+ * the output is checked; `tolMs` at each end that touches sound is allowed
+ * for timing slop. A run is a hole when, inside that margin, it swallowed at
+ * least `minGapMs` of speech of which at least `minLoudMs` was within
+ * `loudDb` of the original's peak (a vowel, not a breath the converter left
+ * out). Reported per hole: where it starts in the original (atSec), its
+ * length (holeMs: the longest stretch of missing speech in the run, pauses
+ * under `splitMs` inside it included), the speech it swallowed in total
+ * (missingSpeechMs) and the whole silent run around it (silentMs).
  */
-export function findGaps(refDb, sigDb, hopMs, lagMs, { minGapMs = 100, erodeMs = 30, growMs = 30 } = {}) {
+export function findGaps(
+  refDb,
+  sigDb,
+  hopMs,
+  lagMs,
+  { minGapMs = 100, tolMs = 20, loudDb = 20, minLoudMs = 40, blipMs = 30, splitMs = 100, segLags = [], refMask = null } = {},
+) {
   const lag = Math.round(lagMs / hopMs);
-  const refSpeech = morph(speechMask(refDb, hopMs), -Math.round(erodeMs / hopMs));
-  const { threshold } = levels(sigDb);
-  const sigActive = new Uint8Array(sigDb.length);
-  for (let i = 0; i < sigDb.length; i++) sigActive[i] = sigDb[i] > threshold ? 1 : 0;
-  const sigOn = morph(sigActive, Math.round(growMs / hopMs));
+  const refSpeech = refMask ?? speechMask(refDb, hopMs);
+  const loudLevel = levels(refDb).peak - loudDb;
 
-  // Walk in output time; positions past the end of the output count as silent.
-  const total = Math.max(sigDb.length, refDb.length + Math.max(0, lag));
+  const lagAt = new Int32Array(refDb.length).fill(lag);
+  for (const s of segLags) {
+    lagAt.fill(Math.round(s.lagMs / hopMs), Math.max(0, s.start), Math.min(refDb.length, s.end));
+  }
+  let maxLag = lag;
+  for (let i = 0; i < refSpeech.length; i++) if (refSpeech[i] && lagAt[i] > maxLag) maxLag = lagAt[i];
+  // Output time; positions past the end of the output count as silent.
+  const total = Math.max(sigDb.length, refDb.length + Math.max(0, maxLag));
+  const due = new Int32Array(total).fill(-1); // output frame -> original speech frame expected there
+  for (let i = 0; i < refSpeech.length; i++) {
+    if (!refSpeech[i]) continue;
+    const j = i + lagAt[i];
+    if (j >= 0 && j < total) due[j] = i;
+  }
+
+  const { threshold } = levels(sigDb);
+  const active = new Uint8Array(total);
+  for (let j = 0; j < sigDb.length; j++) active[j] = sigDb[j] > threshold ? 1 : 0;
+  fillRuns(active, 1, Math.round(blipMs / hopMs), 0); // a click inside a hole is still a hole
+
+  const tol = Math.round(tolMs / hopMs);
+  const split = Math.round(splitMs / hopMs);
   const gaps = [];
-  let runStart = -1;
-  let swallowed = 0;
-  const close = (end) => {
-    if (runStart >= 0 && swallowed * hopMs >= minGapMs) {
-      gaps.push({
-        atSec: ((runStart - lag) * hopMs) / 1000,
-        silentMs: (end - runStart) * hopMs,
-        missingSpeechMs: swallowed * hopMs,
-        pastEnd: end > sigDb.length,
-      });
-    }
-    runStart = -1;
-    swallowed = 0;
-  };
-  for (let j = 0; j < total; j++) {
-    const silent = j >= sigDb.length || !sigOn[j];
-    if (!silent) {
-      close(j);
+  let a = 0;
+  while (a < total) {
+    if (active[a]) {
+      a++;
       continue;
     }
-    if (runStart < 0) runStart = j;
-    const i = j - lag;
-    if (i >= 0 && i < refSpeech.length && refSpeech[i]) swallowed++;
+    let b = a;
+    while (b < total && !active[b]) b++;
+    const coreFrom = a > 0 ? a + tol : a;
+    const coreTo = b < total ? b - tol : b;
+    let swallowed = 0;
+    let core = 0;
+    let loud = 0;
+    // Longest cluster of missing speech in this run (the hole itself, not
+    // the slop at the far side of a pause it runs into).
+    let hole = null;
+    let cluster = null;
+    for (let j = a; j < b; j++) {
+      const i = due[j];
+      if (i < 0) continue;
+      swallowed++;
+      if (j >= coreFrom && j < coreTo) {
+        core++;
+        if (refDb[i] > loudLevel) loud++;
+      }
+      if (!cluster || j - cluster.last > split) cluster = { first: j, last: j, at: i };
+      cluster.last = j;
+      if (!hole || cluster.last - cluster.first > hole.last - hole.first) hole = { ...cluster };
+    }
+    if (core * hopMs >= minGapMs && loud * hopMs >= minLoudMs) {
+      gaps.push({
+        atSec: (hole.at * hopMs) / 1000,
+        holeMs: (hole.last - hole.first + 1) * hopMs,
+        missingSpeechMs: swallowed * hopMs,
+        silentMs: (b - a) * hopMs,
+        pastEnd: b > sigDb.length,
+      });
+    }
+    a = b;
   }
-  close(total);
   return gaps;
 }
 
@@ -429,6 +500,46 @@ export function bandwidthHz(samples, sampleRate, { fftSize = 2048, dropDb = 60 }
   return 0;
 }
 
+/** A per-utterance delay is used when its match is clear and inside the search window. */
+const TRUST_SCORE = 0.3;
+
+/**
+ * Where each stretch of speech is due in the output, for findGaps. Each
+ * utterance is due at its own delay. An utterance that matches poorly
+ * (score below `refineBelow`) probably had its delay change partway (a
+ * stall, a jitter buffer draining): its phrases (speech between pauses of at
+ * least `pauseMs`) then get their own delays, used only when they match
+ * clearly (`acceptScore`). Falls back to the utterance's delay, then to the
+ * overall one. Tuned on simulated stalls and real read speech with dropouts:
+ * looser settings start explaining real dropouts away.
+ */
+function phraseLags(A, B, refMask, segs, utt, lagMs, { pauseMs = 200, searchMs = 1000, refineBelow = 0.8, acceptScore = 0.75 } = {}) {
+  const out = [];
+  segs.forEach((seg, k) => {
+    const base = utt[k].trusted ? utt[k].lagMs : lagMs;
+    const whole = utt[k].trusted ? [{ start: seg.start, end: seg.end, lagMs: base }] : [];
+    if (utt[k].score >= refineBelow) {
+      out.push(...whole);
+      return;
+    }
+    const phrases = utterances(refMask.subarray(seg.start, seg.end), A.hopMs, { pauseMs, minMs: 100 }).map((p) => ({
+      start: p.start + seg.start,
+      end: p.end + seg.start,
+    }));
+    if (phrases.length < 2) {
+      out.push(...whole);
+      return;
+    }
+    const found = utteranceDelays(A.db, B.db, A.hopMs, base, phrases, { searchMs, marginMs: 100 });
+    phrases.forEach((p, i) => {
+      const f = found[i];
+      const ok = f.score >= acceptScore && !f.edge;
+      if (ok || utt[k].trusted) out.push({ start: p.start, end: p.end, lagMs: ok ? f.lagMs : base });
+    });
+  });
+  return out;
+}
+
 /**
  * Everything the spike reports for one run through an engine: overall and
  * per-utterance delay, holes, level change and bandwidth.
@@ -448,9 +559,12 @@ export function analyzeRun({ ref, sig, sampleRate, maxLagMs = 2000, hopMs = 2, w
   }
   const refMask = speechMask(A.db, A.hopMs);
   const segs = utterances(refMask, A.hopMs);
-  const utt = utteranceDelays(A.db, B.db, A.hopMs, est.lagMs, segs);
-  const trusted = utt.filter((u) => u.score >= 0.3).map((u) => u.lagMs);
-  const gaps = findGaps(A.db, B.db, A.hopMs, est.lagMs);
+  const utt = utteranceDelays(A.db, B.db, A.hopMs, est.lagMs, segs).map((u) => ({
+    ...u,
+    trusted: u.score >= TRUST_SCORE && !u.edge,
+  }));
+  const trusted = utt.filter((u) => u.trusted).map((u) => u.lagMs);
+  const gaps = findGaps(A.db, B.db, A.hopMs, est.lagMs, { segLags: phraseLags(A, B, refMask, segs, utt, est.lagMs), refMask });
   const sigMask = speechMask(B.db, B.hopMs);
   const levelRefDb = maskedLevelDb(A.db, refMask);
   const levelSigDb = maskedLevelDb(B.db, sigMask);
@@ -470,7 +584,7 @@ export function analyzeRun({ ref, sig, sampleRate, maxLagMs = 2000, hopMs = 2, w
     gaps,
     gapCount: gaps.length,
     gapMissingMs: gaps.reduce((s, g) => s + g.missingSpeechMs, 0),
-    longestGapMs: gaps.reduce((m, g) => Math.max(m, g.silentMs), 0),
+    longestGapMs: gaps.reduce((m, g) => Math.max(m, g.holeMs), 0),
     speechSec: (speechFrames * A.hopMs) / 1000,
     levelRefDb,
     levelSigDb,

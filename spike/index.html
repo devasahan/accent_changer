@@ -9,7 +9,7 @@
 </head>
 <body>
   <header>
-    <h1>AccentSwitch · Step 0: is Sanas good enough?</h1>
+    <h1>Accent Changer · Step 0: is Sanas good enough?</h1>
     <p>Wear headphones. Sanas credit is used only while a step runs (about $0.009 per minute).</p>
     <p id="status" role="status" data-kind="info">Loading…</p>
   </header>
@@ -41,6 +41,9 @@
         </label>
         <label class="mock-only">Mock fails after (s)
           <input id="mockFail" type="number" min="0" step="1" placeholder="never">
+        </label>
+        <label class="mock-only">Mock start-up (ms)
+          <input id="mockConnect" type="number" value="0" min="0" max="20000" step="100">
         </label>
         <label>Microphone
           <select id="mic"></select>
@@ -92,6 +95,7 @@
 
     <section id="s-listen">
       <h2>4 · Listen and rate</h2>
+      <p id="rateFor" class="hint"></p>
       <p class="row">
         <button id="btnPlayOrig" type="button">▶ Original</button>
         <button id="btnPlayConv" type="button">▶ Converted</button>
@@ -116,7 +120,7 @@
 
     <section id="s-long">
       <h2>6 · Stability: 10 minutes without a break</h2>
-      <p>Plays your recording again and again through one Sanas connection (about $0.09 for 10 minutes).</p>
+      <p>Plays your recording again and again through one Sanas connection (about $0.09 for 10 minutes). If the connection drops, the page reconnects and counts the drop.</p>
       <p class="row">
         <label class="inline">Minutes <input id="longMinutes" type="number" value="10" min="1" max="60"></label>
         <button id="btnLong" type="button">Start</button>
@@ -128,7 +132,7 @@
 
     <section id="s-pair">
       <h2>7 · Measure another microphone (optional)</h2>
-      <p>Compares your microphone with another one, for example "CABLE Output" or "Krisp Microphone". Press the button, then say "pa-ta-ka" a few times with pauses.</p>
+      <p>Compares your microphone with another one. "CABLE Output": the page plays your microphone into VB-CABLE and measures the cable's delay. "Krisp Microphone": measures Krisp's delay. Press the button, then say "pa-ta-ka" a few times with pauses.</p>
       <p class="row">
         <label class="inline">Other microphone <select id="pairDevice"></select></label>
         <button id="btnPair" type="button">Record 12 s</button>
@@ -143,7 +147,7 @@
         <button id="btnSaveWav" type="button">Download last run (WAV)</button>
         <span id="costInfo"></span>
       </p>
-      <p class="hint">The JSON has numbers and settings only, no audio: that is the file to share. WAV files are your voice; keep them on your PC.</p>
+      <p class="hint">The JSON is the file to share. It has no audio: it holds the measurements, your ratings and notes, the settings with your device names, the browser version, the script text only if you changed it, and the page log. WAV files are your voice: keep them on your PC.</p>
       <details>
         <summary>Log</summary>
         <pre id="log"></pre>

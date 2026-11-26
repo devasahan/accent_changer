@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { CSP, startSpikeServer } from "../spike/serve.mjs";
+import { CSP, checkKey, cleanKeyInput, portFromArgs, startSpikeServer } from "../spike/serve.mjs";
 
 const KEY = "sk_test_DO_NOT_LEAK_123";
 
@@ -103,14 +103,14 @@ test("/token swaps the key for a token and never logs either", async () => {
     return new Response(JSON.stringify({ access_token: "secret-token", user_id: "u1", group_id: "g1", expires_in: 3600 }), { status: 200 });
   };
   await withServer({ getApiKey: () => KEY, fetchImpl }, async (port, logs) => {
-    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-switch": "1" } });
+    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-changer": "1" } });
     assert.equal(r.status, 200);
     assert.equal(JSON.parse(r.body).access_token, "secret-token");
     assert.equal(r.headers["access-control-allow-origin"], undefined, "no CORS for other sites");
     assert.equal(sent.url, "https://identity.sanas.ai/oauth2/api-key/login");
     assert.equal(sent.init.method, "POST");
     assert.deepEqual(JSON.parse(sent.init.body), { apiKey: KEY });
-    const again = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-switch": "1" } });
+    const again = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-changer": "1" } });
     assert.equal(again.status, 429, "second token within a second is refused");
     const joined = logs.join("\n");
     assert.ok(!joined.includes(KEY), "key must not be logged");
@@ -121,7 +121,7 @@ test("/token swaps the key for a token and never logs either", async () => {
 
 test("/token explains a missing key and an unreachable Sanas", async () => {
   await withServer({ getApiKey: () => "" }, async (port) => {
-    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-switch": "1" } });
+    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-changer": "1" } });
     assert.equal(r.status, 503);
     assert.match(JSON.parse(r.body).error, /No Sanas API key/);
     const health = await request(port, { path: "/health" });
@@ -131,7 +131,7 @@ test("/token explains a missing key and an unreachable Sanas", async () => {
     throw new TypeError("fetch failed");
   };
   await withServer({ getApiKey: () => KEY, fetchImpl: failing }, async (port, logs) => {
-    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-switch": "1" } });
+    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-changer": "1" } });
     assert.equal(r.status, 502);
     assert.match(JSON.parse(r.body).error, /Could not reach identity\.sanas\.ai/);
     assert.ok(!logs.join("\n").includes(KEY));
@@ -141,8 +141,56 @@ test("/token explains a missing key and an unreachable Sanas", async () => {
 test("passes Sanas's own error answer through (e.g. a revoked key)", async () => {
   const fetchImpl = async () => new Response(JSON.stringify({ errorCode: "UNAUTHORIZED", message: "Invalid API key" }), { status: 401 });
   await withServer({ getApiKey: () => KEY, fetchImpl }, async (port) => {
-    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-switch": "1" } });
+    const r = await request(port, { method: "POST", path: "/token", headers: { origin: `http://localhost:${port}`, "x-accent-changer": "1" } });
     assert.equal(r.status, 401);
     assert.match(r.body, /Invalid API key/);
   });
+});
+
+test("the key prompt drops escape sequences and control keys, and undoes a double paste", () => {
+  const key = "sk_live_AbC123xyz0987654321";
+  assert.deepEqual(cleanKeyInput(key), { value: key, ignored: 0, doubled: false });
+  // Classic console: Ctrl+V arrives as ^V (U+0016), then a right-click paste.
+  assert.equal(cleanKeyInput(`\u0016${key}`).value, key);
+  assert.equal(cleanKeyInput(`\u0016${key}`).ignored, 1);
+  // Bracketed paste markers and a stray arrow key.
+  assert.equal(cleanKeyInput(`\x1b[200~${key}\x1b[201~\x1b[D`).value, key);
+  assert.equal(cleanKeyInput(`${key}\x1bOA`).value, key);
+  // Windows Terminal: Ctrl+V and a right-click paste the key twice.
+  const twice = cleanKeyInput(key + key);
+  assert.equal(twice.value, key);
+  assert.equal(twice.doubled, true);
+  // Backspace deletes; spaces at the ends go.
+  assert.equal(cleanKeyInput(`  ${key}x\u007f `).value, key);
+  assert.equal(cleanKeyInput("").value, "");
+});
+
+test("the start-up key check tells accepted, refused and unknown apart", async () => {
+  const answer = (status, body) => async () => new Response(JSON.stringify(body), { status });
+  assert.deepEqual(await checkKey({ key: KEY, fetchImpl: answer(200, { access_token: "t" }) }), { ok: true });
+  assert.deepEqual(await checkKey({ key: KEY, fetchImpl: answer(401, { message: "Invalid API key" }) }), { refused: true, status: 401 });
+  assert.equal((await checkKey({ key: KEY, fetchImpl: answer(503, {}) })).unknown, true);
+  const offline = async () => {
+    throw new TypeError("fetch failed");
+  };
+  assert.match((await checkKey({ key: KEY, fetchImpl: offline })).message, /could not reach/);
+  let sent = null;
+  await checkKey({
+    key: KEY,
+    fetchImpl: async (url, init) => {
+      sent = { url, body: JSON.parse(init.body) };
+      return new Response("{}", { status: 401 });
+    },
+  });
+  assert.equal(sent.url, "https://identity.sanas.ai/oauth2/api-key/login");
+  assert.deepEqual(sent.body, { apiKey: KEY });
+});
+
+test("--port takes both spellings and refuses nonsense instead of falling back", () => {
+  assert.deepEqual(portFromArgs([], {}), { port: 8080, from: "default" });
+  assert.deepEqual(portFromArgs(["--port", "8090"], {}), { port: 8090, from: "--port" });
+  assert.deepEqual(portFromArgs(["--port=8091"], {}), { port: 8091, from: "--port" });
+  assert.deepEqual(portFromArgs([], { PORT: "9000" }), { port: 9000, from: "PORT" });
+  assert.match(portFromArgs(["--port", "eighty"], {}).error, /not a port number/);
+  assert.match(portFromArgs(["--port"], {}).error, /needs a number/);
 });

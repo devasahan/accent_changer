@@ -65,6 +65,38 @@ export function synthSpeech({ sampleRate = 48000, seconds = 12, seed = 1, leadSe
   return { samples: out, utterances, sampleRate };
 }
 
+/** An inhalation: noise shaped to about 400-4000 Hz with soft ends, peak 1. */
+export function breathNoise(sampleRate, seconds, seed = 1) {
+  const rand = rng(seed);
+  const n = Math.round(seconds * sampleRate);
+  const out = new Float32Array(n);
+  const ah = Math.exp((-2 * Math.PI * 400) / sampleRate);
+  const al = 1 - Math.exp((-2 * Math.PI * 4000) / sampleRate);
+  let hx = 0;
+  let hy = 0;
+  let lp = 0;
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const w = rand() * 2 - 1;
+    const y = ah * (hy + w - hx);
+    hx = w;
+    hy = y;
+    lp += al * (y - lp);
+    const k = i / n;
+    out[i] = lp * Math.min(1, k / 0.2, (1 - k) / 0.2);
+    peak = Math.max(peak, Math.abs(out[i]));
+  }
+  for (let i = 0; i < n; i++) out[i] /= peak || 1;
+  return out;
+}
+
+/** `x` with digital silence before and after, as the probe records a run. */
+export function padded(x, sampleRate, { leadSec = 0.15, tailSec = 2.5 } = {}) {
+  const out = new Float32Array(Math.round(leadSec * sampleRate) + x.length + Math.round(tailSec * sampleRate));
+  out.set(x, Math.round(leadSec * sampleRate));
+  return out;
+}
+
 /** Copy of `x` delayed by `delaySamples` (positive = later), same length. */
 export function delayed(x, delaySamples) {
   const out = new Float32Array(x.length);

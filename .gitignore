@@ -2,9 +2,10 @@ node_modules/
 # Secrets never go in git: keep your Sanas API key out of files here
 .env
 .env.*
-# Your voice stays on your PC: recordings and downloads from the spike
-spike/out/
+# Your voice stays on your PC: recordings from the spike (browsers save them to Downloads)
 *.wav
 *.webm
+# Spike results: share the file itself rather than committing it (it holds your device names and notes)
+sanas-check-*.json
 # Test output (headless browser runs)
 tests/browser/out/

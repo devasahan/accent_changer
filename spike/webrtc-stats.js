@@ -9,8 +9,8 @@ const peers = [];
 export const socketHosts = [];
 
 function install() {
-  if (globalThis.__accentSwitchWatch) return;
-  globalThis.__accentSwitchWatch = true;
+  if (globalThis.__accentChangerWatch) return;
+  globalThis.__accentChangerWatch = true;
   const NativePC = globalThis.RTCPeerConnection;
   if (NativePC) {
     const Watched = function RTCPeerConnection(...args) {
@@ -86,10 +86,39 @@ export async function sampleStats() {
   const rc = s.remoteCandidateId ? report.get(s.remoteCandidateId) : null;
   if (rc) s.remote = `${rc.address ?? rc.ip ?? "?"}:${rc.port ?? "?"} ${rc.protocol ?? ""}`.trim();
   const codec = s.codecId ? report.get(s.codecId) : null;
-  if (codec) s.codec = `${codec.mimeType}/${codec.clockRate}${codec.channels ? `/${codec.channels}` : ""}`;
+  if (codec) s.codec = codecLabel(codec);
   delete s.remoteCandidateId;
   delete s.codecId;
   return s;
+}
+
+/**
+ * "Opus 48 kHz", "G.722 16 kHz", "PCMU 8 kHz". G.722 carries 16 kHz audio
+ * although its RTP clock rate is 8000 by convention (RFC 3551).
+ */
+export function codecLabel({ mimeType = "", clockRate, channels } = {}) {
+  const name = mimeType.replace(/^audio\//i, "");
+  const hz = /^g722$/i.test(name) ? 16000 : clockRate;
+  const pretty = /^g722$/i.test(name) ? "G.722" : /^opus$/i.test(name) ? "Opus" : name;
+  return `${pretty}${hz ? ` ${hz / 1000} kHz` : ""}${channels > 1 ? ` (${channels} ch)` : ""}`;
+}
+
+/**
+ * Wait until the newest WebRTC connection can carry audio: ICE and DTLS
+ * connected, or packets already arriving. Resolves true, or false after
+ * `timeoutMs` or as soon as `cancel()` returns true.
+ */
+export async function waitForMedia({ timeoutMs = 15000, cancel = () => false, pollMs = 50 } = {}) {
+  const until = performance.now() + timeoutMs;
+  while (performance.now() < until) {
+    if (cancel()) return false;
+    const pc = currentPeer();
+    if (pc?.connectionState === "connected") return true;
+    const s = pc ? await sampleStats() : null;
+    if (s?.packetsReceived > 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return false;
 }
 
 /** Collects snapshots once a second until stopped; returns a summary. */

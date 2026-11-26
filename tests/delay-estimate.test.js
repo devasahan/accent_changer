@@ -13,7 +13,7 @@ import {
   speechMask,
   utterances,
 } from "../src/core/delay-estimate.js";
-import { addNoise, bandNoise, delayed, recolour, synthSpeech } from "./helpers/synth.js";
+import { addNoise, bandNoise, breathNoise, delayed, padded, recolour, rng, synthSpeech } from "./helpers/synth.js";
 
 const SR = 48000;
 const ms = (x) => Math.round((x * SR) / 1000);
@@ -153,6 +153,112 @@ test("bandwidth tells phone band, wideband and full band apart", () => {
   assert.ok(Math.abs(wide - 7000) < 400, `wide ${wide}`);
   assert.ok(full > 18000, `full ${full}`);
   assert.equal(bandwidthHz(new Float32Array(SR), SR), null);
+});
+
+test("analyzeRun: dropouts of 300 ms inside sentences are all found, and nothing else", () => {
+  for (const seed of [3, 5, 8]) {
+    const { samples, utterances: truth } = synthSpeech({ seconds: 20, seed });
+    const sig = recolour(delayed(samples, ms(240)), SR, { gainDb: -3 });
+    const rand = rng(seed);
+    const drops = [];
+    for (const u of truth) {
+      if (u.end - u.start < 0.6) continue;
+      const at = u.start + 0.15 + rand() * (u.end - u.start - 0.6);
+      drops.push(at);
+      sig.fill(0, Math.round(at * SR) + ms(240), Math.round(at * SR) + ms(240 + 300));
+    }
+    const r = analyzeRun({ ref: samples, sig, sampleRate: SR });
+    assert.equal(r.gapCount, drops.length, `seed ${seed}: ${JSON.stringify(r.gaps)}`);
+    for (const at of drops) {
+      // The reported hole is the dropout, give or take a fading syllable at either side.
+      const hit = r.gaps.some((g) => g.atSec > at - 0.1 && g.atSec + g.holeMs / 1000 < at + 0.4);
+      assert.ok(hit, `seed ${seed}: no gap inside the dropout at ${at.toFixed(2)} s`);
+    }
+  }
+});
+
+test("analyzeRun: a short take in a noisy room: the zero padding does not turn the noise into speech", () => {
+  const { samples, utterances: truth } = synthSpeech({ seconds: 12, seed: 41 });
+  const ref = padded(addNoise(samples, -45, 5), SR); // room noise well within 40 dB of the voice
+  // The converter removes the room noise (pauses go quiet) but keeps every word.
+  const sig = padded(addNoise(recolour(delayed(samples, ms(280)), SR, { gainDb: -3 }), -85, 6), SR);
+  const r = analyzeRun({ ref, sig, sampleRate: SR });
+  assert.equal(r.ok, true);
+  assert.equal(r.gapCount, 0, JSON.stringify(r.gaps));
+  assert.equal(r.utterances.length, truth.length);
+  assert.ok(r.speechSec < 0.9 * (samples.length / SR), `speech ${r.speechSec} s`);
+});
+
+test("analyzeRun: breaths the converter leaves out are not gaps and do not merge sentences", () => {
+  const { samples, utterances: truth } = synthSpeech({ seconds: 20, seed: 23 });
+  const peak = percentile(envelopeDb(samples, SR).db, 99.5);
+  const withBreaths = Float32Array.from(samples);
+  truth.forEach((u, k) => {
+    const b = breathNoise(SR, 0.3, 100 + k);
+    const gain = 10 ** ((peak - 30 - Math.max(...envelopeDb(b, SR).db)) / 20); // 30 dB under the voice
+    const at = Math.round((u.start - 0.15) * SR) - b.length; // ends 150 ms before the sentence
+    if (at < 0) return;
+    for (let i = 0; i < b.length; i++) withBreaths[at + i] += gain * b[i];
+  });
+  const ref = padded(addNoise(withBreaths, -85, 3), SR); // a quiet room: the breaths stand out
+  const sig = padded(recolour(delayed(samples, ms(300)), SR, { gainDb: -2 }), SR);
+  const r = analyzeRun({ ref, sig, sampleRate: SR });
+  assert.equal(r.gapCount, 0, JSON.stringify(r.gaps));
+  // Same sentences as the take without breaths (each line keeps its own rating row).
+  const plain = envelopeDb(padded(addNoise(samples, -85, 3), SR), SR);
+  const expected = utterances(speechMask(plain.db, plain.hopMs), plain.hopMs);
+  assert.ok(expected.length >= 8);
+  assert.deepEqual(
+    r.utterances.map((u) => u.startSec.toFixed(1)),
+    expected.map((s) => ((s.start * plain.hopMs) / 1000).toFixed(1)),
+  );
+});
+
+test("analyzeRun: sentences that come back late are late, not missing", () => {
+  const { samples, utterances: truth } = synthSpeech({ seconds: 24, seed: 29 });
+  assert.ok(truth.length >= 8);
+  const base = 240;
+  for (const extra of [250, 450]) {
+    const sig = new Float32Array(samples.length + ms(1000));
+    truth.forEach((u, k) => {
+      const d = ms(base + (k >= 3 && k <= 5 ? extra : 0)); // a jitter buffer that grew for three sentences
+      const a = Math.max(0, Math.round((u.start - 0.05) * SR));
+      const b = Math.min(samples.length, Math.round((u.end + 0.05) * SR));
+      for (let i = a; i < b; i++) sig[i + d] += samples[i];
+    });
+    const ref = new Float32Array(sig.length);
+    ref.set(samples);
+    const r = analyzeRun({ ref, sig, sampleRate: SR });
+    assert.equal(r.gapCount, 0, `+${extra} ms: ${JSON.stringify(r.gaps)}`);
+    assert.ok(Math.abs(r.delayMaxMs - (base + extra)) <= 10, `+${extra} ms: max ${r.delayMaxMs}`);
+    assert.ok(Math.abs(r.delayMedianMs - base) <= 10, `+${extra} ms: median ${r.delayMedianMs}`);
+  }
+});
+
+test("analyzeRun: a clipped sentence end is reported at its own length, where it happened", () => {
+  const { samples, utterances: truth } = synthSpeech({ seconds: 16, seed: 31 });
+  const lag = 240;
+  const sig = delayed(samples, ms(lag));
+  const u = truth.find((x, k) => k > 0 && x.end - x.start > 0.9);
+  const from = u.end - 0.35;
+  sig.fill(0, Math.round(from * SR) + ms(lag), Math.round(u.end * SR) + ms(lag));
+  const r = analyzeRun({ ref: samples, sig, sampleRate: SR });
+  assert.equal(r.gapCount, 1, JSON.stringify(r.gaps));
+  assert.ok(r.longestGapMs >= 150 && r.longestGapMs <= 380, `longest ${r.longestGapMs} (the pause after it is not part of it)`);
+  assert.ok(Math.abs(r.gaps[0].atSec - from) < 0.15, `at ${r.gaps[0].atSec} vs ${from}`);
+});
+
+test("findGaps: a click inside a hole does not hide it", () => {
+  const { samples, utterances: truth } = synthSpeech({ seconds: 16, seed: 31 });
+  const lag = 240;
+  const sig = delayed(samples, ms(lag));
+  const long = truth.find((u) => u.end - u.start > 0.9);
+  const cut = Math.round((long.start + 0.25) * SR) + ms(lag);
+  sig.fill(0, cut, cut + ms(300));
+  for (let i = 0; i < ms(4); i++) sig[cut + ms(150) + i] = i % 2 ? 0.5 : -0.5;
+  const A = envelopeDb(samples, SR);
+  const B = envelopeDb(sig, SR);
+  assert.equal(findGaps(A.db, B.db, A.hopMs, lag).length, 1);
 });
 
 test("analyzeRun reports why when nothing came back", () => {
