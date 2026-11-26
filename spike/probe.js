@@ -967,8 +967,10 @@ function followCall(ctx, rec) {
       f.delays.push(f.last.lagMs);
       f.heard.push(secs);
     }
+    // The last 3 s, or what there is of it at the start (the first look comes
+    // before 3 s have arrived, and your first words would be missed).
     const last3 = Math.round(ctx.sampleRate * 3);
-    const tail = ref.length >= last3 ? ref.subarray(ref.length - last3) : null;
+    const tail = ref.length >= ctx.sampleRate ? ref.subarray(Math.max(0, ref.length - last3)) : null;
     if (tail && rmsDb(tail) > SPEECH_DB) {
       f.speech.push(secs);
       f.sound.push(soundSec(tail, ctx.sampleRate, SPEECH_DB));
