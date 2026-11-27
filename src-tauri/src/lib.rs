@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::webview::{PermissionKind, PermissionResponse};
-use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, LogicalSize, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 
 use keystore::{clean_key, tail, KeyStore, OsKeyStore};
@@ -219,6 +219,20 @@ pub fn run() {
                 .title("Accent Changer")
                 .inner_size(820.0, 680.0)
                 .min_inner_size(520.0, 480.0)
+                // Never taller or wider than the screen's free area (the screen
+                // without the taskbar) less a margin, and in its middle: on a
+                // laptop screen with large scaling (1366 x 768 at 125 %, 1920 x
+                // 1080 at 150 %) 820 x 680 would put the bottom of the page,
+                // Copy results, under the taskbar. Set here, as the window is
+                // made: a later size or position call goes through tao and would
+                // hide the window again after a quiet re-show (window.rs).
+                .prevent_overflow_with_margin(LogicalSize::new(window::SCREEN_MARGIN, window::SCREEN_MARGIN))
+                .center()
+                // Not in screen sharing, recordings or screenshots (the plan's
+                // "every window is hidden from screen capture"): step 2 shows the
+                // devices' real names. Windows' WDA_EXCLUDEFROMCAPTURE, set by tao
+                // as the window is made, before it is first shown.
+                .content_protected(true)
                 .on_navigation(move |url| {
                     if is_app_url(url) {
                         return true;

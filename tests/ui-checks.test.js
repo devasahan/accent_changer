@@ -6,7 +6,7 @@
 // page elements are faked, just enough for the view.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { CHECKS_TEXTS, ChecksView, delayKind, delayText, gateItem, hideText, longDone, longProgressText } from "../src/ui/checks.js";
+import { CHECKS_TEXTS, ChecksView, againText, delayKind, delayText, gateItem, hideText, longDone, longProgressText } from "../src/ui/checks.js";
 
 /** A page element as the view uses it: text, children, dataset. */
 function element(doc, tag = "") {
@@ -43,16 +43,17 @@ function page() {
   return { view: new ChecksView({ $ }), $ };
 }
 
-test("gateItem: each status has its mark and its colour (✓ ok, ✗ error, … info, ! warn)", () => {
+test("gateItem: each status has its mark and its colour (✓ ok, ✗ error, ☐ info, ! warn)", () => {
   const rows = [
     [{ row: "Secure page", status: "pass", text: "The app's page is a secure page." }, "✓ · Secure page · The app's page is a secure page.", "ok"],
     [{ row: "Voice into CABLE Input", status: "fail", text: "Refused." }, "✗ · Voice into CABLE Input · Refused.", "error"],
-    [{ row: "Connect only", status: "todo", text: "Press it." }, "… · Connect only · Press it.", "info"],
+    // To do: an empty box, as on a paper checklist ("…" read like a text that was cut off).
+    [{ row: "Connect only", status: "todo", text: "Press it." }, "☐ · Connect only · Press it.", "info"],
     [{ row: "Delay at most 120 ms", status: "note", text: "Close." }, "! · Delay at most 120 ms · Close.", "warn"],
   ];
   for (const [row, text, kind] of rows) assert.deepEqual(gateItem(row), { text, kind }, row.status);
   // Anything else is shown as not done yet, never as passed.
-  assert.deepEqual(gateItem({ row: "X", status: "maybe", text: "?" }), { text: "… · X · ?", kind: "info" });
+  assert.deepEqual(gateItem({ row: "X", status: "maybe", text: "?" }), { text: "☐ · X · ?", kind: "info" });
 });
 
 test("renderGate: the checklist shows every row with its mark and data-kind", () => {
@@ -67,7 +68,7 @@ test("renderGate: the checklist shows every row with its mark and data-kind", ()
   assert.deepEqual(items, [
     ["ok", "✓ · Secure page · Yes."],
     ["error", "✗ · Connect only · No."],
-    ["info", "… · Zoom's Test Mic hears you · Your note."],
+    ["info", "☐ · Zoom's Test Mic hears you · Your note."],
     ["warn", "! · Delay at most 120 ms · Close."],
   ]);
 });
@@ -99,25 +100,80 @@ test("longDone: passed is green; a setting to change is yellow; not passed and n
     lines: [...lines, "A note."],
     kind: "ok",
   });
+  // One colon only: the verdict in brackets, then its reasons.
   assert.deepEqual(longDone({ verdict: "fix-setting", reasons: ["The tone came in at −16.0 dB."], lines: [] }), {
-    head: "Long check done: needs a setting change: The tone came in at −16.0 dB.",
+    head: "Long check done (needs a setting change): The tone came in at −16.0 dB.",
     lines: [],
     kind: "warn",
   });
   assert.deepEqual(longDone({ verdict: "fail", reasons: ["The sound stopped once.", "Too many clicks."], lines }), {
-    head: "Long check done: not passed: The sound stopped once. Too many clicks.",
+    head: "Long check done (not passed): The sound stopped once. Too many clicks.",
     lines,
     kind: "error",
   });
   assert.equal(longDone({ verdict: "no-signal", reasons: ["The test tone never arrived."] }).kind, "error");
-  assert.equal(longDone({ verdict: "no-signal", reasons: [] }).head, "Long check done: nothing measured:");
-  // The view: the head, then each line; the kind it returns is the status line's.
+  assert.equal(longDone({ verdict: "no-signal", reasons: [] }).head, "Long check done (nothing measured): Run this check again.");
+});
+
+test("ChecksView.longDone: only the verdict line takes the verdict's colour; the lines after it do not", () => {
+  // "Gaps: none." in red after a fail, or "Volume: steady" in yellow, read as faults of their own.
   const { view, $ } = page();
-  assert.equal(view.longDone({ verdict: "fail", reasons: ["The sound stopped once."], lines: ["Gaps: 1 (300 ms)."] }), "error");
-  assert.equal($("longInfo").textContent, "Long check done: not passed: The sound stopped once.\nGaps: 1 (300 ms).");
-  assert.equal($("longInfo").dataset.kind, "error");
-  assert.equal(view.longDone({ verdict: "pass", reasons: [], lines: [] }), "ok");
-  assert.equal($("longInfo").dataset.kind, "ok");
+  const info = $("longInfo");
+  assert.equal(view.longDone({ verdict: "fail", reasons: ["The sound stopped once."], lines: ["Gaps: 1 (300 ms).", "Volume: steady at −12.0 dB."] }), "error");
+  assert.equal(info.textContent, "Long check done (not passed): The sound stopped once.\nGaps: 1 (300 ms).\nVolume: steady at −12.0 dB.");
+  assert.equal(info.dataset.kind, undefined, "the paragraph itself has no colour");
+  const [head, ...rest] = info.children;
+  assert.equal(head.tag, "span");
+  assert.equal(head.dataset.kind, "error");
+  assert.equal(head.textContent, "Long check done (not passed): The sound stopped once.");
+  assert.deepEqual(
+    rest.map((n) => [n.tag, n.dataset.kind]),
+    [["br", undefined], ["#text", undefined], ["br", undefined], ["#text", undefined]],
+  );
+  for (const [verdict, kind] of [["pass", "ok"], ["fix-setting", "warn"], ["no-signal", "error"]]) {
+    assert.equal(view.longDone({ verdict, reasons: [], lines: ["Gaps: none."] }), kind, verdict);
+    assert.equal(info.children[0].dataset.kind, kind, verdict);
+    assert.equal(info.dataset.kind, undefined, verdict);
+  }
+  // A progress line or a failure to start is one line, as before.
+  view.longProgress({ mode: "tone", elapsedSec: 1, totalSec: 15, phase: "visible", phasesSoFar: {}, levelDb: -12 });
+  assert.equal(info.children.length, 1);
+  assert.equal(info.dataset.kind, undefined);
+  view.longFailed("The long check could not start its recorder.");
+  assert.equal(info.dataset.kind, "error");
+});
+
+test("U13: a check that measured nothing or ended early says what to do next, once", () => {
+  const toneLost = "The test tone stopped (Windows' default playback device went away or failed), so the check ended early.";
+  // The hour-long tone check is Session B step 7; the check with your voice is step 8.
+  assert.equal(againText({ mode: "tone", minutesAsked: 65, verdict: "no-signal", reasons: ["The test tone never reached “CABLE Output”."] }), "Do Session B step 7 again.");
+  assert.equal(againText({ mode: "tone", minutesAsked: 65, verdict: "fail", reasons: [toneLost, "Gaps: 1."] }), "Do Session B step 7 again.");
+  assert.equal(againText({ mode: "mic", minutesAsked: 5, verdict: "no-signal", reasons: ["Your voice never reached “CABLE Output”."] }), "Do Session B step 8 again.");
+  assert.equal(againText({ mode: "tone", minutesAsked: 30, verdict: "fail", reasons: [toneLost] }), "Run this check again.");
+  // The runtime's own record of an early end counts as well.
+  assert.equal(againText({ mode: "tone", minutesAsked: 65, verdict: "fail", reasons: ["The sound stopped once."], endedEarly: { why: "cable-ended", note: "x" } }), "Do Session B step 7 again.");
+  // A check that ran to its end (or the user stopped) has nothing more to say.
+  assert.equal(againText({ mode: "tone", minutesAsked: 65, verdict: "fail", reasons: ["The sound stopped once."] }), null);
+  assert.equal(againText({ mode: "tone", minutesAsked: 65, verdict: "pass", reasons: [] }), null);
+  assert.equal(againText({ mode: "tone", minutesAsked: 65, verdict: "fix-setting", reasons: ["Quieter."] }), null);
+
+  assert.equal(
+    longDone({ mode: "tone", minutesAsked: 65, verdict: "no-signal", reasons: ["The test tone never reached “CABLE Output”."] }).head,
+    "Long check done (nothing measured): The test tone never reached “CABLE Output”. Do Session B step 7 again.",
+  );
+  assert.equal(
+    longDone({ mode: "tone", minutesAsked: 65, verdict: "fail", reasons: [toneLost, "The sound stopped once."] }).head,
+    `Long check done (not passed): ${toneLost} The sound stopped once. Do Session B step 7 again.`,
+  );
+  // Said once: a reason that already says it (the runtime's own early-end text, say) is not repeated.
+  const said = "“CABLE Output” stopped recording (did Windows Audio restart?), so the check ended early. Do Session B step 7 again.";
+  const head = longDone({ mode: "tone", minutesAsked: 65, verdict: "fail", reasons: [said] }).head;
+  assert.equal(head, `Long check done (not passed): ${said}`);
+  assert.equal(head.match(/again/g).length, 1);
+  // The result's own reasons are left as they were.
+  const result = { mode: "mic", minutesAsked: 5, verdict: "no-signal", reasons: ["Nothing reached “CABLE Output”: it carried only digital silence."] };
+  longDone(result);
+  assert.equal(result.reasons.length, 1);
 });
 
 test("longProgressText: the tone check's line, and the check with the microphone's (drop-outs, no tone)", () => {
@@ -134,13 +190,20 @@ test("longProgressText: the tone check's line, and the check with the microphone
   };
   assert.equal(longProgressText(p), "Long check: 12:30 of 30:00 · now minimized · minimized so far 10:02 · hidden so far 0:00 · tone −12.0 dB · clicks 1 · gaps 0");
   assert.equal(
-    longProgressText({ ...p, levelDb: null }),
+    longProgressText({ ...p, levelDb: null, locked: false }),
     "Long check: 12:30 of 30:00 · now minimized · minimized so far 10:02 · hidden so far 0:00 · tone not found yet · clicks 1 · gaps 0",
   );
+  // A tone that was found and is gone now (a gap) is lost, not "not found yet".
+  assert.equal(
+    longProgressText({ ...p, levelDb: null, locked: true, gaps: 1 }),
+    "Long check: 12:30 of 30:00 · now minimized · minimized so far 10:02 · hidden so far 0:00 · tone lost now · clicks 1 · gaps 1",
+  );
+  assert.match(longProgressText({ ...p, levelDb: -12, locked: true }), / · tone −12\.0 dB · /);
   // Extended by a Hide: the total goes past the hour.
   assert.match(longProgressText({ ...p, totalSec: 4350, phase: "hidden" }), /^Long check: 12:30 of 1:12:30 · now hidden · /);
   const mic = { ...p, mode: "mic", phase: "visible", phasesSoFar: { visibleSec: 3, minimizedSec: 0, hiddenSec: 0 }, elapsedSec: 3, totalSec: 15, levelDb: null, dropouts: 2, gaps: 1 };
-  assert.equal(longProgressText(mic), "Long check: 0:03 of 0:15 · now open · minimized so far 0:00 · hidden so far 0:00 · dropouts 2 · gaps 1");
+  // "drop-outs", as every other text of the page spells it.
+  assert.equal(longProgressText(mic), "Long check: 0:03 of 0:15 · now open · minimized so far 0:00 · hidden so far 0:00 · drop-outs 2 · gaps 1");
   assert.ok(!/tone|clicks/.test(longProgressText(mic)));
   assert.equal(longProgressText({ analysing: true, analysingSec: 5 }), "Analysing (about 5 s)…");
   assert.equal(longProgressText(null), "");

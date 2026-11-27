@@ -2,7 +2,7 @@
 
 A small personal Windows tool. While you speak in an interview on Zoom, Teams or Meet, your microphone is converted live from an Indian-English accent to a US accent, in your own voice. It will use Sanas Accent Translation (AT5.2) and the free VB-CABLE virtual microphone.
 
-**Status: Step 0.** Before the app is built, this repo's test page compares three options on your laptop:
+**Status: Step 2.** The app's test build for [Session B](#session-b-your-voice-into-the-meeting-2-to-3-hours) sends your microphone into VB-CABLE, a free virtual cable, so that Zoom, Teams or Meet can use it, and checks that this works on your laptop. The converted voice comes in later steps. This repo's test page (Parts 1 and 2) compares three options on your laptop:
 
 - Sanas cloud: the engine our app would use.
 - The Sanas desktop app: ready-made, with a 7-day free trial.
@@ -16,10 +16,10 @@ Results so far: [spike/FINDINGS.md](spike/FINDINGS.md).
 2. **Part 2, 5–6 days before your interview** (about 2 hours): try Krisp and the Sanas desktop app with the same page, and ask a friend for a short blind listening test.
 3. **Your interview:** follow [INTERVIEW.md](INTERVIEW.md) with the app that passes its bar. Our own app can't be ready in time.
 4. **When I say the app's test build is ready** (about 15 minutes, any day): [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes) below.
-5. **When I say the Session B build is ready** (about 2 hours in all, about 50 minutes of it with you): [Session B](#session-b-your-voice-into-the-meeting-about-2-hours) below.
+5. **When I say the Session B build is ready** (about 2¼ hours in all, about 80 minutes of it with you; about 35 minutes more if its step 7.6 is needed): [Session B](#session-b-your-voice-into-the-meeting-2-to-3-hours) below.
 6. **Send me the results file** after every sitting.
 
-Two rules for every sitting:
+Two rules for every sitting with the test page (Parts 1 and 2; the app in Sessions A2 and B has **Copy results** instead):
 
 - **Download results (JSON) before you close the page.** Runs, ratings and notes live only in the open page. Each file has its own time stamp, so send all of them.
 - **Keep the page open in its own tab until you have downloaded.** Don't reload it, and open other sites (Zoom, Meet) in a new tab (Ctrl+T). The page remembers your script text, model name, sample rate and devices, but not your recording, runs, ratings or notes. Once it holds any of them, Edge asks "Leave site?" or "Reload site?" every time you leave or reload the page, even right after a download. If a step is still running, choose **Cancel**. If you changed anything since you last downloaded the results (a run, a rating, a blind-test count or a note), choose **Cancel** and download first. Otherwise choose **Leave** (or **Reload**).
@@ -172,50 +172,64 @@ When I tell you the test build is ready:
 
 To uninstall later: Windows Settings → Apps → Installed apps (Windows 10: Apps & features) → Accent Changer → Uninstall (in Windows 11, under its **…** button). To remove the key too, open the app first and press **Remove key**.
 
-## Session B: your voice into the meeting (about 2 hours)
+## Session B: your voice into the meeting (2 to 3 hours)
 
-Do this when I tell you the Session B build is ready. It takes about 2 hours in all: the long check runs by itself for an hour, and about 50 minutes need you. This build sends your microphone into VB-CABLE, a free virtual cable, so that Zoom, Teams or Meet can use "CABLE Output" as your microphone. It uses no Sanas minutes.
+Do this when I tell you the Session B build is ready. It takes about 2¼ hours in all: the long check runs by itself for an hour, and about 80 minutes need you. If step 7.6 is needed, it adds about 35 minutes, about 5 of them with you. This build sends your microphone into VB-CABLE, a free virtual cable, so that Zoom, Teams or Meet can use "CABLE Output" as your microphone. It uses no Sanas minutes.
 
 **You need:** the laptop on its charger, your wired or USB headset plugged in, Zoom installed, Google Meet in Edge, your phone (for a timer), and an hour in which the laptop does nothing heavy.
 
-**Before you start:** Windows Settings → System → Power & battery → **Screen and sleep** (on newer Windows 11: **Screen, sleep, & hibernate timeouts**) → "When plugged in, put my device to sleep after" → **Never**. Set it back afterwards. The screen may still turn off: that is fine.
+**Before you start** (3 min): Windows Settings → System → Power & battery → **Screen and sleep** (on newer Windows 11: **Screen, sleep, & hibernate timeouts**) → "When plugged in, put my device to sleep after" → **Never**. On Windows 10: Windows Settings → System → **Power & sleep** → "When plugged in, PC goes to sleep after" → **Never**. Note what it said before, so you can set it back at the end (step 12). The screen may still turn off: that is fine. **Keep the laptop open** until the end: closing the lid puts it to sleep even with this setting, and a sleep spoils the long check (step 7).
 
-1. **Install VB-CABLE** (10 min). In Edge, open vb-audio.com/Cable and download the Windows "VBCABLE_Driver_Pack" zip. Right-click it → **Extract All** → **Extract**. In the new folder, right-click **VBCABLE_Setup_x64** → **Run as administrator** → **Yes** → **Install Driver** → **OK**. Restart Windows. (Running it from inside the zip fails.)
+1. **Install VB-CABLE** (10 min). In Edge, open vb-audio.com/Cable and download the Windows "VBCABLE_Driver_Pack" zip. In Edge's list of downloads (Ctrl+J opens it), click the folder icon next to the file (**Show in folder**), then right-click the zip → **Extract All** → **Extract**, as in Session A2, step 3. In the new folder, right-click **VBCABLE_Setup_x64** → **Run as administrator** → **Yes** → **Install Driver** → **OK**. Restart Windows. (Running it from inside the zip fails.)
 2. **Windows sound settings** (10 min). Press Windows key + R, type `mmsys.cpl` and press Enter.
-   1. **Playback:** right-click your headset → **Set as Default Device**, and again → **Set as Default Communication Device**. CABLE Input must not have the green tick.
+   1. **Playback:** right-click your headset → **Set as Default Device**, and again → **Set as Default Communication Device**. CABLE Input must have neither the green tick nor the green phone sign.
    2. **Playback:** right-click **CABLE Input** → **Properties** → **Advanced** → Default Format "2 channel, 24 bit, 48000 Hz" (or 16 bit, 48000 Hz) → **OK**.
-   3. **Recording:** make your headset microphone the default device and the default communication device. CABLE Output must have neither tick. Right-click **CABLE Output** → **Properties** → **Advanced** → 48000 Hz as above. Then the **Listen** tab: "Listen to this device" must be unticked → **OK**.
+   3. **Recording:** make your headset microphone the default device and the default communication device. CABLE Output must have neither the green tick nor the green phone sign. Right-click **CABLE Output** → **Properties** → **Advanced** → 48000 Hz as above. Then the **Listen** tab: "Listen to this device" must be unticked → **OK**.
    4. **Communications** tab → **Do nothing** → **OK**.
 3. **Remove the old test build, then install the new one** (7 min).
-   1. Windows Settings → Apps → Installed apps → **Accent Changer** → **…** → **Uninstall** → **Uninstall**. In the window that opens, tick **Delete the application data**, then press **Uninstall**. This makes the next start a true first start, like on your friend's PC. Your Sanas key stays saved: it lives in Windows Credential Manager. (No Accent Changer in the list? Skip this.)
+   1. Windows Settings → Apps → Installed apps → **Accent Changer** → **…** → **Uninstall** → **Uninstall**. On Windows 10: Windows Settings → Apps → Apps & features → **Accent Changer** → **Uninstall** → **Uninstall**. In the window that opens, tick **Delete the application data**, then press **Uninstall**. This makes the next start a true first start, like on your friend's PC. Your Sanas key stays saved: it lives in Windows Credential Manager. (No Accent Changer in the list? Skip this.)
    2. Install the new build as in [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes), steps 2 and 3, from the link I send.
 4. **Open the app three times** (5 min). Open Accent Changer, look at the page, and close it with the X. Do this three times in all, and leave the third one open. **Each time, note whether Windows or the app asked anything.** The first time matters most. On the page:
    - step 1 says "Secure page: yes";
    - step 2 is green: "Your voice goes into “CABLE Input”…", and shows "off / off / off";
-   - step 2 shows no yellow warnings. If it does, do what they say, then press **Check the microphone**.
+   - step 2 shows no warnings: lines in brown or yellow under the two bars. If it does, do what they say, then press **Check the microphone**.
 
-   Speak: the "Your microphone" and "Going to the meeting" bars move. (The true first start on your friend's PC is checked again when they install it.)
-5. **Zoom's microphone test** (5 min). Zoom → Settings → Audio: Microphone **CABLE Output (VB-Audio Virtual Cable)**, Speaker your headset. Untick "Automatically adjust microphone volume". Press **Test Mic**, say a sentence and listen to the playback. Note: did you hear yourself?
+   Speak: the "Your microphone" and "Going to the meeting" bars move. If you can't reach the bottom of the page (**Copy results**, in step 6 of the page), maximize the window: double-click its title bar. (The true first start on your friend's PC is checked again when they install it.)
+5. **Zoom's microphone test** (6 min). Zoom → Settings → Audio: Microphone **CABLE Output (VB-Audio Virtual Cable)**, Speaker your headset. Untick "Automatically adjust microphone volume" (note whether it was ticked). Press **Test Mic**, say a sentence and listen to the playback. Note: did you hear yourself? Then **set Zoom back** for your other calls: Microphone your headset, and "Automatically adjust microphone volume" as it was. CABLE Output carries your voice only while Accent Changer is open.
 6. **Measure the delay** (2 min). In step 3 of the page, press **Measure the delay**, then say "pa-ta-ka" over and over until it stops (12 seconds). Note the number.
-7. **The long check** (about 70 min; you are needed at the start, after 30 minutes and at the end).
-   1. In the app: Long check → Send **a test tone**, Minutes **65** → **Start the long check**. From now on the meeting hears a steady tone instead of you: that is expected. (Starting it before the meeting lets the app notice if Windows turns the sound down when the meeting starts.)
-   2. In Edge, go to meet.google.com → **New meeting** → **Start an instant meeting**. In the meeting: **⋮** → **Settings** → **General** → turn **Leave empty calls** off. Otherwise Meet ends a call in which you are alone after a few minutes. Then **Audio** → Microphone **CABLE Output (VB-Audio Virtual Cable)**, Speaker your headset. Keep the meeting open, with the camera on or off. If you can't find "Leave empty calls", join the same meeting from your phone instead, with the phone's microphone and sound off, and leave the phone there.
-   3. Minimize the app (the – at the top right). Set a 30-minute timer on your phone.
-   4. After 30 minutes: check that the Meet tab still shows the meeting (if it ended, note the time). Click the app in the taskbar and press **Hide the app for 30 minutes**. It disappears. It comes back by itself after 30 minutes, without jumping in front of other windows: look for it on the taskbar. (To bring it back sooner, open it from the Start menu.)
-   5. When it is back, check that the Meet tab still shows the meeting (if it ended, note it). Wait until the long check says **done** (about 2 minutes after the app comes back), and note its result line. **Still in the meeting**, press **Measure the delay** and say "pa-ta-ka" until it stops: this shows how the delay grew during the hour, and whether the meeting made Windows turn the sound down. Then leave the meeting.
-   6. **Only if it says "too many clicks":** step 2 → Advanced → Output route **Through an audio element (test)**. Press **Measure the delay** again. Run the long check again with Minutes **30** (no meeting needed; the app can stay open). Then set Output route back to **Automatic**.
-8. **A short check with your voice** (7 min). Long check → Send **your microphone**, Minutes **5** → **Start the long check**. Minimize the app and read anything aloud (a news article) with normal pauses for 5 minutes. Then open the app and note the result.
-9. **Restart Windows Audio** (5 min). Start → type `services` → right-click **Services** → **Run as administrator** → **Yes**. Find **Windows Audio** → right-click → **Restart**. If Windows asks whether to restart other services too, press **Yes**. Then look at step 2 → **Recoveries**, and wait until a new line appears there (up to 30 seconds). It should say that your voice came back, and after how long. If it says "waiting for you" instead, do what step 2 says, and note it. Speak: the bars move again.
+7. **The long check** (about 75 min; you are needed at the start, after 30 minutes and at the end).
+   1. In the app: Long check → Send **a test tone**, Minutes **65** → **Start the long check**. From now on the meeting hears a steady tone instead of you: that is expected. (Starting it before the meeting lets the app notice if Windows turns the sound down when the meeting starts.) Until the check says **done**, don't press your headset's mute button: the check would count that as your microphone stopping.
+   2. In Edge, go to meet.google.com → **New meeting** → **Start an instant meeting**. If Edge asks whether Meet may use your microphone and camera, allow it. In the meeting: **⋮** → **Settings** → **General** → turn **Leave empty calls** off. Otherwise Meet ends a call in which you are alone after a few minutes. Then **Audio** → Microphone **CABLE Output (VB-Audio Virtual Cable)**, Speaker your headset. Keep the meeting open, with the camera on or off. If you can't find "Leave empty calls", join the same meeting from your phone as well: on the laptop, **Meeting details** (the ⓘ at the bottom right) → **Copy joining info**, and send that to your phone (an e-mail to yourself). Open the link on the phone, join with the phone's microphone and camera off, press **Admit** on the laptop, and leave the phone there with its sound down.
+   3. Minimize the app (the – at the top right). Set a 30-minute timer on your phone. Leave the laptop open and plugged in.
+   4. After 30 minutes: check that the Meet tab still shows the meeting (if it ended, note the time). Click the app in the taskbar and press **Hide the app for 30 minutes**. It disappears. It comes back by itself after 30 minutes, without jumping in front of other windows: look for it on the taskbar. If it isn't back after 32 minutes, open it from the Start menu and note the time. Open it sooner only if you must (and note the time): the check needs the 30 minutes.
+   5. When it is back, check that the Meet tab still shows the meeting (if it ended, note it). Wait until the long check says **done** (about 2 minutes after the app comes back), and note its first line:
+      - **Ended early**, or **nothing measured**: note why. Finish this step, then do step 7 again once, from 7.1. If that happens again, go on and tell me.
+      - **Passed**: go on.
+      - **Needs a setting change**: do what it says, note it, and go on. Tell me in your message before you run the hour again.
+      - **Not passed** for another reason: note the reasons. If they start with "Too many clicks", do step 7.6 after this step.
+
+      **Still in the meeting**, press **Measure the delay** and say "pa-ta-ka" until it stops: this shows how the delay grew during the hour, and whether the meeting made Windows turn the sound down. Then **set Meet back** for your other calls: **⋮** → **Settings** → **Audio** → Microphone your headset, and **General** → **Leave empty calls** on again (if you turned it off). Then leave the meeting. Press **Copy results** in the app and paste them into your message (don't send it yet): if the app closes by mistake later, the hour's results are not lost.
+   6. **Only if it said "Too many clicks":** step 2 → **Advanced** → Output route **Through an audio element (test)**. Press **Measure the delay** again. Run the long check again with Minutes **30** (no meeting needed; the app can stay open; again, no mute button). Then set Output route back to **Automatic**.
+8. **A short check with your voice** (7 min). Long check → Send **your microphone**, Minutes **5** → **Start the long check**. Minimize the app and read anything aloud (a news article) with normal pauses for 5 minutes, without pressing your headset's mute button. Then open the app and note the first line of the result.
+9. **Restart Windows Audio** (6 min). First press **Copy results** and paste them into your message, under the earlier ones. Then: Start → type `services` → right-click **Services** → **Run as administrator** → **Yes**. Find **Windows Audio** → right-click → **Restart**. If Windows asks whether to restart other services too, press **Yes**. Then look at step 2 → **Recoveries**, and wait until a new line appears there (up to 30 seconds). It should say that your voice came back, and after how long. If it says "waiting for you" instead, do what step 2 says, and note it. Speak: the bars move again.
 10. **Connect only** (1 min) in step 5 of the page.
-11. **Copy results** and paste them into your message, with your notes from steps 4, 5, 7.4 and 7.5 (and anything odd, with the time). Do not close the app before you have pasted them. The "Session B checklist" in step 3 shows what passed. Also send the log file: press Windows key + R, paste the line below and press Enter:
+11. **Copy results** (5 min) and paste them into your message, under the earlier ones: this last copy holds everything. Add your notes from steps 4, 5, 6, 7.4, 7.5, 8 and 9 (and anything odd, with the time). Do not close the app before you have pasted them. The "Session B checklist" in step 3 of the page shows what passed. Also send the log file: press Windows key + R, paste the line below and press Enter:
 
     ```
     %LOCALAPPDATA%\io.github.devasahan.accentchanger\logs
     ```
 
     Attach **Accent Changer.log** from the folder that opens. It holds the first start's timings and the permission answers, and no device names.
+12. **Set things back** (2 min). Set the sleep setting back as you noted it (Before you start). Zoom and Meet are already back on your headset (steps 5 and 7.5). You can close Accent Changer now.
 
-**If I ask you to compare with Edge** (only then): start the test server as in Part 1, step 2, open http://localhost:8080/src/ in Edge, press **Start** if step 2 of the page shows it, and do steps 6 to 8 there. Instead of Hide, minimize the Edge window.
+**If I ask you to compare with Edge** (only then; about 1½ hours, with the laptop plugged in and open, and the sleep setting on **Never** as in Before you start):
+
+1. **Close Accent Changer** (the X at the top right) if it is open, once its results are pasted (step 11). While it is open it keeps sending your microphone into CABLE Input, and Windows would mix that into the Edge page's sound.
+2. **Download the code again** as in [Before you start](#before-you-start-once), step 2, or from the link I send, into a new folder: the copy you downloaded then doesn't have this page. Open a terminal in the new folder (step 3 there).
+3. **Start the test server** as in Part 1, step 2. This comparison uses no Sanas: when it asks for the key, just press Enter. It then says only the Mock engine will work, which is fine.
+4. **Open** http://localhost:8080/src/ in Edge (not `/spike/`, which the server names). If Edge asks to use your microphone, allow it. Press **Start** if step 2 of the page shows it, and check that step 2 is green.
+5. **Do Session B steps 6, 7 and 8 above on that page**, with three changes. In step 7.2, open Meet in a new Edge window (Ctrl+N), not in a new tab. Edge has no Hide: in step 7.3, minimize the window with the test page and set the timer to 65 minutes, and skip step 7.4. When the timer rings, open that window again and go on with step 7.5. The checklist judges an Edge run on the time the page was not on screen, because Edge can't tell minimized from hidden.
+6. **Press Copy results** on that page and paste them into your message, under the app's. Then close the test page's window (while it is open, it too sends your microphone into CABLE Input), stop the server with Ctrl+C, and set the sleep setting back.
 
 ## Troubleshooting
 
@@ -241,17 +255,22 @@ Do this when I tell you the Session B build is ready. It takes about 2 hours in 
 | Step 7: the other microphone "is silent" or "stayed silent" | The app must be running, with your headset as its microphone and accent conversion on. Some apps convert only while a call app uses their microphone: the page counts as one. |
 | Accent Changer (the test build) doesn't open, or closes at once | Send me its log file: see [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes), step 4. |
 | Session B: step 2 says VB-CABLE is not installed | Do Session B step 1 again, then restart Windows. |
-| Zoom's Test Mic plays nothing | In Zoom the microphone must be CABLE Output, and the app must be open with step 2 green. |
+| Session B step 5: Zoom's Test Mic plays nothing | In Zoom the microphone must be CABLE Output, and the app must be open with step 2 green. |
+| After Session B, nobody hears me in Zoom or Meet | The meeting app still uses CABLE Output, which carries your voice only while Accent Changer is open. Pick your headset as the microphone: in a Zoom call, the **^** next to Mute; in Meet, the arrow next to the microphone button. |
 | I hear myself all the time | "Listen to this device" on CABLE Output is ticked: see Session B step 2.3. |
-| The meeting hears a tone | The long check is running (that is expected), or it was stopped early: press **Stop and check**. |
+| The meeting hears a tone | The long check is running: that is expected until it says done. Only if you need your own voice back sooner, press **Stop and check**: the check then ends early, and step 7 must be done again. |
 | The app came back, but I can't see it | It is behind the meeting window: click it on the taskbar. |
 | Meet left the call by itself | "Leave empty calls" was on (Session B step 7.2). Note the time, and do step 7 again if I ask. |
+| The laptop went to sleep, or its lid was closed, during Session B step 7 | Note the time, and do step 7 again with the laptop plugged in and open (Session B, Before you start). |
+| A screenshot or a screen share shows what is behind the app, or a black area | That is on purpose: the app's window is left out of screen captures, because step 2 shows your devices' names. Send me **Copy results** instead. |
 
 ## Privacy
 
 - **API key, test page (Parts 1 and 2):** only in the test server's memory. It never reaches the browser, the disk or the logs.
 - **API key, app (Session A2):** you paste it once into the app's page. The app checks it with Sanas and keeps it in Windows Credential Manager until you press **Remove key**. It is never written to the app's log or to the results; the page shows only its last 4 characters.
-- **Session B results and log:** they hold no device ids. Device names are hidden, except VB-CABLE's own names and Windows' generic ones such as "Headset Microphone". The log holds codes and numbers only.
+- **Session B results and log:** they hold no device ids. Device names are hidden, except VB-CABLE's own names and Windows' generic ones such as "Headset Microphone". The log holds state names, codes, timings and short error sentences: never a device name, a device id, a key or a token.
+- **Session B settings, on this PC only:** the microphone and the output you pick in step 2 of the app's page are kept, with their Windows names and ids, in `%LOCALAPPDATA%\io.github.devasahan.accentchanger\settings.json` (in Edge dev mode, in Edge's storage for the page). They never leave the PC and are not in the results or the log. Uninstalling with **Delete the application data** removes them, the log, and the microphone permission the app keeps in its own WebView2 folder there.
+- **Screen captures:** the app's window is left out of screen sharing, recordings and screenshots, because step 2 shows your devices' names.
 - **Audio:** goes to Sanas Cloud (Ohio or Mumbai). Sanas says it is processed in real time and not stored.
 - **Krisp and the Sanas desktop app:** their vendors say accent conversion runs on your laptop. Their meeting-notes features upload transcripts, so keep those off.
 - **Recordings and downloads:** stay on your PC (your Downloads folder). If you copy them into this folder, `.gitignore` keeps WAV files and `sanas-check-*.json` results out of git.

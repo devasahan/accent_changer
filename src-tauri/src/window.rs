@@ -29,6 +29,11 @@
 //! window by itself. The timed re-show of `window_hide_for` is the one
 //! exception to the plan's "the app never opens a window by itself", for
 //! Session B's check only.
+//!
+//! Every window the app makes (the main one in lib.rs; Step 5's status pill)
+//! is built with `content_protected(true)`, so no screen share, recording or
+//! screenshot shows it, and gets its size and place in its builder
+//! (`prevent_overflow_with_margin`, `center`), never through a later tao call.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -41,6 +46,10 @@ use crate::AppState;
 
 /// The app's one window (built in lib.rs `setup`).
 pub const MAIN_WINDOW: &str = "main";
+
+/// Space kept free around the main window when the screen's free area is
+/// smaller than the window (logical pixels, in all: half above, half below).
+pub const SCREEN_MARGIN: f64 = 24.0;
 
 /// Which Hide is the current one. Every Hide arms a new generation; a timer
 /// shows the window again only while its own generation is still current,

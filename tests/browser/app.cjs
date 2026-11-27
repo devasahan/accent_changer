@@ -214,8 +214,14 @@ async function devMode(browser, base, CHECK_TEXTS, VOICE_TEXTS) {
       `${r0.voice?.state}: ${await text("#voiceStatus")}`,
     );
     check(
-      (await page.locator("#outSelect option").first().textContent()) === "Automatic: not found",
+      (await page.locator("#outSelect option").first().textContent()) === VOICE_TEXTS.autoMissing && /CABLE Input not found/.test(VOICE_TEXTS.autoMissing),
       "the output list says CABLE Input was not found",
+    );
+    // U18: the status says VB-CABLE is not installed yet; the warnings under it do not say it again.
+    check(
+      !(await page.locator("#voiceWarnings li").allTextContents()).includes(await text("#voiceStatus")),
+      "step 2 says it once: the warnings do not repeat the status line",
+      await text("#voiceWarnings"),
     );
     check(r0.settings?.source === "none", "no settings saved yet", json(r0.settings));
     check(lines.includes("settings none") && lines.includes("state no-cable"), "the log (the developer console here) says so in codes", lines.join("\n"));
@@ -778,7 +784,7 @@ async function passthrough(app) {
   check(r.voice.debug?.contexts === 1 && r.voice.debug?.micSources === 1, "one audio context and one microphone source", json(r.voice.debug));
   check(/Your voice goes into “CABLE Input”/.test(await text("#voiceStatus")), "step 2 says where the voice goes", await text("#voiceStatus"));
   check((await page.locator("#voiceStatus").getAttribute("data-kind")) === "ok", "and is green while the voice runs");
-  check(/the app's audio engine/.test(await text("#voiceInfo")), "and how it is sent", await text("#voiceInfo"));
+  check(/Sent through\s*the normal route/.test(await text("#voiceInfo")), "and how it is sent, in plain words", await text("#voiceInfo"));
 
   // What Gate 1 reads from voice (spec §6.5, §10, §12): the open times (no mic prompt), VB-CABLE's endpoint names
   // and rates, the route's latencies, and the microphone's holes.
@@ -978,6 +984,32 @@ async function keyFlows(app) {
 const DELAY_KIND = { good: "ok", borderline: "warn", slow: "error", unclear: "warn", "silent-mic": "warn", "silent-cable": "error" };
 // The colour of a long check's verdict (spec §6.3: "Long check done." takes the verdict's kind).
 const LONG_KIND = { pass: "ok", "fix-setting": "warn", fail: "error", "no-signal": "error" };
+
+/**
+ * A long check's result in step 3: its verdict line has the verdict's colour,
+ * and its other lines ("Gaps: none.", "Volume: steady …") the page's own text
+ * colour, as the computed styles show them (U19).
+ */
+async function onlyTheVerdictLineIsColoured(page, what) {
+  const c = await page.evaluate(() => {
+    const info = document.querySelector("#longInfo");
+    const verdict = info.querySelector(".verdict");
+    const color = (el) => getComputedStyle(el).color;
+    return {
+      kind: info.getAttribute("data-kind"),
+      first: info.firstChild === verdict,
+      lines: info.querySelectorAll("br").length,
+      verdict: verdict ? color(verdict) : null,
+      rest: color(info),
+      text: color(document.body),
+    };
+  });
+  check(
+    c.kind === null && c.first && c.lines >= 1 && c.rest === c.text && c.verdict !== c.text,
+    `${what}: only its verdict line is coloured; the lines after it are in the page's text colour`,
+    json(c),
+  );
+}
 
 async function measureDelay(app) {
   const { page, results, text, press, status, statusKind } = app;
@@ -1297,7 +1329,11 @@ async function headsetLost(app) {
   });
   let r = await waitResults((x) => x.voice?.mic?.standIn === true && x.voice?.state === "running", 3000);
   check(r.voice?.mic?.standIn === true, "the headset is unplugged: a stand-in microphone within 3 s", json(r.voice?.mic));
-  check((await text("#voiceWarnings")).includes("is not connected, so the app uses"), "step 2 says which microphone stands in", await text("#voiceWarnings"));
+  check(
+    (await text("#voiceStatus")).includes("is not connected, so the app uses") && !(await text("#voiceWarnings")).includes("is not connected, so the app uses"),
+    "step 2 says which microphone stands in, once (in its status line, not again in the warnings)",
+    `${await text("#voiceStatus")} | ${await text("#voiceWarnings")}`,
+  );
   check((await voiceKind()) === "warn", "and its status is yellow while a stand-in is used", await voiceKind());
   check((await app.page.$eval("#micSelect", (s) => s.selectedOptions[0]?.textContent ?? "")).endsWith("(for now)"), "the list shows the stand-in (for now)");
   // The stand-in's warning names both microphones on the page; the copied results must not.
@@ -1500,13 +1536,14 @@ async function longTone(app) {
   check(L.verdict === "fail" && L.reasons.some((x) => /sound stopped/.test(x)), "the gap fails the check", json(L.reasons));
   note(`ticks per 30 min: tone ${L.tonePath?.ticksPer30Min}, microphone ${L.micPath?.ticksPer30Min} (not asserted: fake clocks)`);
   const done = await text("#longInfo");
-  check(done.startsWith("Long check done: not passed:") && done.includes("Gaps: 1"), "step 3 says why it did not pass, with its lines", done);
-  const kinds = [await statusKind(), await page.locator("#longInfo").getAttribute("data-kind")];
+  check(done.startsWith("Long check done (not passed):") && done.includes("Gaps: 1"), "step 3 says why it did not pass, with its lines", done);
+  const kinds = [await statusKind(), await page.evaluate(() => document.querySelector("#longInfo .verdict")?.getAttribute("data-kind") ?? null)];
   check(
     (await status()) === "Long check done." && same(kinds, ["error", "error"]) && LONG_KIND[L.verdict] === "error",
-    "the check that did not pass is red, in the status line and in step 3",
+    "the check that did not pass is red, in the status line and in step 3's verdict line",
     `${await status()} ${json(kinds)}`,
   );
+  await onlyTheVerdictLineIsColoured(page, "the tone check");
   const toneGone = await waitText("#voiceStatus", "test tone", { present: false, timeout: 3000 });
   const back = await waitResults((x) => x.voice?.state === "running", 3000);
   check(toneGone && back.voice?.state === "running", "the voice is back on the cable afterwards (the test source removed)", await text("#voiceStatus"));
@@ -1532,7 +1569,7 @@ async function longMic(app) {
   await page.waitForFunction(() => /^Long check: /.test(document.querySelector("#longInfo").textContent), null, { timeout: 5000 });
   const running = await text("#longInfo");
   check(
-    /^Long check: \d+:\d\d of \d+:\d\d · now \w+ · minimized so far \d+:\d\d · hidden so far \d+:\d\d · dropouts \d+ · gaps \d+$/.test(running) &&
+    /^Long check: \d+:\d\d of \d+:\d\d · now \w+ · minimized so far \d+:\d\d · hidden so far \d+:\d\d · drop-outs \d+ · gaps \d+$/.test(running) &&
       !/tone|clicks/.test(running),
     "the check with the microphone shows its own progress (drop-outs; no tone, no clicks)",
     running,
@@ -1548,12 +1585,13 @@ async function longMic(app) {
   note(`shorter drop-outs: ${drops.filter((d) => d.ms < 200).length} (reported only)`);
   check([0, 1].includes(L.speech?.gaps?.length), "at most one gap in the speech", json(L.speech?.gaps));
   check(L.recordedSec >= 14 && L.recordedSec <= 17, "it recorded about 15 s and ended by itself", `${L.recordedSec}`);
-  const kinds = [await statusKind(), await page.locator("#longInfo").getAttribute("data-kind")];
+  const kinds = [await statusKind(), await page.evaluate(() => document.querySelector("#longInfo .verdict")?.getAttribute("data-kind") ?? null)];
   check(
     (await status()) === "Long check done." && Boolean(LONG_KIND[L.verdict]) && same(kinds, [LONG_KIND[L.verdict], LONG_KIND[L.verdict]]),
-    "its result takes its verdict's colour, in the status line and in step 3",
+    "its result takes its verdict's colour, in the status line and in step 3's verdict line",
     `${L.verdict}: ${json(kinds)}`,
   );
+  await onlyTheVerdictLineIsColoured(page, "the check with the microphone");
 }
 
 // ---- 12 · Hide ----
@@ -1578,7 +1616,7 @@ async function hide(app) {
 async function routeChoice(app) {
   const { results, waitResults, peak, press, choose, text } = app;
   const methods = (r) => (r.voice?.output?.tried ?? []).map((t) => t.method);
-  await app.page.click("details.advanced summary"); // "Advanced (only if I ask)"
+  await app.page.click("details.advanced summary"); // "Advanced (only when the README or I ask)"
   await choose("#routeSelect", "element", /Output route switched/);
   let r = await waitResults((x) => x.voice?.state === "running" && x.voice.output?.method === "element", 5000);
   check(
@@ -1604,7 +1642,7 @@ async function routeChoice(app) {
   );
   const row = r.gate.find((g) => g.row === "Delay at most 120 ms");
   check(row && row.text.includes("not counted"), "the checklist lists it without counting it", row?.text);
-  check(/an audio element \(fallback\)/.test(await text("#voiceInfo")), "step 2 says how the voice is sent", await text("#voiceInfo"));
+  check(/a slower backup route/.test(await text("#voiceInfo")), "step 2 says how the voice is sent, in plain words", await text("#voiceInfo"));
   await choose("#routeSelect", "auto", /Output route switched/);
   r = await waitResults((x) => x.voice?.state === "running" && x.voice.output?.method === "context", 5000);
   check(r.voice?.output?.method === "context" && r.voice.output.routePreference === "auto", "back to the app's audio engine", json(r.voice?.output?.method));
@@ -1700,7 +1738,7 @@ async function copyResults(app) {
   );
   // Step 3's checklist and results.gate, read together (one render draws both): each item is "mark · row · text"
   // with the mark and colour of its status (spec §6.1; typed here, not taken from the page's code).
-  const MARKS = { pass: ["✓", "ok"], fail: ["✗", "error"], todo: ["…", "info"], note: ["!", "warn"] };
+  const MARKS = { pass: ["✓", "ok"], fail: ["✗", "error"], todo: ["☐", "info"], note: ["!", "warn"] };
   const listed = await page.evaluate(() => ({
     gate: JSON.parse(document.querySelector("#results").textContent).gate,
     items: [...document.querySelectorAll("#gateList li")].map((li) => [li.dataset.kind, li.textContent]),
@@ -1877,7 +1915,7 @@ async function sinkFallbacks(app) {
   check((await permissionCalls()) === 0, "(a) the permission fix is not needed");
   check(r.voice?.output?.contextSink === "mic-sibling", "(a) the graph's context runs on the headset's earpiece", r.voice?.output?.contextSink);
   await nothingOnTheEarpiece("(a)");
-  check(/an audio element \(fallback\)/.test(await text("#voiceInfo")), "(a) step 2 says so", await text("#voiceInfo"));
+  check(/a slower backup route/.test(await text("#voiceInfo")), "(a) step 2 says so", await text("#voiceInfo"));
   // Chromium names the device in the refusal ("access to the device <64-hex id> is not permitted."): kept, id hidden.
   check(
     tried[0]?.errorMessage === "access to the device [redacted] is not permitted." && !/[0-9a-f]{64}/i.test(await text("#results")),
@@ -1910,7 +1948,7 @@ async function sinkFallbacks(app) {
   check((await permissionCalls()) === 1, "(b) the permission fix ran once");
   p = await peak(1500);
   check(p > 0.01, "(b) the voice reaches the cable", `peak ${p}`);
-  check(/\+ the permission fix/.test(await text("#voiceInfo")), "(b) step 2 says the permission fix was used", await text("#voiceInfo"));
+  check(/the normal route, after a permission fix/.test(await text("#voiceInfo")), "(b) step 2 says the permission fix was used", await text("#voiceInfo"));
 
   // (c) both refused, the permission fix answers but changes nothing
   await setFlags({ refuseContextSink: true, refuseElementSink: true });

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "What the app's own page may call: Tauri's core APIs. The app's key and token commands are its own.",
+  "description": "What the app's own page may call besides the app's own commands (key, token, settings, window, permission, log), which need no capability: nothing. Add only what a page calls, never core:default (window, path, menu, tray and event calls the page does not use).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": []
 }

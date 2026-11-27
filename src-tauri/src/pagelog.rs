@@ -187,6 +187,22 @@ mod tests {
     }
 
     #[test]
+    fn what_only_the_page_hides() {
+        // clean_line is the second layer. A short token after "access_token="
+        // or "token:", and a base64 key that + or / split into runs under 32
+        // characters, pass it unchanged: the page's redact() (src/core/redact.js,
+        // used by both shells' log()) is what hides them, and
+        // tests/platform.test.js checks that it does.
+        for line in [
+            "csp connect-src https://x.example/cb?access_token=abc123def",
+            "sanas token: 0123456789abcdef0123",
+            "key AbCdEfGh12345678+IjKlMnOp87654321/QrStUvWx",
+        ] {
+            assert_eq!(clean_line(line), line);
+        }
+    }
+
+    #[test]
     fn levels() {
         assert_eq!(level_of("warn"), log::Level::Warn);
         assert_eq!(level_of("error"), log::Level::Error);
