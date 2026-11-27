@@ -159,6 +159,19 @@ async fn sanas_token(state: State<'_, AppState>) -> Result<String, String> {
     state.broker.token(&key).await
 }
 
+/// The log file's settings, for run() and a test. The plugin's default
+/// deletes the whole file at 40 kB, which a Session B with the page's lines
+/// could reach, losing the first start's lines. Here a full file (1 MB) is
+/// kept as one older file, named with the date, and a new file starts; the
+/// older file before it is deleted. So the log holds at most about 2 MB.
+/// KeepSome counts the older files only.
+fn log_settings() -> tauri_plugin_log::Builder {
+    tauri_plugin_log::Builder::new()
+        .level(log::LevelFilter::Info)
+        .max_file_size(1_000_000)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(1))
+}
+
 pub fn run() {
     // A failed start (WebView2 can't start, say) ends in a panic, and the
     // installed app has no console to show it on. So panics also go to the log:
@@ -175,16 +188,7 @@ pub fn run() {
         // First, so a second launch only brings the running app forward (and
         // ends a "Hide" early: the Start menu is the user's way back).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show_for_user(app)))
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                // The plugin's default deletes the whole file at 40 kB, which a
-                // Session B with the page's lines could reach, losing the first
-                // start's lines. Keep up to 1 MB, and the file before it.
-                .max_file_size(1_000_000)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(2))
-                .build(),
-        )
+        .plugin(log_settings().build())
         .plugin(tauri_plugin_opener::init())
         .on_permission_request(|webview, kind| permission_for(webview.url().ok(), kind))
         .invoke_handler(tauri::generate_handler![
@@ -269,6 +273,43 @@ mod tests {
         assert_eq!(build_stamp(Some(""), Some(" ")), "local", "set but empty counts as not set");
         assert_eq!(build_stamp(Some("main"), None), "main");
         assert_eq!(build_stamp(None, sha), "1a2b3c4");
+    }
+
+    #[test]
+    fn the_log_keeps_its_file_and_one_older_file() {
+        use log::Log as _;
+        use tauri_plugin_log::{Target, TargetKind};
+        // The app's log settings, writing to a test folder. The logger does not
+        // become the global one, so the other tests' lines stay out of it.
+        let dir = std::env::temp_dir().join(format!("accent-changer-test-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = tauri::test::mock_app();
+        let folder = TargetKind::Folder { path: dir.clone(), file_name: Some("Accent Changer".into()) };
+        let (_, _, logger) = log_settings().clear_targets().target(Target::new(folder)).split(app.handle()).unwrap();
+        // 3.5 MB in lines of 100 kB: the file fills up three times.
+        let line = "x".repeat(100_000);
+        for _ in 0..35 {
+            logger.log(&log::Record::builder().level(log::Level::Info).args(format_args!("{line}")).build());
+        }
+        logger.flush();
+        // Close the file first: Windows may list an open file with an old size,
+        // and cannot remove a folder with an open file in it.
+        drop(logger);
+        let mut files: Vec<(String, u64)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                (path.file_name().unwrap().to_string_lossy().into_owned(), std::fs::metadata(&path).unwrap().len())
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        files.sort();
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), 2, "the file and one older file: {names:?}");
+        assert_eq!(names[0], "Accent Changer.log");
+        assert!(names[1].starts_with("Accent Changer_") && names[1].ends_with(".log"), "{names:?}");
+        assert!(files.iter().all(|&(_, bytes)| bytes <= 1_000_000), "at most 1 MB each: {files:?}");
+        assert!(files[1].1 > 900_000, "the older file was full (1 MB, not the plugin's 40 kB): {files:?}");
     }
 
     #[test]

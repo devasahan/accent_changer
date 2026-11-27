@@ -63,7 +63,9 @@ pub fn read_settings(path: &Path) -> Result<Option<String>, String> {
 
 /// Replace the settings file with `json` (a JSON object). The new text goes
 /// to a temporary file in the same folder first and is then renamed over
-/// `settings.json`, which replaces it in one step on Windows too.
+/// `settings.json`, which replaces it in one step on Windows too. Every save
+/// has its own temporary file, so two saves never write into one, even
+/// without the lock.
 pub fn write_settings(path: &Path, json: &str) -> Result<(), String> {
     if json.len() > MAX_BYTES {
         return Err("The settings are too big to save.".to_string());
@@ -155,7 +157,7 @@ pub async fn settings_save(app: AppHandle, state: State<'_, AppState>, json: Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     /// A new, empty folder under the system's temporary folder; removed on drop.
     struct TempDir(PathBuf);
@@ -331,10 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn every_save_gets_its_own_temporary_name() {
+    fn temp_path_gives_every_call_its_own_name() {
         let dir = Path::new("app-data");
         let (first, second) = (temp_path(dir, FILE_NAME), temp_path(dir, FILE_NAME));
-        assert_ne!(first, second, "two saves never write the same temporary file");
+        assert_ne!(first, second, "two calls never get the same temporary file");
         let prefix = format!("{FILE_NAME}.{}-", std::process::id());
         for temp in [&first, &second] {
             assert_eq!(temp.parent(), Some(dir), "next to settings.json, so the rename stays on one drive");
@@ -342,6 +344,35 @@ mod tests {
             let n = name.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(".tmp"));
             assert!(n.is_some_and(|n| n.parse::<u64>().is_ok()), "settings.json.<pid>-<n>.tmp: {name}");
         }
+    }
+
+    #[test]
+    fn saves_without_the_lock_never_share_a_temporary_file() {
+        // Two saves at the same time without the lock, as a later Rust feature
+        // that forgets the lock (or a second process) would make. Each save
+        // writes its own temporary file, so both work. If saves shared one
+        // temporary name, one save would empty or rename away the other's
+        // temporary file, and that save would fail.
+        let dir = TempDir::new("no-lock");
+        let path = Arc::new(dir.file());
+        let start = Arc::new(Barrier::new(2));
+        let a = r#"{"micLabel":"first writer"}"#;
+        let b = r#"{"micLabel":"second writer, a longer text"}"#;
+        let writers: Vec<_> = [a, b]
+            .into_iter()
+            .map(|json| {
+                let (path, start) = (Arc::clone(&path), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..200).filter(|_| write_settings(&path, json).is_err()).count()
+                })
+            })
+            .collect();
+        let failed: usize = writers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(failed, 0, "every save works");
+        let text = read_settings(&path).unwrap().unwrap();
+        assert!(text == a || text == b, "{text}");
+        assert!(dir.temps().is_empty(), "{:?}", dir.temps());
     }
 
     #[test]
