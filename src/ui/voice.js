@@ -12,7 +12,7 @@
  * Text goes in through textContent only. Nothing touches the page when this
  * module is imported: main.js makes the view once the page has loaded.
  */
-import { headphonesFor, pseudoTarget, reportLabel, siblingOutput, virtualOutputs } from "../core/device-choice.js";
+import { PSEUDO_IDS, headphonesFor, pseudoTarget, reportLabel, siblingOutput, virtualOutputs } from "../core/device-choice.js";
 import { isCableInput, isCableOutput } from "../core/devices-match.js";
 import { restartVerdict } from "../core/cable-check.js";
 import { captureLatencyMs } from "../audio/measure.js";
@@ -20,7 +20,7 @@ import { captureLatencyMs } from "../audio/measure.js";
 /** Texts of this part of the page (plain English, no device names). */
 export const VOICE_TEXTS = Object.freeze({
   autoCable: "Automatic: CABLE Input",
-  autoMissing: "Automatic: not found",
+  autoMissing: "Automatic: CABLE Input not found",
   forNow: " (for now)",
   noName: "(no name)",
   notYet: "not yet",
@@ -29,7 +29,9 @@ export const VOICE_TEXTS = Object.freeze({
   cableFound: "installed (CABLE Input found)",
   cableMissing: "not installed yet (needed for Session B)",
   slowOpen: " (slow: did a question appear?)",
-  permissionFix: " + the permission fix",
+  normalRoute: "the normal route",
+  backupRoute: "a slower backup route",
+  permissionFix: ", after a permission fix",
   bringingBack: "bringing it back…",
   waitingForYou: "waiting for you (see step 2)",
   notReaching: " Your voice is not reaching the meeting yet: see step 2.",
@@ -75,7 +77,6 @@ const CAUSE_WORDS = Object.freeze({
   "change-failed": "the change you made did not work",
 });
 
-const PSEUDO_IDS = ["default", "communications"];
 const LEVEL_FLOOR_DB = -60;
 const MAX_LOG_LINES = 20;
 
@@ -108,10 +109,15 @@ export function kHz(hz) {
 /** A processing switch as the page shows it: false → "off"; true or a mode such as "all" → "ON". */
 const offText = (v) => (v === false ? "off" : v === true || (typeof v === "string" && v) ? "ON" : VOICE_TEXTS.unknown);
 
-/** The route method in words: "the app's audio engine", "an audio element (fallback)", "… + the permission fix". */
+/**
+ * The route method in plain words: "the normal route" (the app's own audio
+ * context on CABLE Input), "a slower backup route" (an audio element), and
+ * ", after a permission fix" when WebView2's saved permission had to be set
+ * first. Only the results keep the method's own name.
+ */
 export function routeWords(method) {
   if (typeof method !== "string" || !method) return VOICE_TEXTS.notYet;
-  const base = method.startsWith("element") ? "an audio element (fallback)" : "the app's audio engine";
+  const base = method.startsWith("element") ? VOICE_TEXTS.backupRoute : VOICE_TEXTS.normalRoute;
   return method.endsWith("-after-permission") ? base + VOICE_TEXTS.permissionFix : base;
 }
 
@@ -344,6 +350,8 @@ export class VoiceView {
     el.textContent = info.text;
     el.dataset.kind = info.kind;
     this.$("btnStartVoice").hidden = info.state !== "needs-gesture";
+    // The status can become a warning's own text (no VB-CABLE, a stand-in microphone), or stop being it.
+    this.renderWarnings();
   }
 
   /**
@@ -479,10 +487,18 @@ export class VoiceView {
     this.$("outMeter").value = level(levels?.outPeakDb);
   }
 
+  /**
+   * The warnings under the meters, except one that step 2's status line
+   * already says word for word (no VB-CABLE yet; a stand-in microphone): each
+   * sentence once. The results keep every warning.
+   */
   renderWarnings() {
     const ul = this.$("voiceWarnings");
     const doc = ul.ownerDocument;
-    ul.replaceChildren(...this.graph.warnings.map((w) => Object.assign(doc.createElement("li"), { textContent: w.text })));
+    const status = this.graph.stateInfo?.text ?? null;
+    const all = Array.isArray(this.graph.warnings) ? this.graph.warnings : [];
+    const shown = all.filter((w) => w.text !== status);
+    ul.replaceChildren(...shown.map((w) => Object.assign(doc.createElement("li"), { textContent: w.text })));
   }
 
   /** The microphone, its processing and rate, the route, the rates and the delay on the way out. */
@@ -599,7 +615,17 @@ export class VoiceView {
       state: g.state,
       since: this.since,
       processor: out?.processor ?? null,
-      start: start ? { ms: roundTo(start.ms), attempts: start.attempts, steps: (start.steps ?? []).slice() } : null,
+      // The launch's first start, with its own microphone open time and label unlock: a later reopen (after a
+      // fault, a stand-in, a change) replaces mic.openedInMs below, never these.
+      start: start
+        ? {
+            ms: roundTo(start.ms),
+            attempts: start.attempts,
+            steps: (start.steps ?? []).slice(),
+            openedInMs: isNum(start.openedInMs) ? start.openedInMs : null,
+            unlockMs: isNum(start.unlockMs) ? start.unlockMs : isNum(mic?.unlockMs) ? mic.unlockMs : null,
+          }
+        : null,
       mic: mic
         ? {
             label: reportLabel(mic.entry?.label),

@@ -12,8 +12,11 @@ import {
   choiceState,
   recoveryLine,
   recoveryResult,
+  routeWords,
 } from "../src/ui/voice.js";
 import { restartVerdict } from "../src/core/cable-check.js";
+import { deviceWarnings } from "../src/core/device-choice.js";
+import { redactObject } from "../src/core/redact.js";
 
 /** A page element as the view uses it: text, children, dataset. */
 function element(doc) {
@@ -32,6 +35,9 @@ function element(doc) {
     replaceChildren(...nodes) {
       this.children = nodes;
       this.text = "";
+    },
+    append(...nodes) {
+      this.children.push(...nodes.map((n) => (typeof n === "string" ? Object.assign(element(doc), { text: n }) : n)));
     },
   };
 }
@@ -423,4 +429,155 @@ test("follow: a choice is not settled by the graph's events before the graph has
   assert.equal(outcome, undefined);
   g.output = { entry: { deviceId: "cable-in" }, how: "saved-id", routePreference: "auto" };
   assert.equal(choice.answered(), "taken");
+});
+
+// ---------- what step 2 shows, and what the results keep ----------
+
+/**
+ * A stand-in graph for results(): a personal word ("Zelda") in every device
+ * name and a 64-hex id for every device, as on a PC where the user renamed
+ * their devices (VB-CABLE's endpoints and a Voicemeeter output included).
+ */
+function personalGraph() {
+  const hex = (c) => c.repeat(64);
+  const mic = { deviceId: hex("a"), groupId: hex("1"), kind: "audioinput", label: "Headset (Zelda's AirPods Hands-Free AG Audio)" };
+  const laptop = { deviceId: hex("b"), groupId: hex("2"), kind: "audioinput", label: "Microphone Array (Zelda's laptop)" };
+  const cableOut = { deviceId: hex("c"), groupId: hex("3"), kind: "audioinput", label: "Zelda cable (VB-Audio Virtual Cable)" };
+  const cableIn = { deviceId: hex("d"), groupId: hex("3"), kind: "audiooutput", label: "Zelda speakers (VB-Audio Virtual Cable)" };
+  const ear = { deviceId: hex("e"), groupId: hex("1"), kind: "audiooutput", label: "Headphones (Zelda's AirPods Stereo)" };
+  const snapshot = {
+    labelsVisible: true,
+    inputs: [{ deviceId: "default", groupId: hex("1"), kind: "audioinput", label: `Default - ${mic.label}` }, mic, laptop, cableOut],
+    outputs: [{ deviceId: "default", groupId: hex("1"), kind: "audiooutput", label: `Default - ${ear.label}` }, ear, cableIn],
+    usable: [mic, laptop],
+    cableIn,
+    cableOut,
+    defaultInputLabel: `Default - ${mic.label}`,
+    defaultOutputLabel: `Default - ${ear.label}`,
+    commsInputLabel: `Communications - ${mic.label}`,
+    commsOutputLabel: `Communications - ${ear.label}`,
+    cableEndpoints: [cableOut.label, cableIn.label],
+  };
+  const warnInput = {
+    micLabel: laptop.label,
+    savedMicLabel: mic.label,
+    standIn: true,
+    outputFound: true,
+    savedOutputMissing: true,
+    savedOutputLabel: "Zelda's Voicemeeter (VB-Audio Voicemeeter VAIO)",
+  };
+  return {
+    state: "running",
+    stateInfo: { state: "running", text: "x", kind: "ok" },
+    snapshot,
+    mic: {
+      entry: laptop,
+      how: "stand-in",
+      standIn: true,
+      settings: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRateHz: 48000 },
+      openedInMs: 40,
+      unlockMs: 120,
+      mutedCount: 0,
+      track: { readyState: "live", stats: null, getSettings: () => ({}) },
+    },
+    output: {
+      entry: cableIn,
+      how: "saved-id",
+      method: "element",
+      routePreference: "auto",
+      tried: [
+        { method: "context", ok: false, errorName: "NotAllowedError", errorMessage: `access to the device ${hex("d")} is not permitted.` },
+        { method: "element", ok: true },
+      ],
+      routeChanges: [],
+      contextSink: "mic-sibling",
+    },
+    rates: { defaultOutputHz: 48000, cableInputHz: 48000 },
+    startRecord: { ms: 100, attempts: 1, steps: ["rebuild"] },
+    levels: { micHolesTotal: 0 },
+    recoveries: [],
+    debugCounts: () => ({ contexts: 1, micSources: 1, taps: 0, routed: true }),
+    warningsWith: (nameOf) => deviceWarnings(warnInput, nameOf),
+    get warnings() {
+      return deviceWarnings(warnInput);
+    },
+  };
+}
+
+test("U11: no device name or id reaches the results, whatever the user named their devices", () => {
+  const { v, $ } = view(personalGraph());
+  v.started();
+  const copied = JSON.stringify(redactObject({ microphone: v.microphoneCheck(), voice: v.results() }));
+  // As "Copy results" gives them (main.js renders them through redactObject).
+  assert.doesNotMatch(copied, /zelda|airpods/i);
+  assert.doesNotMatch(copied, /[0-9a-f]{64}/i);
+  // Every field that holds a name is there, masked: the renamed CABLE Input is still known as VB-CABLE's.
+  const voice = JSON.parse(copied).voice;
+  assert.equal(voice.output.label, "[renamed] (VB-Audio Virtual Cable)");
+  assert.deepEqual(voice.devices.cableEndpoints, ["[renamed] (VB-Audio Virtual Cable)", "[renamed] (VB-Audio Virtual Cable)"]);
+  assert.ok(voice.mic.label && voice.warnings.length >= 2, copied);
+  // The page itself (it stays on this PC) shows the real names.
+  assert.match($("micInfo").textContent, /Zelda's laptop/);
+});
+
+test("U12: the results keep the launch's first microphone open, whatever reopens came later", () => {
+  const { v } = view(personalGraph());
+  const g = v.graph;
+  // The graph's first start, with that start's own open and unlock times (the latest reopen took 40 ms).
+  g.startRecord = { ms: 812.4, attempts: 2, steps: ["rebuild", "rebuild"], openedInMs: 2100, unlockMs: 340 };
+  assert.deepEqual(v.results().start, { ms: 812, attempts: 2, steps: ["rebuild", "rebuild"], openedInMs: 2100, unlockMs: 340 });
+  assert.equal(v.results().mic.openedInMs, 40, "mic keeps the latest open");
+  // A graph that does not keep the first open: the open time is not known, never the latest one.
+  g.startRecord = { ms: 812.4, attempts: 1, steps: ["rebuild"] };
+  assert.deepEqual(v.results().start, { ms: 812, attempts: 1, steps: ["rebuild"], openedInMs: null, unlockMs: 120 });
+  g.startRecord = null;
+  assert.equal(v.results().start, null);
+});
+
+test("U15: step 2 names the route in plain words", () => {
+  assert.equal(routeWords("context"), "the normal route");
+  assert.equal(routeWords("element"), "a slower backup route");
+  assert.equal(routeWords("context-after-permission"), "the normal route, after a permission fix");
+  assert.equal(routeWords("element-after-permission"), "a slower backup route, after a permission fix");
+  assert.equal(routeWords(null), VOICE_TEXTS.notYet);
+  const { v, $ } = view(personalGraph());
+  v.renderInfo();
+  const shown = $("voiceInfo").textContent;
+  assert.match(shown, /Sent througha slower backup route/);
+  assert.doesNotMatch(shown, /audio element|fallback|\+/);
+});
+
+test("U18: step 2 says each sentence once: a warning that is the status line is not listed under it", () => {
+  const { v, $ } = view(personalGraph());
+  const g = v.graph;
+  const warnings = g.warnings;
+  const standIn = warnings.find((w) => w.code === "STAND_IN");
+  assert.ok(standIn && warnings.length >= 2, JSON.stringify(warnings));
+  // Running on a stand-in microphone: the status line is the STAND_IN warning's own text.
+  g.stateInfo = { state: "running", text: standIn.text, kind: "warn", code: "STAND_IN" };
+  v.renderStatus();
+  assert.equal($("voiceStatus").textContent, standIn.text);
+  const listed = () => $("voiceWarnings").children.map((li) => li.textContent);
+  assert.deepEqual(listed(), warnings.filter((w) => w.code !== "STAND_IN").map((w) => w.text));
+  // The same on a warnings event.
+  v.renderWarnings();
+  assert.ok(!listed().includes(standIn.text));
+  // Once the status line says something else, the warning is listed again.
+  g.stateInfo = { state: "running", text: "Your voice goes into “CABLE Input”.", kind: "ok" };
+  v.onState({ state: "running" });
+  assert.ok(listed().includes(standIn.text));
+  // The results keep every warning.
+  g.stateInfo = { state: "running", text: standIn.text, kind: "warn", code: "STAND_IN" };
+  assert.ok(v.results().warnings.some((w) => w.code === "STAND_IN"));
+});
+
+test("U22: without CABLE Input the output list says what it did not find", () => {
+  const { v, $ } = view(personalGraph());
+  const g = v.graph;
+  v.renderSelects();
+  assert.equal($("outSelect").children[0].textContent, "Automatic: CABLE Input");
+  g.snapshot = { ...g.snapshot, cableIn: null, outputs: g.snapshot.outputs.filter((d) => !/Virtual Cable/.test(d.label)) };
+  v.renderSelects();
+  assert.equal($("outSelect").children[0].textContent, "Automatic: CABLE Input not found");
+  assert.equal(VOICE_TEXTS.autoMissing, "Automatic: CABLE Input not found");
 });

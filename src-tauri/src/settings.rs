@@ -93,6 +93,40 @@ fn temp_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{}-{n}.tmp", std::process::id()))
 }
 
+/// Whether `file` is one of `temp_path`'s names for the settings file `name`.
+fn is_temp_name(file: &str, name: &str) -> bool {
+    let Some(middle) = file.strip_prefix(name).and_then(|rest| rest.strip_prefix('.')).and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    middle.split_once('-').is_some_and(|(pid, n)| digits(pid) && digits(n))
+}
+
+/// Remove the temporary files that saves cut off between writing and
+/// renaming (the app killed or crashed, the power gone) left next to the
+/// settings file. Each holds the pid of a run that is over, so no later save
+/// reuses or removes it. Call it with the settings lock held: then no save of
+/// this process is under way, so every such file is a leftover (and the
+/// single-instance rule keeps a second process out). Files that cannot be
+/// removed now (open in a virus scanner, say) stay until the next start.
+/// settings.json itself is never touched. → how many were removed
+pub fn remove_leftover_temps(path: &Path) -> usize {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return 0;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0; // no folder yet: nothing left over
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| is_temp_name(&e.file_name().to_string_lossy(), &name))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
 /// Write and flush to the disk, so the rename never puts an empty file in place.
 fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
@@ -124,14 +158,26 @@ fn is_busy(e: &io::Error) -> bool {
             || matches!(e.raw_os_error(), Some(32 | 33)))
 }
 
-/// The settings file's text (None: no file yet). The page parses and checks it.
+/// What `settings_load` does with the settings lock held: read the file,
+/// then remove the temporary files that earlier runs' cut-off saves left.
+/// → (the file's text, how many leftovers were removed)
+pub fn load_settings(path: &Path) -> (Result<Option<String>, String>, usize) {
+    (read_settings(path), remove_leftover_temps(path))
+}
+
+/// The settings file's text (None: no file yet). The page parses and checks
+/// it. The page reads the settings once as it starts, which is when the
+/// temporary files left by an earlier run's cut-off save are removed.
 #[tauri::command]
 pub async fn settings_load(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
     let path = settings_path(&app)?;
-    let read = {
+    let (read, removed) = {
         let _turn = state.settings_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        read_settings(&path)
+        load_settings(&path)
     };
+    if removed > 0 {
+        log::info!("settings: removed {removed} leftover temporary file(s)");
+    }
     match &read {
         Ok(Some(text)) => log::info!("settings read ({} bytes)", text.len()),
         Ok(None) => log::info!("no settings file yet"),
@@ -373,6 +419,69 @@ mod tests {
         let text = read_settings(&path).unwrap().unwrap();
         assert!(text == a || text == b, "{text}");
         assert!(dir.temps().is_empty(), "{:?}", dir.temps());
+    }
+
+    #[test]
+    fn the_temporary_files_of_cut_off_saves_are_removed_at_the_next_start() {
+        // A save cut off between writing its temporary file and renaming it
+        // (the app killed, a crash, the power gone) leaves the file behind.
+        // Its name holds that run's pid, so no later save reuses it: the next
+        // start (settings_load) removes it, and nothing else.
+        let dir = TempDir::new("leftovers");
+        let json = r#"{"version":1,"micLabel":"kept"}"#;
+        write_settings(&dir.file(), json).unwrap();
+        let leftovers = [
+            "settings.json.999999-0.tmp".to_string(),
+            "settings.json.4242-17.tmp".to_string(),
+            // This process's own pid: under the lock no save of its own is under way.
+            format!("settings.json.{}-123456.tmp", std::process::id()),
+        ];
+        for name in &leftovers {
+            fs::write(dir.0.join(name), r#"{"version":1,"micLabel":"half a sa"#).unwrap();
+        }
+        let others = [
+            "settings.json.bak",
+            "settings.json.12-x.tmp",
+            "settings.json.-1.tmp",
+            "settings.json.1-.tmp",
+            "settings.json.1-2.tmp.keep",
+            "other.json.1-2.tmp",
+            "notes.tmp",
+        ];
+        for name in others {
+            fs::write(dir.0.join(name), "not ours").unwrap();
+        }
+        fs::create_dir(dir.0.join("settings.json.7-7.tmp")).unwrap(); // a folder, not a file
+
+        assert_eq!(load_settings(&dir.file()), (Ok(Some(json.to_string())), leftovers.len()));
+        let mut left: Vec<String> =
+            fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        let mut expected: Vec<String> = others.iter().map(|s| s.to_string()).collect();
+        expected.push(FILE_NAME.to_string());
+        expected.push("settings.json.7-7.tmp".to_string());
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(load_settings(&dir.file()), (Ok(Some(json.to_string())), 0), "settings.json is untouched; nothing more to remove");
+    }
+
+    #[test]
+    fn no_folder_yet_means_no_leftovers() {
+        let dir = TempDir::new("leftovers-no-folder");
+        assert_eq!(load_settings(&dir.0.join("not-made-yet").join(FILE_NAME)), (Ok(None), 0));
+    }
+
+    #[test]
+    fn every_temporary_name_a_save_uses_counts_as_one() {
+        let dir = Path::new("app-data");
+        for _ in 0..3 {
+            let temp = temp_path(dir, FILE_NAME);
+            assert!(is_temp_name(&temp.file_name().unwrap().to_string_lossy(), FILE_NAME), "{temp:?}");
+        }
+        assert!(!is_temp_name(FILE_NAME, FILE_NAME));
+        assert!(!is_temp_name("settings.json.tmp", FILE_NAME));
+        assert!(!is_temp_name("settings.json.1-2-3.tmp", FILE_NAME));
+        assert!(!is_temp_name("settings.jsonx.1-2.tmp", FILE_NAME));
     }
 
     #[test]

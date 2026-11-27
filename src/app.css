@@ -12,7 +12,7 @@
   color-scheme: light dark;
 }
 
-/* WebView2 follows the Windows theme, so the app gets this on a laptop in dark mode. */
+/* WebView2 follows the Windows theme, so the app gets this on a PC in dark mode. */
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161615;
