@@ -28,6 +28,14 @@ keyring = "4.2"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "system-proxy"] }
 tokio = { version = "1", features = ["sync", "time"] }
 
+# The same versions Tauri 2.12 and wry already use (see Cargo.lock), so nothing
+# new is downloaded: WebView2's permission call (permission.rs) and the
+# window's quiet re-show (window.rs). They may change with a Tauri minor release.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 

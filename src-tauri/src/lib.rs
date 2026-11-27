@@ -3,12 +3,20 @@
 //! The audio pipeline runs as plain JavaScript in the window (WebView2). This
 //! side keeps the Sanas API key in Windows Credential Manager, swaps it for
 //! short-lived tokens, gives the microphone to the app's own page only, and
-//! keeps the window on that page (links open in the normal browser).
+//! keeps the window on that page (links open in the normal browser). It also
+//! keeps the settings file (settings.rs), hides and shows the window
+//! (window.rs, the only code allowed to), sets the microphone permission in
+//! WebView2's profile (permission.rs) and writes the page's log lines
+//! (pagelog.rs).
 
 mod keystore;
+mod pagelog;
+mod permission;
 mod sanas;
+mod settings;
+mod window;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::webview::{PermissionKind, PermissionResponse};
@@ -17,10 +25,15 @@ use tauri_plugin_opener::OpenerExt;
 
 use keystore::{clean_key, tail, KeyStore, OsKeyStore};
 use sanas::{KeyCheck, TokenBroker};
+use window::HideTimer;
 
 pub struct AppState {
     keys: Arc<dyn KeyStore>,
     broker: TokenBroker,
+    /// Which "Hide" may still show the window again (window.rs).
+    hide: Arc<HideTimer>,
+    /// Reads and saves of the settings file take turns (settings.rs).
+    settings_lock: Mutex<()>,
 }
 
 /// Pages that belong to the app: its bundled page (http://tauri.localhost on
@@ -36,13 +49,18 @@ pub fn is_app_url(url: &Url) -> bool {
     bundled || dev_server
 }
 
-/// Microphone (and audio autoplay) for the app's own page; nothing for anyone else.
+/// Microphone (and audio autoplay) for the app's own page; nothing for anyone
+/// else. Every answer is logged ("permission Microphone: allow"), so a Session B
+/// log shows whether WebView2 asked for anything else when choosing a playback
+/// device (it would arrive as `Other`) and was refused.
 fn permission_for(url: Option<Url>, kind: PermissionKind) -> PermissionResponse {
     let own = url.as_ref().is_some_and(is_app_url);
-    match kind {
+    let answer = match kind {
         PermissionKind::Microphone | PermissionKind::Autoplay if own => PermissionResponse::Allow,
         _ => PermissionResponse::Deny,
-    }
+    };
+    log::info!("permission {kind:?}: {}", if answer == PermissionResponse::Allow { "allow" } else { "deny" });
+    answer
 }
 
 #[derive(Serialize)]
@@ -154,25 +172,46 @@ pub fn run() {
         print(info);
     }));
     tauri::Builder::default()
-        // First, so a second launch only brings the running app forward.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
-        .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
+        // First, so a second launch only brings the running app forward (and
+        // ends a "Hide" early: the Start menu is the user's way back).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show_for_user(app)))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                // The plugin's default deletes the whole file at 40 kB, which a
+                // Session B with the page's lines could reach, losing the first
+                // start's lines. Keep up to 1 MB, and the file before it.
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(2))
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .on_permission_request(|webview, kind| permission_for(webview.url().ok(), kind))
-        .invoke_handler(tauri::generate_handler![app_info, key_status, key_set, key_delete, sanas_token])
+        .invoke_handler(tauri::generate_handler![
+            app_info,
+            key_status,
+            key_set,
+            key_delete,
+            sanas_token,
+            window::window_hide_for,
+            window::window_state,
+            permission::mic_permission_allow,
+            settings::settings_load,
+            settings::settings_save,
+            pagelog::log_line
+        ])
         .setup(|app| {
             // Here rather than before the app starts: the log is open by now, so a
             // failure to set up the HTTP client is written down. The page, the only
             // caller of the commands, comes after.
-            app.manage(AppState { keys: Arc::new(OsKeyStore), broker: TokenBroker::new(sanas::IDENTITY_URL) });
+            app.manage(AppState {
+                keys: Arc::new(OsKeyStore),
+                broker: TokenBroker::new(sanas::IDENTITY_URL),
+                hide: Arc::new(HideTimer::default()),
+                settings_lock: Mutex::new(()),
+            });
             let handle = app.handle().clone();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            WebviewWindowBuilder::new(app, window::MAIN_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("Accent Changer")
                 .inner_size(820.0, 680.0)
                 .min_inner_size(520.0, 480.0)
