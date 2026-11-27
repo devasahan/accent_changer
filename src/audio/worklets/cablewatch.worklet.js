@@ -26,7 +26,9 @@
  *
  * After stopAfterFrames samples it closes what is still going on (a tone
  * lost at the very end is a gap), posts a last summary (final: true) and
- * { type: "done", frame }, and then does nothing more.
+ * { type: "done", frame }, and then does nothing more: process() returns
+ * false from then on, so the browser drops the node once its inputs are
+ * disconnected (until then it calls it, and it returns at once).
  * Messages in: "stop" (the same, now); { type: "extend", stopAfterFrames }
  * (stop later, or now when that many samples have already been watched).
  */
@@ -79,10 +81,10 @@ class CableWatch extends AudioWorkletProcessor {
   }
 
   process(inputs) {
-    if (this.done) return true;
+    if (this.done) return false;
     if (this.frame >= this.stopAfter) {
       this.finish();
-      return true;
+      return false;
     }
     const a = inputs[0]?.[0];
     const b = inputs[1]?.[0];
@@ -113,7 +115,7 @@ class CableWatch extends AudioWorkletProcessor {
       this.sinceSummary -= this.summaryFrames;
       this.post(false);
     }
-    return true;
+    return !this.done;
   }
 
   /** The end: close what is still going on, post the last summary and "done", then stay idle. */

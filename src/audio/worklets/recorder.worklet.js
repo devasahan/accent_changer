@@ -7,12 +7,19 @@
  * Any number of inputs (the node's numberOfInputs), mono. An input that is
  * not connected, or not flowing yet, is written as zeros, so the inputs stay
  * aligned. It works with or without an output: with numberOfOutputs 0 the
- * browser keeps pulling it as long as its context runs.
+ * browser pulls it on every render quantum while its context runs, until it
+ * has stopped (see below).
  *
  * Messages in: "start" (from now on, recording starts afresh), "stop" (the
  * part of a chunk recorded so far is sent, then { type: "stopped" }).
  * Messages out: { type: "chunk", parts } (one Float32Array per input, their
  * buffers transferred), { type: "stopped" }.
+ *
+ * Its life: process() returns true until "stop" and false after it. A
+ * processor that returns false while no input is connected is never called
+ * again, so the browser drops a stopped recorder once its inputs are
+ * disconnected. Before "start" it must stay: its inputs may not be connected
+ * yet.
  */
 const CHUNK_FRAMES = 4800;
 
@@ -24,14 +31,17 @@ class Recorder extends AudioWorkletProcessor {
     const chunk = options?.processorOptions?.chunkFrames;
     this.chunkFrames = Number.isInteger(chunk) && chunk > 0 ? chunk : CHUNK_FRAMES;
     this.active = false;
+    this.stopped = false;
     this.fresh();
     this.port.onmessage = (e) => {
       if (e.data === "start") {
         this.fresh();
         this.active = true;
+        this.stopped = false;
       } else if (e.data === "stop") {
         this.flush();
         this.active = false;
+        this.stopped = true;
         this.port.postMessage({ type: "stopped" });
       }
     };
@@ -50,7 +60,7 @@ class Recorder extends AudioWorkletProcessor {
   }
 
   process(inputs) {
-    if (!this.active) return true;
+    if (!this.active) return !this.stopped;
     let frames = 128;
     for (let i = 0; i < this.inputsCount; i++) {
       const channel = inputs[i]?.[0];

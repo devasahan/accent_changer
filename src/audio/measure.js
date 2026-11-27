@@ -218,22 +218,27 @@ function concat(list, frames) {
 }
 
 /**
- * The capture latency of a microphone track in ms: track.stats.latency
- * (Chromium 125 and later), else getSettings().latency, else null. A stats
- * reading above MAX_CAPTURE_MS is not a capture latency (a track made by an
- * audio context reports seconds there) and is not used.
+ * The capture latency of a microphone track in ms (1 decimal), or null.
+ * track.stats (Chromium 125 and later) gives it in ms, like every
+ * DOMHighResTimeStamp: its averageLatency (steadier), else its latency. 0
+ * there means no frames were delivered yet. Without a usable reading,
+ * getSettings().latency, which is in seconds. A value above MAX_CAPTURE_MS is
+ * not a capture latency and is not used.
  */
 export function captureLatencyMs(track) {
   if (!track) return null;
+  const usable = (ms) => isNum(ms) && ms >= 0 && ms <= MAX_CAPTURE_MS;
   try {
-    const s = track.stats?.latency;
-    if (isNum(s) && s >= 0 && s * 1000 <= MAX_CAPTURE_MS) return round(s * 1000, 1);
+    const stats = track.stats;
+    for (const ms of [stats?.averageLatency, stats?.latency]) {
+      if (usable(ms) && ms > 0) return round(ms, 1);
+    }
   } catch {
     // No stats on this track.
   }
   try {
-    const l = track.getSettings?.()?.latency;
-    if (isNum(l) && l >= 0) return round(l * 1000, 1);
+    const sec = track.getSettings?.()?.latency;
+    if (isNum(sec) && usable(sec * 1000)) return round(sec * 1000, 1);
   } catch {
     // No settings either.
   }
@@ -359,14 +364,26 @@ class Recording {
     this._reject(err);
   }
 
-  /** Disconnect the recorder (it may be called again). */
+  /**
+   * Disconnect the recorder (it may be called again). One that was never told
+   * to stop is told now: until then its processor goes on running in its
+   * context, however long that context lives.
+   */
   dispose() {
     disconnectAll(this.wires);
     this.wires = [];
-    if (this.node) {
-      this.node.port.onmessage = null;
-      disconnectAll([[this.node]]);
+    const node = this.node;
+    if (!node) return;
+    node.port.onmessage = null;
+    if (!this.stopping) {
+      this.stopping = true;
+      try {
+        node.port.postMessage("stop");
+      } catch {
+        // Its context is gone, and the processor with it.
+      }
     }
+    disconnectAll([[node]]);
   }
 }
 
@@ -545,6 +562,7 @@ class LongCheck {
       lastStats: null,
       ended: false,
       done: false,
+      stopSent: false,
       doneSignal: deferred(),
     };
     this.segments.push(seg);
@@ -585,10 +603,11 @@ class LongCheck {
         this.dropSegment(seg);
         return NOOP_HANDLE;
       }
+      // Kept at once: a node that is made and then cannot be wired must still be told to stop.
       const node = new AudioWorkletNode(ctx, "ac-cablewatch", this.watcherOptions(seg));
-      const cableSource = ctx.createMediaStreamSource(this.cable.stream);
       seg.ctx = ctx;
       seg.node = node;
+      const cableSource = ctx.createMediaStreamSource(this.cable.stream);
       seg.wires = [
         [micBus, node],
         [cableSource, node],
@@ -600,7 +619,10 @@ class LongCheck {
       this.buildFailed(seg, err);
       throw err;
     }
-    if (route && !isContextRoute(route.method) && !this.routeNoted) {
+    // A check that began on VB-CABLE's clock (the context route) and is rebuilt on the audio element route
+    // records from then on across a clock crossing of its own. One that began on the element route and
+    // records here says so from the start (CHECK_TEXTS.ownCrossing).
+    if (this.contextRoute && route && !isContextRoute(route.method) && !this.routeNoted) {
       this.routeNoted = true;
       this.note(CHECK_TEXTS.routeChanged);
     }
@@ -616,9 +638,9 @@ class LongCheck {
     try {
       await limit(ctx.audioWorklet.addModule(workletUrl("cablewatch.worklet.js")), BUILD_LIMIT_MS, "The long check's recorder");
       const node = new AudioWorkletNode(ctx, "ac-cablewatch", this.watcherOptions(seg));
-      const cableSource = ctx.createMediaStreamSource(this.cable.stream);
       seg.ctx = ctx;
       seg.node = node;
+      const cableSource = ctx.createMediaStreamSource(this.cable.stream);
       seg.wires = [[cableSource, node]];
       cableSource.connect(node, 0, 1);
       this.connectFresh(seg, this.graph.micStream);
@@ -676,7 +698,7 @@ class LongCheck {
 
   buildFailed(seg, err) {
     this.dropSegment(seg);
-    disconnectAll(seg.wires);
+    this.retire(seg);
     this.log("warn", `check long recorder failed ${nameOf(err)}`);
     if (!this.builtOnce) this.firstBuild.reject(err);
     else this.end(CHECK_TEXTS.rebuildFailed, "rebuild-failed");
@@ -686,12 +708,39 @@ class LongCheck {
   segmentGone(seg, info) {
     if (seg.ended) return;
     seg.ended = true;
-    disconnectAll(seg.wires);
-    seg.wires = [];
-    if (seg.node) seg.node.port.onmessage = null;
+    this.retire(seg);
     seg.doneSignal.resolve();
     if (this.current === seg) this.current = null;
     if (info?.generationEnded) this.log("info", `check long recorder cut by a rebuild at ${Math.round(this.framesNow() / SAMPLE_RATE)} s`);
+  }
+
+  /**
+   * The segment's watcher off the graph, its messages no longer heard. One
+   * that has not finished is told to stop: until then its processor goes on
+   * running in its context, however long that context lives (the voice's
+   * own, on the context route).
+   */
+  retire(seg) {
+    disconnectAll(seg.wires);
+    seg.wires = [];
+    if (seg.fresh) {
+      disconnectAll([[seg.fresh]]);
+      seg.fresh = null;
+    }
+    if (!seg.node) return;
+    seg.node.port.onmessage = null;
+    this.stopWatcher(seg);
+  }
+
+  /** Ask the segment's watcher to stop (once): it sends its last summary and "done", then does nothing more. */
+  stopWatcher(seg) {
+    if (!seg.node || seg.done || seg.stopSent) return;
+    seg.stopSent = true;
+    try {
+      seg.node.port.postMessage("stop");
+    } catch {
+      // Its context is gone, and the processor with it.
+    }
   }
 
   // ---------------------------------------------------------------- what the watcher says
@@ -1115,11 +1164,15 @@ class LongCheck {
     if (text && !this.notes.includes(text)) this.notes.push(text);
   }
 
-  /** End the check now (note: why, when it ends early). → the result */
+  /**
+   * End the check now. note: why, when it ends early for a reason nobody
+   * chose (the tone or CABLE Output lost, the voice stopped, …): the result
+   * then fails with that reason first. A stop ("stop") and the planned end
+   * ("end") have no note. → the result
+   */
   end(note = null, why = "stop") {
     if (!this.finishing) {
       if (note) {
-        this.note(note);
         this.earlyEnd = { note, why };
         this.log("warn", `check long ended early ${why}`);
       }
@@ -1138,11 +1191,7 @@ class LongCheck {
         // The watcher closes what is still going on (a tone lost at the very end is a gap) and sends its last summary.
         const seg = this.current;
         if (seg && seg.node && !seg.ended && !seg.done) {
-          try {
-            seg.node.port.postMessage("stop");
-          } catch {
-            // Its context is gone.
-          }
+          this.stopWatcher(seg);
           await limit(seg.doneSignal.promise, DONE_WAIT_MS).catch(() => {});
         }
         const endWallMs = performance.now();
@@ -1172,9 +1221,7 @@ class LongCheck {
     for (const seg of this.segments) {
       if (!seg.ended) {
         seg.ended = true;
-        disconnectAll(seg.wires);
-        if (seg.fresh) disconnectAll([[seg.fresh]]);
-        if (seg.node) seg.node.port.onmessage = null;
+        this.retire(seg);
         seg.doneSignal.resolve();
       }
     }
@@ -1430,8 +1477,11 @@ class LongCheck {
     }
 
     const v = longVerdict(verdictInput);
-    result.verdict = v.verdict;
-    result.reasons = v.reasons;
+    // A check that ended early for a reason nobody chose did not cover what it was asked to: it fails, with
+    // that reason first, whatever the part it recorded says. One that measured nothing stays "no-signal".
+    const early = this.earlyEnd;
+    result.verdict = early && v.verdict !== "no-signal" ? "fail" : v.verdict;
+    result.reasons = early ? [early.note, ...v.reasons] : v.reasons;
     result.lines = v.lines;
     result.tonePath = v.tonePath
       ? { ticksPer30Min: round(v.tonePath.ticksPer30Min, 2), ppm: round(v.tonePath.ppm, 1), direction: v.tonePath.direction }
@@ -1483,7 +1533,7 @@ class LongCheck {
       recordedSec: round((this.lastSync?.frame ?? 0) / SAMPLE_RATE, 1),
       phases: { visibleSec: 0, minimizedSec: 0, hiddenSec: 0, unknownSec: 0 },
       verdict: "no-signal",
-      reasons: [CHECK_TEXTS.notAnalysed(nameOf(err))],
+      reasons: [...(this.earlyEnd ? [this.earlyEnd.note] : []), CHECK_TEXTS.notAnalysed(nameOf(err))],
       lines: [],
       tonePath: null,
       micPath: null,
