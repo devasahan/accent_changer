@@ -302,8 +302,14 @@ export function toneOutput(snapshot) {
   return { entry: target, refusal: null };
 }
 
-/** A Bluetooth device by its name: hands-free profiles, "Bluetooth", "BT", AirPods, "… Buds". */
-const BLUETOOTH = /hands-free|bluetooth|\bbt\b|airpods|buds\b/i;
+/** A Bluetooth device by its name: hands-free profiles, "Bluetooth", "BT", AirPods, "… Buds", "Buds2", Airdopes. */
+const BLUETOOTH = /hands-free|bluetooth|\bbt\b|airpods|buds\d*\b|airdopes/i;
+
+/**
+ * A microphone that records at this rate or less is a Bluetooth headset in
+ * call mode (16 or 8 kHz), or a very basic one: either way it sounds poor.
+ */
+const NARROW_MIC_HZ = 16000;
 
 /**
  * What a label says about its device: { cable: one of VB-CABLE's endpoints
@@ -468,7 +474,10 @@ export function micSettingsReport(settings) {
 // devices-match.js does not export its texts: take them from feedbackWarnings(), so both always agree.
 const MIC_IS_CABLE = feedbackWarnings({ micLabel: "CABLE Output (VB-Audio Virtual Cable)" })[0];
 const OUTPUT_IS_CABLE = feedbackWarnings({ defaultOutputLabel: "CABLE Input (VB-Audio Virtual Cable)" })[0];
-const INPUT_IS_CABLE = feedbackWarnings({ defaultInputLabel: "CABLE Output (VB-Audio Virtual Cable)" })[0];
+const INPUT_IS_CABLE_STEP3 = feedbackWarnings({ defaultInputLabel: "CABLE Output (VB-Audio Virtual Cable)" })[0];
+// devices-match.js (a Step 3 module) speaks of "the converted voice", which this build does not have yet.
+const INPUT_IS_CABLE =
+  "Windows' default microphone is “CABLE Output”, the app's own output. Apps that use the default microphone would hear the app instead of you. In Windows sound settings, make your headset the default microphone, and pick “CABLE Output” only inside Zoom, Teams or Meet.";
 const INPUT_IS_LOOPBACK = feedbackWarnings({ defaultInputLabel: "Stereo Mix (Realtek(R) Audio)" })[0] ?? null;
 
 /**
@@ -495,19 +504,23 @@ export const WARNINGS = Object.freeze({
     `The playback device you picked, “${saved}”, is not there, so the app uses CABLE Input instead.`,
   NO_CABLE:
     "VB-CABLE is not installed yet (there is no “CABLE Input” playback device). Install it, restart Windows, then open the app again.",
+  CABLE_GONE:
+    "“CABLE Input” is gone for now (Windows Audio restarting?). The app brings your voice back as soon as Windows lists it again. If it stays gone for a minute, press “Copy results” and send them to me.",
   DEFAULT_RATE_LOW: (hz) =>
-    `Windows' default playback device runs at ${hz / 1000} kHz (a Bluetooth headset in call mode?). The converted voice will be played through that device, so it can't sound better than that: make wired or USB headphones the default playback device.`,
+    `Windows' default playback device runs at ${hz / 1000} kHz (a Bluetooth headset in call mode?). The app's sound through that device can't sound better than that: make wired or USB headphones the default playback device.`,
   CABLE_RATE: (hz) =>
-    `CABLE Input runs at ${hz / 1000} kHz. Set it to 48000 Hz: Windows sound settings → More sound settings → Playback → CABLE Input → Properties → Advanced.`,
+    `CABLE Input runs at ${hz / 1000} kHz. Set it to 48000 Hz: press Windows key + R, type mmsys.cpl and press Enter → Playback → right-click “CABLE Input” → Properties → Advanced → 48000 Hz → OK. Then press “Check the microphone”.`,
   BLUETOOTH_MIC:
     "Your microphone looks like a Bluetooth headset. Bluetooth adds delay and cut-outs: use a wired or USB headset.",
-  // from, to: "the app's audio engine" or "an audio element (fallback)".
+  NARROW_MIC: (hz) =>
+    `Your microphone records only at ${hz / 1000} kHz: a Bluetooth headset in call mode, or a very basic headset. Use a wired or USB headset.`,
+  // from, to: routeWords() of the two methods (the graph warns only for a move onto the audio element route).
   ROUTE_CHANGED: (from, to) =>
     `The app now sends your voice through ${to} instead of ${from}. This can add delay or clicks: copy the results and send them to me.`,
   NAMES_HIDDEN:
     "The app can't see your devices' names yet, so it doesn't know where your headphones are. Press “Check the microphone” first.",
   STAND_IN_QUIET:
-    "Sounds are off while your headset is unplugged: they would come out of the laptop's speakers, and the meeting would hear them.",
+    "Sounds are off while your headset is unplugged: they would come out of the PC's speakers, and the meeting would hear them.",
   DEFAULT_IS_VIRTUAL:
     "Windows' default playback device is a virtual device, not your headphones. In Windows sound settings, make your headphones the default playback device.",
   NO_HEADPHONES: "The app could not find your headphones, so it plays no sound. Plug in your headset.",
@@ -517,10 +530,41 @@ export const WARNINGS = Object.freeze({
 
 /** The code of a text from feedbackWarnings(): the constant it equals, or "FEEDBACK" for one this module does not know. */
 function feedbackCode(text) {
+  if (text === INPUT_IS_CABLE_STEP3) return "INPUT_IS_CABLE";
   for (const code of ["MIC_IS_CABLE", "OUTPUT_IS_CABLE", "INPUT_IS_CABLE", "INPUT_IS_LOOPBACK"]) {
     if (WARNINGS[code] !== null && text === WARNINGS[code]) return code;
   }
   return "FEEDBACK";
+}
+
+/**
+ * Why the voice stopped, in words. The status line and the Recoveries line
+ * name a cause the same way (graph.js and ui/voice.js both use this).
+ */
+const CAUSE_WORDS = Object.freeze({
+  "render-error": "the audio device reported an error",
+  "render-stalled": "the audio stopped moving",
+  "context-suspended": "the audio was paused",
+  "context-closed": "the audio engine closed",
+  "sink-changed": "the playback device changed",
+  "mic-ended": "the microphone stopped",
+  "change-failed": "the change you made did not work",
+});
+
+/** A recovery's cause in words ("a problem with the sound" for one not known here). */
+export const causeText = (cause) => CAUSE_WORDS[cause] ?? "a problem with the sound";
+
+/**
+ * The output route in plain words: "the normal route" (the app's own audio
+ * engine plays into the cable) or "a slower backup route" (an audio
+ * element, which resamples and adds delay), with ", after a permission fix"
+ * when the route needed one. `none` when there is no route (yet). Step 2 of
+ * the page, the warnings and the checklist all use this.
+ */
+export function routeWords(method, none = "not yet") {
+  if (typeof method !== "string" || !method) return none;
+  const base = method.startsWith("element") ? "a slower backup route" : "the normal route";
+  return method.endsWith("-after-permission") ? `${base}, after a permission fix` : base;
 }
 
 /**
@@ -534,7 +578,11 @@ function feedbackCode(text) {
  * missing: savedMicLabel, else wantedMicLabel, the label of the microphone
  * in use before when nothing is saved; no name when neither is known);
  * OUTPUT_OVERRIDE_MISSING; NO_CABLE (no output found); DEFAULT_RATE_LOW
- * (below 44.1 kHz); CABLE_RATE (not 48 kHz); BLUETOOTH_MIC. nameOf(label) is
+ * (below 44.1 kHz); CABLE_RATE (not 48 kHz); BLUETOOTH_MIC (by its name);
+ * NARROW_MIC (the microphone in use records at 16 kHz or less, micRateHz,
+ * whatever its name). With no output found, NO_CABLE, or CABLE_GONE when
+ * cableSeen (the app found CABLE Input since it started: it is gone for
+ * now, as in a Windows Audio restart). nameOf(label) is
  * applied to every label put into a text: the identity for the page,
  * reportLabel for results. Labels of Windows' defaults are the
  * pseudo-devices' labels ("Default - …"; "" when absent). ROUTE_CHANGED is
@@ -556,12 +604,18 @@ export function deviceWarnings(
     commsOutputLabel = "",
     defaultOutputRateHz = null,
     cableRateHz = null,
+    cableSeen = false,
+    micRateHz = null,
   } = {},
   nameOf = (s) => s,
 ) {
   const list = [];
   const feedback = (labels) => {
-    for (const text of feedbackWarnings(labels)) list.push({ code: feedbackCode(text), text });
+    for (const text of feedbackWarnings(labels)) {
+      const code = feedbackCode(text);
+      // This module's own wording where it has one (INPUT_IS_CABLE: devices-match's speaks of a converted voice).
+      list.push({ code, text: code === "INPUT_IS_CABLE" ? WARNINGS.INPUT_IS_CABLE : text });
+    }
   };
   feedback({ micLabel: savedMicLabel });
   feedback({ defaultOutputLabel });
@@ -577,7 +631,7 @@ export function deviceWarnings(
   if (savedOutputMissing) {
     list.push({ code: "OUTPUT_OVERRIDE_MISSING", text: WARNINGS.OUTPUT_OVERRIDE_MISSING(nameOf(savedOutputLabel ?? "")) });
   }
-  if (!outputFound) list.push({ code: "NO_CABLE", text: WARNINGS.NO_CABLE });
+  if (!outputFound) list.push(cableSeen ? { code: "CABLE_GONE", text: WARNINGS.CABLE_GONE } : { code: "NO_CABLE", text: WARNINGS.NO_CABLE });
   if (typeof defaultOutputRateHz === "number" && defaultOutputRateHz > 0 && defaultOutputRateHz < 44100) {
     list.push({ code: "DEFAULT_RATE_LOW", text: WARNINGS.DEFAULT_RATE_LOW(defaultOutputRateHz) });
   }
@@ -585,5 +639,8 @@ export function deviceWarnings(
     list.push({ code: "CABLE_RATE", text: WARNINGS.CABLE_RATE(cableRateHz) });
   }
   if (labelFlags(micLabel).bluetooth) list.push({ code: "BLUETOOTH_MIC", text: WARNINGS.BLUETOOTH_MIC });
+  else if (typeof micRateHz === "number" && micRateHz > 0 && micRateHz <= NARROW_MIC_HZ) {
+    list.push({ code: "NARROW_MIC", text: WARNINGS.NARROW_MIC(micRateHz) });
+  }
   return list;
 }

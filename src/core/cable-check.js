@@ -16,6 +16,7 @@
  * Pure: no DOM, no Web Audio, no clock. Times come in as numbers (frames at
  * 48 kHz, or ms on the page's performance.now() timeline).
  */
+import { routeWords } from "./device-choice.js";
 import {
   estimateDelayFromEnvelopes,
   findGaps,
@@ -40,6 +41,10 @@ export const LIMITS = Object.freeze({
   MIC_HOLE_MIN_MS: 8,
   MIC_HOLE_MAX_MS: 11,
   NOISE_GATE_FRACTION: 0.01,
+  GATE_RUN_MAX_MS: 2000,
+  GATE_MIN_RUNS: 20,
+  MIN_SPEECH_SEC: 10,
+  MIN_SPEECH_SHARE: 0.1,
   LEVEL_WARN_DB: -3,
   CABLE_QUIET_DB: -3,
   TONE_LEVEL_MIN_DB: -13,
@@ -75,8 +80,23 @@ const lengthOfMs = (ms) =>
 /** A level in dB with a real minus sign: "−12.0 dB". */
 const dbText = (v) => `${v < 0 ? "−" : ""}${Math.abs(v).toFixed(1)} dB`;
 
-/** How the reason for a microphone that stopped begins: gateSummary looks for it in a check's reasons. */
-const MIC_STOPPED = "The microphone itself stopped";
+/**
+ * How the reason for a microphone that sent only digital silence begins: gateSummary looks for it in a check's
+ * reasons. A muted headset gives the same exact zeros as a capture Windows paused, so the reason names both.
+ */
+const MIC_STOPPED = "Your microphone sent only digital silence";
+
+/** How the reason for a microphone that dropped out for 20 to 100 ms begins: gateSummary looks for it too. */
+const MIC_DROPPED = "The microphone itself dropped out";
+
+/** How the reason for long drop-outs in CABLE Output (a check with your voice) begins: gateSummary reads it too. */
+const CABLE_DROPPED = "CABLE Output dropped out";
+
+/** "once" → 1, "twice" → 2, "5 times" → 5, at the start of `text`; 0 when it says no number. */
+const timesIn = (text) => {
+  const m = /^\s*(once|twice|(\d+) times)\b/.exec(text);
+  return !m ? 0 : m[1] === "once" ? 1 : m[1] === "twice" ? 2 : Number(m[2]);
+};
 
 /** How the reason for other sound in the test tone begins: gateSummary looks for it too. */
 const OTHER_SOUND = "Other sound was mixed into the test tone";
@@ -84,9 +104,18 @@ const OTHER_SOUND = "Other sound was mixed into the test tone";
 /** CABLE Output envelope frames at or below this carried nothing: digital silence (−120) or next to it. */
 const SILENT_DB = -100;
 
+/** Windows sound settings, as README Session B step 2 opens them (the same on Windows 10 and 11). */
+const SOUND_SETTINGS = "Windows sound settings (Windows key + R, type mmsys.cpl, Enter)";
+
 /** What to do when the voice arrives much quieter in CABLE Output than it left the microphone. */
-const QUIET_ADVICE =
-  "check that CABLE Input and CABLE Output are at 100 % in Windows sound settings, and that Communications is set to “Do nothing”.";
+const QUIET_ADVICE = `In ${SOUND_SETTINGS}: Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100.`;
+
+/** The long check's settings advice: where exactly, and what about the meeting app's own volume control. */
+const COMMS_FIX = `In ${SOUND_SETTINGS}: Communications tab → “Do nothing” → OK.`;
+const SETTINGS_FIX = `In ${SOUND_SETTINGS}: Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100. In the meeting app, turn off its automatic microphone volume.`;
+
+/** Which re-run the settings advice means (Session B step 7.5 says what to do with it). */
+const AFTER_FIX = "Then tell me before you run the hour-long check again (Session B step 7.5).";
 
 /** The window phase in words. */
 const PHASE_WORDS = { visible: "open", minimized: "minimized", hidden: "hidden" };
@@ -128,7 +157,7 @@ export function delayVerdict(r, { captureLatencyMs = null, micFifoMs = null } = 
     return result("unclear", "Could not measure clearly. Speak a bit louder, closer to the microphone, and try again.");
   }
   if (isNum(r.levelDiffDb) && r.levelDiffDb < LIMITS.CABLE_QUIET_DB) {
-    notes.push(`The voice arrives ${(-r.levelDiffDb).toFixed(1)} dB quieter in CABLE Output: ${QUIET_ADVICE}`);
+    notes.push(`The voice arrives ${(-r.levelDiffDb).toFixed(1)} dB quieter in CABLE Output. ${QUIET_ADVICE}`);
   }
   if (isNum(micFifoMs) && micFifoMs >= LIMITS.MIC_FIFO_NOTE_MS) {
     notes.push(
@@ -271,6 +300,21 @@ export function micHoleCount(refRuns, { sampleRate = 48000 } = {}) {
 /** A microphone clock more than this many ppm faster than VB-CABLE's is "faster": its buffer fills, then drops. */
 const FASTER_PPM = 3;
 
+/**
+ * How far the buffer rises above its start before it counts as full. A
+ * source's buffer holds at most 60 ms and starts with 0–20 ms of its own
+ * (H1), so it rises only 30–50 ms before it drops; each reading has ± 10 ms.
+ */
+const RISE_MS = 25;
+
+/**
+ * Readings that start this far above a fresh source come from a buffer that
+ * had already filled (a faster clock before the check, or rendering that
+ * paused): it may have no room left to rise, so a flat slope says nothing
+ * about a faster clock. A buffer that starts empty reads −20 to +20 ms.
+ */
+const FULL_START_MS = 30;
+
 /** 10 ms drops per 30 minutes for a microphone clock offset: one per 10 ms of drift (ppm·1e-6 × 1800 s / 0.010 s). */
 const dropsOf = (ppm) => Math.max(0, ppm) * 0.18;
 
@@ -292,14 +336,25 @@ function theilSen(points) {
  * buffer holds (micFifoMs). Only the longest run of readings with one
  * micGen is used: a new microphone source starts a new buffer. Each reading
  * has ± 10 ms of its own, so one difference means nothing; the slope over
- * many does.
- *  1. base = the median of the first 3 lags; saturatedAtSec = the time of the
- *     first reading 40 ms or more above it (the buffer is full and drops
- *     10 ms at a time from then on), or null.
- *  2. ppm = the Theil–Sen slope of the readings before saturation (ms/s ×
- *     1000) when they span 600 s or more and number 4 or more; else, once
- *     saturated, 40 ms over the time it took to get there, as a lower bound;
- *     else null.
+ * many does. The run should start with the buffer empty (the tone check
+ * gives micBus a new source at its start): the buffer can rise only 30–50 ms
+ * before it drops (H1), so one that had already filled shows no slope.
+ *  1. base = the first lag, or the median of the first 3 when that is lower.
+ *     The buffer counts as full (it drops 10 ms at a time from then on) from
+ *     the first group of three readings in a row (two, at the end) whose
+ *     median is RISE_MS (25 ms) or more above base; saturatedAtSec = the time
+ *     of the first reading of that group that is that high itself, else null.
+ *     One high reading alone does not count.
+ *  2. ppm = the Theil–Sen slope (ms/s × 1000) of the readings while the
+ *     buffer rose: all of them when it never counted as full, else those
+ *     before the first group (from saturatedAtSec on) whose median is within
+ *     5 ms of the median of the readings from saturatedAtSec on (where it
+ *     settles), when they span 600 s or more and number 4 or more; else, once
+ *     saturated, 25 ms over the time from the first reading to
+ *     saturatedAtSec, as a lower bound; else null. fullAtStart: base is
+ *     FULL_START_MS (30 ms) or more and the buffer never rose by 25 ms: it
+ *     had filled before the readings began, so there is no slope (ppm null)
+ *     and only holes can still tell a clock.
  *  3. direction: ppm above 3 → "faster" (the buffer fills, then drops 10 ms
  *     per 10 ms of drift); else holes → "slower" (it inserts 10 ms of zeros
  *     per 10 ms of drift and its fill only saw-tooths, so the holes are the
@@ -309,10 +364,11 @@ function theilSen(points) {
  *     durationSec; ticksPer30Min = their sum.
  * slopePpm and slopeIsLowerBound keep step 2's result (null when the
  * readings were too few) after the holes take over ppm in step 3: with a
- * noise gate the holes say nothing, and longVerdict uses the slope alone.
- * → { ppm, ppmIsLowerBound, direction, saturatedAtSec, holes, holesPer30Min,
- * dropsPer30Min, ticksPer30Min, slopePpm, slopeIsLowerBound, readings (the
- * run used: [{atSec, lagMs}]) }
+ * noise gate the holes seen are only some of them (gatedMicRoad), and the
+ * slope is what tells a faster clock.
+ * → { ppm, ppmIsLowerBound, direction, saturatedAtSec, fullAtStart, holes,
+ * holesPer30Min, dropsPer30Min, ticksPer30Min, slopePpm, slopeIsLowerBound,
+ * readings (the run used: [{atSec, lagMs}]) }
  */
 export function micClock(samples, { holes = 0, durationSec = null } = {}) {
   const valid = list(samples).filter((s) => isNum(s.atSec) && isNum(s.lagMs));
@@ -331,21 +387,39 @@ export function micClock(samples, { holes = 0, durationSec = null } = {}) {
   let ppm = null;
   let ppmIsLowerBound = false;
   let saturatedAtSec = null;
+  let fullAtStart = false;
   if (readings.length) {
-    const base = median(readings.slice(0, 3).map((s) => s.lagMs));
-    const saturated = readings.find((s) => s.lagMs - base >= 40);
+    const lags = readings.map((s) => s.lagMs);
+    // The first reading alone when it is lower: with a fast clock the 2nd and 3rd are already on their way up.
+    const base = Math.min(lags[0], median(lags.slice(0, 3)));
+    // The first reading from which the median of it and the next two (the next one, at the end) is at `level`.
+    const firstAt = (level, from) => {
+      for (let i = from; i + 1 < lags.length; i++) if (median(lags.slice(i, i + 3)) >= level) return i;
+      return -1;
+    };
+    const win = firstAt(base + RISE_MS, 1);
+    // Full from the first reading of that window that is RISE_MS up itself (it, else the next one).
+    const at = win < 0 ? -1 : lags[win] - base >= RISE_MS ? win : win + 1;
+    const saturated = at >= 0 ? readings[at] : null;
     saturatedAtSec = saturated ? saturated.atSec : null;
-    const before = saturated ? readings.filter((s) => s.atSec < saturated.atSec) : readings;
+    // The slope's readings: up to where the buffer settles (5 ms below the median of the readings from `at` on).
+    const end = saturated ? Math.max(at, firstAt(Math.max(base + RISE_MS, median(lags.slice(at)) - 5), at)) : -1;
+    const before = saturated ? readings.slice(0, end) : readings;
     const spanSec = before.length ? before[before.length - 1].atSec - before[0].atSec : 0;
-    if (before.length >= 4 && spanSec >= 600) {
-      ppm = theilSen(before) * 1000;
-    } else if (saturated) {
-      // 40 ms gathered in at most this long (from the first reading of this run, else from the start).
-      const tookSec = saturated.atSec - readings[0].atSec > 0 ? saturated.atSec - readings[0].atSec : saturated.atSec;
-      if (tookSec > 0) {
-        ppm = (40 / tookSec) * 1000;
+    if (saturated) {
+      // RISE_MS gathered by then (from the first reading of this run).
+      const tookSec = saturated.atSec - readings[0].atSec;
+      if (before.length >= 4 && spanSec >= 600) {
+        ppm = theilSen(before) * 1000;
+      } else if (tookSec > 0) {
+        ppm = (RISE_MS / tookSec) * 1000;
         ppmIsLowerBound = true;
       }
+    } else if (base >= FULL_START_MS) {
+      // Filled before the readings began: a flat slope cannot tell "the same clock" from "faster".
+      fullAtStart = true;
+    } else if (before.length >= 4 && spanSec >= 600) {
+      ppm = theilSen(before) * 1000;
     }
   }
   const slopePpm = ppm;
@@ -369,6 +443,7 @@ export function micClock(samples, { holes = 0, durationSec = null } = {}) {
     ppmIsLowerBound,
     direction,
     saturatedAtSec,
+    fullAtStart,
     holes: holeCount,
     holesPer30Min,
     dropsPer30Min,
@@ -380,9 +455,9 @@ export function micClock(samples, { holes = 0, durationSec = null } = {}) {
 }
 
 /**
- * The microphone road from its buffer's slope alone, for a microphone with a
- * noise gate (whose holes say nothing): { ppm, lowerBound }, or null when
- * the readings were too few. micClock() gives it as slopePpm; a result
+ * The microphone's buffer slope, for a microphone with a noise gate (whose
+ * holes are only some of a slower clock's): { ppm, lowerBound }, or null
+ * when the readings were too few. micClock() gives it as slopePpm; a result
  * without that field (a check's result that kept only some of the fields)
  * has it worked out again from its readings, else from a ppm the holes did
  * not make.
@@ -397,6 +472,30 @@ function slopeOf(mp) {
     return isNum(again.slopePpm) ? { ppm: again.slopePpm, lowerBound: again.slopeIsLowerBound } : null;
   }
   return isNum(mp.ppm) && mp.direction !== "slower" ? { ppm: mp.ppm, lowerBound: mp.ppmIsLowerBound === true } : null;
+}
+
+/**
+ * The microphone's road for a microphone with a noise gate, for the check's
+ * verdict and the checklist alike. A slower clock's 10 ms hole that falls
+ * into the gate's own silence is not seen (it only makes that silence
+ * longer), so the holes seen are some of its holes, never all; and the
+ * buffer's slope tells only a faster clock, which makes drops, not holes.
+ * → { ticks, atLeast, slope, holes }, or null when there is neither a slope
+ * nor a hole (not measured). ticks: the drops the slope predicts when it
+ * shows a faster clock, plus the holes seen per 30 minutes (their sum, as
+ * micClock counts them without a gate). atLeast: the slope does not show a
+ * faster clock, so a slower one is not ruled out and ticks is only a lower
+ * bound: above TICKS_PER_30_MIN it fails, otherwise the road was not
+ * measured; it never passes.
+ */
+function gatedMicRoad(mp) {
+  if (!mp) return null;
+  const slope = slopeOf(mp);
+  const holes = isNum(mp.holes) && mp.holes > 0 ? mp.holes : 0;
+  if (!slope && holes === 0) return null;
+  const faster = slope !== null && slope.ppm > FASTER_PPM;
+  const seen = holes > 0 && isNum(mp.holesPer30Min) ? mp.holesPer30Min : 0;
+  return { ticks: (faster ? dropsOf(slope.ppm) : 0) + seen, atLeast: !faster, slope, holes };
 }
 
 // ---------- time ----------
@@ -675,9 +774,10 @@ const FIRST_EVENT_WITHIN = 13;
  * their number). Otherwise (a burst of holes in one second, a cluster that
  * stopped) ticksPer30Min = ticks × 1800 / durationSec and ppm and direction
  * are null: they say nothing about the clocks. With fewer than 3 events of
- * one kind, ticksPer30Min is that same count rate and ppm = ticks × 10 ms /
- * durationSec (a bound when there are none).
- * → { ppm, direction: "faster" | "slower" | null, ticksPer30Min }
+ * one kind ticksPer30Min is that same count rate, and ppm and direction are
+ * null too: one or two clicks can be any glitch, not a measured offset.
+ * steady says whether ppm and direction were measured (from regular events).
+ * → { ppm, direction: "faster" | "slower" | null, ticksPer30Min, steady }
  */
 export function clockFromEvents(events, durationSec) {
   const evs = list(events);
@@ -692,7 +792,7 @@ export function clockFromEvents(events, durationSec) {
   const skipCount = evs.filter((e) => e.kind === "skip").length;
   const holeCount = evs.filter((e) => e.kind === "hole").length;
   const ticks = skipCount + holeCount + evs.filter((e) => e.kind === "click").length;
-  if (!isNum(durationSec) || !(durationSec > 0)) return { ppm: null, direction: null, ticksPer30Min: null };
+  if (!isNum(durationSec) || !(durationSec > 0)) return { ppm: null, direction: null, ticksPer30Min: null, steady: false };
   const countRate = (ticks * 1800) / durationSec;
   const regular = skips.length >= 3 && skips.length >= holes.length ? { at: skips, sign: 1 } : holes.length >= 3 ? { at: holes, sign: -1 } : null;
   if (regular) {
@@ -705,16 +805,15 @@ export function clockFromEvents(events, durationSec) {
       every >= 0.01 / (MAX_DRIFT_PPM * 1e-6) &&
       at[0] <= FIRST_EVENT_WITHIN * every &&
       durationSec - at[0] <= 2 * at.length * every;
-    if (!steady) return { ppm: null, direction: null, ticksPer30Min: countRate };
+    if (!steady) return { ppm: null, direction: null, ticksPer30Min: countRate, steady: false };
     return {
       ppm: (regular.sign * 0.01 * 1e6) / every,
       direction: regular.sign > 0 ? "faster" : "slower",
       ticksPer30Min: 1800 / every,
+      steady: true,
     };
   }
-  const direction = skipCount > holeCount ? "faster" : holeCount > skipCount ? "slower" : null;
-  const ppm = ((ticks * 0.01) / durationSec) * 1e6;
-  return { ppm: direction === "slower" ? -ppm : ppm, direction, ticksPer30Min: countRate };
+  return { ppm: null, direction: null, ticksPer30Min: countRate, steady: false };
 }
 
 /** "15 s" for a short check, "65 min" for a long one. */
@@ -732,23 +831,76 @@ function whereText(atSec, phase) {
 const per30 = (x) => round(x, 1).toFixed(1);
 
 /**
+ * Whether the microphone sends digital silence in its pauses (a noise gate),
+ * so that its own silences say nothing: NOISE_GATE_FRACTION or more of the
+ * check is digital silence, and it comes the way a gate's does, which shuts
+ * again and again at every pause in the sound: GATE_MIN_RUNS or more
+ * silences of GAP_MS or more, or NOISE_GATE_FRACTION of the check in zero
+ * runs shorter than GATE_RUN_MAX_MS. One or a few long silences are the
+ * microphone muted or paused, however long they were: their length never
+ * makes a gate. micZeroFraction: the frames in all its zero runs of 1 ms or
+ * more / all frames; runs: its zero runs ([{startFrame, frames}]: at least
+ * every run of GAP_MS or more); totalFrames: all frames. A long run missing
+ * from `runs` stays among the short ones, so an error leans towards a gate (a
+ * note in the checklist), never towards a pass. → boolean
+ */
+export function noiseGateOf(micZeroFraction, runs, totalFrames) {
+  if (!isNum(micZeroFraction) || micZeroFraction < LIMITS.NOISE_GATE_FRACTION) return false;
+  const longFrames = LIMITS.GATE_RUN_MAX_MS * FRAMES_PER_MS;
+  const gapFrames = LIMITS.GAP_MS * FRAMES_PER_MS;
+  let silences = 0;
+  let frames = 0;
+  for (const r of runList(runs)) {
+    if (r.frames >= gapFrames) silences++;
+    if (r.frames >= longFrames) frames += r.frames;
+  }
+  if (silences >= LIMITS.GATE_MIN_RUNS) return true;
+  const share = isNum(totalFrames) && totalFrames > 0 ? frames / totalFrames : 0;
+  return micZeroFraction - share >= LIMITS.NOISE_GATE_FRACTION;
+}
+
+/**
  * Where the "capture paused" rule finds the microphone's own zero runs of
  * GAP_MS or more: refRuns when given (both modes), else the mic-mode speech
  * analysis (its micPauses; else its micSilentSec, the runs of 200 ms or more,
- * whose number is not known). → { count, longestMs } | { totalMs } | null
- * (nothing to check with).
+ * whose number is not known). A run's time is its atSec (else startFrame at
+ * 48 kHz) and its phase, when it has one. → { count, longestMs, atSec, phase }
+ * | { totalMs } | null (nothing to check with).
  */
 function micStops(refRuns, speech) {
-  const long = (ms) => ms >= LIMITS.GAP_MS;
-  const summary = (lengths) => ({ count: lengths.length, longestMs: lengths.reduce((a, b) => (b > a ? b : a), 0) });
-  if (Array.isArray(refRuns)) return summary(runList(refRuns).map((r) => r.frames / FRAMES_PER_MS).filter(long));
+  const long = (r) => r.ms >= LIMITS.GAP_MS;
+  const run = (r, ms) => ({
+    ms,
+    atSec: isNum(r.atSec) ? r.atSec : isNum(r.startFrame) ? r.startFrame / (FRAMES_PER_MS * 1000) : null,
+    phase: r.phase ?? null,
+  });
+  const summary = (runs) => {
+    const top = runs.reduce((a, b) => (b.ms > a.ms ? b : a), { ms: 0, atSec: null, phase: null });
+    return { count: runs.length, longestMs: top.ms, atSec: top.atSec, phase: top.phase };
+  };
+  if (Array.isArray(refRuns)) return summary(runList(refRuns).map((r) => run(r, r.frames / FRAMES_PER_MS)).filter(long));
   if (speech && Array.isArray(speech.micPauses)) {
-    return summary(list(speech.micPauses).map((p) => (isNum(p.ms) ? p.ms : (p.frames ?? 0) / FRAMES_PER_MS)).filter(long));
+    return summary(list(speech.micPauses).map((p) => run(p, isNum(p.ms) ? p.ms : (p.frames ?? 0) / FRAMES_PER_MS)).filter(long));
   }
   if (speech && isNum(speech.micSilentSec)) {
     return speech.micSilentSec > 0 ? { totalMs: speech.micSilentSec * 1000 } : summary([]);
   }
   return null;
+}
+
+/**
+ * The microphone's own drop-outs: its zero runs (refRuns) of DROPOUT_MS up
+ * to GAP_MS: several of its buffer's 10 ms holes in a row, a USB hiccup, a
+ * capture that came late. In normal use the voice carries each one to the
+ * meeting, as it carries a stop. A run may carry atSec and phase.
+ * → { count, longest: the longest run } | null (no record of the runs).
+ */
+function micDrops(refRuns) {
+  if (!Array.isArray(refRuns)) return null;
+  const lo = LIMITS.DROPOUT_MS * FRAMES_PER_MS;
+  const hi = LIMITS.GAP_MS * FRAMES_PER_MS;
+  const drops = runList(refRuns).filter((r) => r.frames >= lo && r.frames < hi);
+  return { count: drops.length, longest: drops.reduce((a, b) => (a && a.frames >= b.frames ? a : b), null) };
 }
 
 /**
@@ -761,9 +913,11 @@ function micStops(refRuns, speech) {
  * 1 ms or more, ZeroRuns.zeroFrames, / all frames), late
  * (renderPauses().late), levelChanges ([{atSec, fromDb, toDb}]; taken from
  * the tone's "level" events when absent), refRuns (the microphone's zero
- * runs over the whole check, [{startFrame, frames}]: at least every run of
- * GAP_MS or more. Tone mode needs them for "capture paused"; mic mode falls
- * back to speech.micPauses) }.
+ * runs over the whole check, [{startFrame, frames, atSec?, phase?}]: every
+ * run of GAP_MS or more, and every run of DROPOUT_MS up to GAP_MS once the
+ * microphone's sources have settled. Tone mode needs them for the
+ * microphone's silences and drop-outs; mic mode falls back to
+ * speech.micPauses for its silences) }.
  * It fails on: any gap (a tone gap, every outage; counts.gaps counts too,
  * also a gap that has no event, such as one still going on when the check
  * ended); other sound mixed into the tone (its "noise" events or
@@ -772,22 +926,38 @@ function micStops(refRuns, speech) {
  * DROPOUT_MS or more (mic); more than 6 clicks per 30 minutes on the tone's
  * road (tone mode) or on the microphone's road; more than 6 short drop-outs
  * per 30 minutes (mic mode); missing words (findGaps, mic mode); any
- * recovery; the microphone itself silent for GAP_MS or more ("capture
- * paused": the reason begins "The microphone itself stopped"; without
- * refRuns or speech a line says it was not checked). The microphone's holes
- * and "capture paused" count only when it has no noise gate
- * (micZeroFraction < NOISE_GATE_FRACTION); otherwise a line says so and the
- * microphone's road uses only its buffer's slope (micPath.slopePpm), and
- * says it could not be measured only when the readings were too few. With
- * nothing failing, a tone quieter than TONE_LEVEL_MIN_DB or a drop in volume
- * of 3 dB or more needs a setting changed ("fix-setting"). "no-signal":
- * nothing on the cable was measured, so tonePath is null and the lines say
- * gaps were not checked. In tone mode: the tone was never found. In mic
- * mode: no speech analysis, a voice on the microphone that never reached
- * CABLE Output, or CABLE Output that carried only digital silence
- * (speech.cableSilent). Late deliveries never fail: a line reports them.
+ * recovery; the microphone itself silent for GAP_MS or more, however long
+ * (a capture Windows paused, or a muted headset: the same exact zeros; the
+ * reason begins "Your microphone sent only digital silence"; without refRuns
+ * or speech a line says it was not checked); the microphone itself silent
+ * for DROPOUT_MS up to GAP_MS (its own drop-outs: the reason begins "The
+ * microphone itself dropped out"; without refRuns a line says they were not
+ * checked). The microphone's holes, drop-outs and silences count only when
+ * it has no noise gate (noiseGateOf: NOISE_GATE_FRACTION or more of digital
+ * silence that comes as a gate's does, in GATE_MIN_RUNS or more silences or
+ * mostly in short ones; one or a few long silences are never a gate);
+ * otherwise a line says so, and the microphone's road is gatedMicRoad's:
+ * the drops its buffer's slope predicts when the slope shows a faster clock;
+ * otherwise the holes seen, which a slower clock's hidden holes can only add
+ * to: more than 6 per 30 minutes fail ("at least"), fewer leave the road
+ * not measured (a line says so, and the checklist's clicks row is a note),
+ * never a pass. A buffer that had already filled when the readings began
+ * (micPath.fullAtStart) has no slope: its road is not measured unless holes
+ * tell. micSilence says whether the microphone's own silences were judged
+ * (checked: false with a noise gate or without a record of them);
+ * gateSummary makes the gaps row a note then. With nothing failing, a tone
+ * quieter than TONE_LEVEL_MIN_DB or a drop in volume of 3 dB or more needs a
+ * setting changed ("fix-setting"). "no-signal": nothing on the cable was
+ * measured, so tonePath is null and the lines say gaps were not checked. In
+ * tone mode: the tone was never found. In mic mode: no speech analysis, a
+ * voice on the microphone that never reached CABLE Output, or CABLE Output
+ * that carried only digital silence (speech.cableSilent); and, when nothing
+ * failed, less speech than MIN_SPEECH_SEC or MIN_SPEECH_SHARE of the check
+ * (only the silence was checked, which is no pass). Late deliveries never
+ * fail: a line reports them.
  * → { verdict: "pass" | "fix-setting" | "fail" | "no-signal", reasons, tonePath:
- * {ticksPer30Min, ppm, direction} | null, micPath, lines (at most 10) }
+ * {ticksPer30Min, ppm, direction} | null, micPath, lines (at most 10),
+ * micSilence: {checked, gate} }
  */
 export function longVerdict(input) {
   const inp = input && typeof input === "object" ? input : {};
@@ -801,7 +971,12 @@ export function longVerdict(input) {
   const micPath = inp.micPath && typeof inp.micPath === "object" ? inp.micPath : null;
   const outages = list(inp.outages);
   const recoveries = isNum(inp.recoveries) ? inp.recoveries : 0;
-  const noiseGate = isNum(inp.micZeroFraction) && inp.micZeroFraction >= LIMITS.NOISE_GATE_FRACTION;
+  // A noise gate by the pattern of the microphone's silences, not by their total: one long silence is not one.
+  const noiseGate = noiseGateOf(
+    inp.micZeroFraction,
+    Array.isArray(inp.refRuns) ? inp.refRuns : speech?.micPauses,
+    durationSec * FRAMES_PER_MS * 1000,
+  );
   // Mic mode measured nothing on the cable when the voice heard on the microphone never arrived there, or when
   // CABLE Output carried only digital silence (a muted microphone, nothing sent, no speech).
   const voiceLost = mode === "mic" && (!speech || (!isNum(speech.lagMs) && (speech.speechSec ?? 0) > 0));
@@ -881,64 +1056,94 @@ export function longVerdict(input) {
       fails.push(`Too many clicks from the meeting's side: about ${per30(ticksPer30Min)} per 30 minutes (6 at most).`);
     }
     const n = ticks ?? events.filter((e) => e.kind === "hole" || e.kind === "skip" || e.kind === "click").length;
-    const offset = isNum(fromEvents.ppm) ? Math.round(Math.abs(fromEvents.ppm)) : 0;
-    const differ = offset > 0 ? `; Windows' default playback device and VB-CABLE differ by about ${offset} ppm` : "";
+    // The offset itself (tonePath.ppm) is for the results only; the page says it in words, and only when the
+    // clicks came at a steady pace (one or two can be any glitch).
+    const differ = fromEvents.steady
+      ? ", at a steady pace: Windows' default playback device and VB-CABLE run at slightly different speeds"
+      : "";
     lines.push(
       n > 0
-        ? `Clicks from the meeting's side of the sound: ${n} (about ${per30(ticksPer30Min ?? 0)} per 30 minutes${differ}).`
+        ? `Clicks from the meeting's side of the sound: ${n} (about ${per30(ticksPer30Min ?? 0)} per 30 minutes)${differ}.`
         : "Clicks from the meeting's side of the sound: none.",
     );
   }
 
   // The microphone's road: microphone → VB-CABLE.
-  const tooShort = "The microphone's clock could not be measured (the check was too short).";
-  const micClicks = (ticks, how) => {
+  const tooShort =
+    micPath?.fullAtStart === true
+      ? "The microphone's clock could not be measured: its buffer had already filled when the check began."
+      : "The microphone's clock could not be measured (the check was too short).";
+  // The offset in ppm stays in the results (micPath); the page says it in words.
+  const micClicks = (ticks, how, atLeast = false) => {
+    const about = atLeast ? "at least" : "about";
     if (ticks > LIMITS.TICKS_PER_30_MIN) {
-      fails.push(`Too many clicks from your microphone's side: about ${per30(ticks)} per 30 minutes (6 at most).`);
+      fails.push(`Too many clicks from your microphone's side: ${about} ${per30(ticks)} per 30 minutes (6 at most).`);
     }
-    lines.push(`Clicks from your microphone's side: about ${per30(ticks)} per 30 minutes (${how}).`);
+    lines.push(`Clicks from your microphone's side: ${about} ${per30(ticks)} per 30 minutes (${how}).`);
   };
+  const FASTER_WORDS = "its clock runs faster than VB-CABLE's";
   if (micPath && noiseGate) {
-    // With a noise gate the holes say nothing (a slower clock's holes hide among the gate's silence): only the
-    // buffer's slope counts, and it can only tell a faster clock.
-    const slope = slopeOf(micPath);
-    if (!slope) {
+    // With a noise gate a slower clock's holes hide among the gate's silence: the holes seen still count, but only
+    // as a lower bound, and the buffer's slope can only tell a faster clock.
+    const road = gatedMicRoad(micPath);
+    if (!road) {
       lines.push(tooShort);
+    } else if (!road.atLeast) {
+      micClicks(road.ticks, FASTER_WORDS, road.slope.lowerBound);
     } else {
-      micClicks(
-        dropsOf(slope.ppm),
-        slope.ppm > FASTER_PPM
-          ? `its clock runs ${slope.lowerBound ? "at least " : ""}${Math.round(slope.ppm)} ppm faster than VB-CABLE's`
-          : "its clock is not faster than VB-CABLE's; whether it is slower could not be checked",
-      );
+      const why = `${road.slope ? "its clock is not faster than VB-CABLE's" : "the check was too short to measure its clock"}; its noise gate hides the clicks a slower clock makes`;
+      const n = per30(road.ticks);
+      if (road.ticks > LIMITS.TICKS_PER_30_MIN) {
+        fails.push(`Too many clicks from your microphone's side: at least ${n} per 30 minutes (6 at most).`);
+        lines.push(`Clicks from your microphone's side: at least ${n} per 30 minutes (${why}, so there may be more).`);
+      } else {
+        lines.push(`Clicks from your microphone's side: not measured${road.holes > 0 ? `, at least ${n} per 30 minutes` : ""} (${why}).`);
+      }
     }
   } else if (micPath) {
     const holesCount = isNum(micPath.holes) ? micPath.holes : 0;
     if (!(isNum(micPath.ppm) || holesCount > 0)) {
       lines.push(tooShort);
     } else {
-      const ppm = isNum(micPath.ppm) ? Math.round(Math.abs(micPath.ppm)) : null;
-      micClicks(
-        micPath.ticksPer30Min ?? 0,
-        micPath.direction === "faster" && ppm !== null
-          ? `its clock runs ${micPath.ppmIsLowerBound === true ? "at least " : ""}${ppm} ppm faster than VB-CABLE's`
-          : micPath.direction === "slower" && ppm !== null
-            ? `its clock runs ${ppm} ppm slower than VB-CABLE's`
-            : "its clock keeps time with VB-CABLE's",
-      );
+      const faster = micPath.direction === "faster" && isNum(micPath.ppm);
+      // Holes tell a slower clock only when they come again and again: one or two can be any glitch.
+      const how = faster
+        ? FASTER_WORDS
+        : micPath.direction === "slower"
+          ? holesCount >= 3
+            ? "its clock runs slower than VB-CABLE's"
+            : `${holesCount === 1 ? "one short hole" : "two short holes"}: too few to tell its clock`
+          : "its clock keeps time with VB-CABLE's";
+      micClicks(micPath.ticksPer30Min ?? 0, how, faster && micPath.ppmIsLowerBound === true);
     }
   } else {
     lines.push("The microphone's clock was not measured on this output route.");
   }
 
-  // The microphone itself: silent for GAP_MS or more while the app was capturing ("capture paused").
+  // The microphone itself: digital silence for GAP_MS or more while the app was capturing ("capture paused", or
+  // a muted headset: the same exact zeros).
   const stops = noiseGate ? null : micStops(inp.refRuns, speech);
+  const why = "it was muted, or Windows paused it.";
   if (stops && isNum(stops.count) && stops.count > 0) {
-    fails.push(`${MIC_STOPPED} ${times(stops.count)} (the longest for ${lengthOfMs(stops.longestMs)}): Windows paused it.`);
+    const where = whereText(stops.atSec, stops.phase);
+    fails.push(`${MIC_STOPPED} ${times(stops.count)} (the longest for ${lengthOfMs(stops.longestMs)}${where}): ${why}`);
   } else if (stops && isNum(stops.totalMs)) {
-    fails.push(`${MIC_STOPPED} for ${lengthOfMs(stops.totalMs)} in all: Windows paused it.`);
+    fails.push(`${MIC_STOPPED} for ${lengthOfMs(stops.totalMs)} in all: ${why}`);
   } else if (!noiseGate && stops === null) {
     lines.push("Whether the microphone itself stopped was not checked (no record of its silences).");
+  }
+  const micSilence = { checked: stops !== null, gate: noiseGate };
+
+  // The microphone itself: drop-outs of DROPOUT_MS up to GAP_MS. In tone mode the tone took its place on the
+  // cable, but in normal use the voice carries each one to the meeting, as it carries a stop.
+  const micDropouts = noiseGate ? null : micDrops(inp.refRuns);
+  if (micDropouts && micDropouts.count > 0) {
+    const l = micDropouts.longest;
+    const where = whereText(isNum(l.atSec) ? l.atSec : l.startFrame / (FRAMES_PER_MS * 1000), l.phase);
+    // Whole ms, rounded down: a run just under GAP_MS is "99 ms", never "100 ms".
+    fails.push(`${MIC_DROPPED} ${times(micDropouts.count)} for 20 to 100 ms (the longest ${Math.floor(l.frames / FRAMES_PER_MS)} ms${where}).`);
+  } else if (!noiseGate && micDropouts === null && stops !== null) {
+    lines.push("Whether the microphone itself dropped out for 20 to 100 ms was not checked (no record of its short silences).");
   }
 
   // Mic mode: words, drop-outs.
@@ -953,7 +1158,7 @@ export function longVerdict(input) {
     const short = drops.filter((d) => d.ms < LIMITS.DROPOUT_MS);
     if (long.length) {
       const longest = long.reduce((m, d) => Math.max(m, d.ms), 0);
-      fails.push(`CABLE Output dropped out ${times(long.length)} (the longest for ${lengthOfMs(longest)}).`);
+      fails.push(`${CABLE_DROPPED} ${times(long.length)} (the longest for ${lengthOfMs(longest)}).`);
     }
     if (rate(short.length) > LIMITS.TICKS_PER_30_MIN) {
       fails.push(`Too many short drop-outs in CABLE Output: about ${per30(rate(short.length))} per 30 minutes (6 at most).`);
@@ -985,14 +1190,14 @@ export function longVerdict(input) {
     const minDb = isNum(tone.minStableDb) ? tone.minStableDb : tone.lockDb;
     if (minDb < LIMITS.TONE_LEVEL_MIN_DB) {
       fixes.push(
-        `The meeting hears your voice ${(TONE_DB - minDb).toFixed(1)} dB quieter than it should: in Windows sound settings set Communications to “Do nothing”, set CABLE Input and CABLE Output to 100 %, and in Zoom untick “Automatically adjust microphone volume”. Then run the check again.`,
+        `The meeting hears the sound ${(TONE_DB - minDb).toFixed(1)} dB quieter than it should. ${SETTINGS_FIX} ${AFTER_FIX}`,
       );
     }
     for (const c of levelChanges) {
       if (!isNum(c.fromDb) || !isNum(c.toDb) || c.toDb - c.fromDb > LIMITS.LEVEL_WARN_DB) continue;
       const at = isNum(c.atSec) ? ` at ${formatClock(c.atSec)}` : "";
       fixes.push(
-        `Windows turned the voice down by ${(c.fromDb - c.toDb).toFixed(1)} dB${at}, probably when the meeting started: in Windows sound settings set Communications to “Do nothing”. Then run the check again.`,
+        `Windows turned the sound down by ${(c.fromDb - c.toDb).toFixed(1)} dB${at}, probably when the meeting started. ${COMMS_FIX} ${AFTER_FIX}`,
       );
     }
     lines.push(
@@ -1014,6 +1219,11 @@ export function longVerdict(input) {
     );
   }
 
+  // A check with your voice that heard (almost) no speech checked only the silence: it never passes. What it
+  // found still fails it (a capture pause, CABLE Output drop-outs, an outage); otherwise it measured nothing.
+  const heardSec = speech && isNum(speech.speechSec) ? speech.speechSec : 0;
+  const tooQuiet = mode === "mic" && !noSignal && heardSec < Math.max(LIMITS.MIN_SPEECH_SEC, LIMITS.MIN_SPEECH_SHARE * durationSec);
+
   let verdict;
   let reasons;
   if (noSignal) {
@@ -1028,6 +1238,13 @@ export function longVerdict(input) {
   } else if (fails.length) {
     verdict = "fail";
     reasons = fails;
+  } else if (tooQuiet) {
+    verdict = "no-signal";
+    reasons = [
+      heardSec > 0
+        ? `Too little speech was heard (${lengthText(heardSec, heardSec >= 90)} in ${lengthText(durationSec, durationSec >= 90)}), so the check could not tell whether words went missing: run it again and read aloud the whole time.`
+        : "No speech was heard, so the check could not tell whether words went missing: run it again and read aloud the whole time.",
+    ];
   } else if (fixes.length) {
     verdict = "fix-setting";
     reasons = fixes;
@@ -1035,7 +1252,7 @@ export function longVerdict(input) {
     verdict = "pass";
     reasons = [];
   }
-  return { verdict, reasons, tonePath, micPath, lines: lines.slice(0, 10) };
+  return { verdict, reasons, tonePath, micPath, lines: lines.slice(0, 10), micSilence };
 }
 
 // ---------- Windows Audio restart ----------
@@ -1069,7 +1286,7 @@ export function restartVerdict(record) {
   }
   return {
     verdict: "fail",
-    text: `fail (${back}; the app's own part took ${Math.round(app + wait)} ms: ${Math.round(wait)} ms of waiting, then ${Math.round(app)} ms to rebuild)`,
+    text: `fail (${back}; the app's own part took ${Math.round(app + wait)} ms: it waited ${Math.round(wait)} ms before trying again, then took ${Math.round(app)} ms to bring the voice back)`,
   };
 }
 
@@ -1093,6 +1310,7 @@ function securePageRow(results) {
 function microphoneRow(results) {
   const name = "Microphone: no prompt, processing off";
   const mic = results.voice?.mic ?? null;
+  const start = results.voice?.start ?? null;
   const step1 = results.microphone ?? null;
   const settings = mic?.settings ?? null;
   const allOff = settings
@@ -1104,21 +1322,19 @@ function microphoneRow(results) {
   if (!allOff) {
     return row(name, "fail", "Echo cancellation, noise suppression or auto gain is still on for the microphone.");
   }
-  const note = "Your notes from step 4 say whether Windows or the app asked anything on the 1st and 3rd start.";
-  const slow = [mic?.unlockMs, mic?.openedInMs].filter((ms) => isNum(ms) && ms > 1500);
+  // Whether anything asked at the 1st and 3rd start is known only from the user's notes (and the log): the row
+  // stays a note until then, never a pass. A slow open of this launch's first start hints at a prompt; a later
+  // reopen (after a fault or a change) says nothing about one.
+  const note =
+    "Whether Windows or the app asked anything at the 1st and 3rd start: your notes (Session B step 4); the first start's timings are in the log file.";
+  const first = (key) => (isNum(start?.[key]) ? start[key] : mic?.[key]);
+  const slow = [first("unlockMs"), first("openedInMs")].filter((ms) => isNum(ms) && ms > 1500);
   if (slow.length) {
     const ms = Math.max(...slow);
-    return row(name, "note", `Processing is off. The microphone took ${(ms / 1000).toFixed(1)} s to open: was there a prompt? ${note}`);
+    return row(name, "note", `Processing is off. The microphone took ${(ms / 1000).toFixed(1)} s to open at the start: was there a prompt? ${note}`);
   }
-  return row(name, "pass", `Processing is off. ${note}`);
+  return row(name, "note", `Processing is off. ${note}`);
 }
-
-const ROUTE_WORDS = {
-  context: "the app's audio engine",
-  element: "an audio element (fallback)",
-  "context-after-permission": "the app's audio engine, after the permission fix",
-  "element-after-permission": "an audio element (fallback), after the permission fix",
-};
 
 function cableRow(results) {
   const name = "Voice into CABLE Input";
@@ -1126,21 +1342,45 @@ function cableRow(results) {
   if (voice.state === "sink-refused") return row(name, "fail", "The app could not send your voice into “CABLE Input”.");
   const method = voice.output?.method;
   if (!method) return row(name, "todo", "The voice is not going into CABLE Input yet.");
-  const words = ROUTE_WORDS[method] ?? method;
+  const words = routeWords(method);
   const changes = list(voice.output?.routeChanges);
+  // The user's own switches under Advanced (Session B step 7.6, cause "route") are a comparison, not a problem.
+  const byApp = changes.filter((c) => c.cause !== "route");
+  const byYou = changes.length - byApp.length;
   const extra = method === "context" ? "" : " It works, but this route may add delay or clicks.";
-  if (changes.length) {
-    return row(name, "note", `Sent through ${words}.${extra} The route changed ${times(changes.length)} during the session: to discuss.`);
+  const forced = voice.output?.routePreference === "element" ? " It is the one you chose under Advanced: set it back to Automatic." : "";
+  const yours = byYou ? ` You switched the route ${times(byYou)} under Advanced (your comparison run).` : "";
+  if (byApp.length) {
+    return row(name, "note", `Sent through ${words}.${extra}${forced} The app changed the route by itself ${times(byApp.length)} during the session: to discuss.${yours}`);
   }
-  return row(name, "pass", `Sent through ${words}.${extra}`);
+  return row(name, "pass", `Sent through ${words}.${extra}${forced}${yours}`);
 }
+
+/**
+ * A check forced onto the audio element under Advanced (Session B step 7.6): a comparison, listed beside its row and
+ * never counted. A check without routePreference (results made before it was recorded) counts as the normal route.
+ */
+const isComparison = (run) => run?.routePreference === "element";
+
+/**
+ * The check ran on the route the user had chosen. false: a choice made during an outage was not applied yet, or a
+ * forced audio element route was not used: such a check belongs to neither side and counts for no row. Results
+ * made before it was recorded count as chosen.
+ */
+const asChosen = (run) => run?.routeAsChosen !== false;
+
+/** A check on the app's normal route: counted by the rows. */
+const isNormalRoute = (run) => !isComparison(run) && asChosen(run);
+
+/** A comparison check through the audio element, on that route: listed beside its row. */
+const isElementComparison = (run) => isComparison(run) && asChosen(run);
 
 /** The delay runs that measured clearly, on the normal route ("counted") and forced onto the audio element. */
 function delayRuns(results) {
   const runs = list(results.checks?.delay).filter(
     (r) => isNum(r.estimateMs) && ["good", "borderline", "slow"].includes(r.verdict),
   );
-  return { counted: runs.filter((r) => r.routePreference !== "element"), element: runs.filter((r) => r.routePreference === "element") };
+  return { counted: runs.filter(isNormalRoute), element: runs.filter(isElementComparison) };
 }
 
 function delayRow(results) {
@@ -1149,7 +1389,7 @@ function delayRow(results) {
   const elementText = element.length
     ? ` Through the audio element (not counted): ${element.map((r) => `${Math.round(r.estimateMs)} ms`).join(", ")}.`
     : "";
-  if (!counted.length) return row(name, "todo", `Press “Measure the delay” (step 6).${elementText}`);
+  if (!counted.length) return row(name, "todo", `Press “Measure the delay” in step 3 of this page (Session B step 6).${elementText}`);
   const top = counted.reduce((a, b) => (b.estimateMs > a.estimateMs ? b : a));
   const ms = Math.round(top.estimateMs);
   const fifo = isNum(top.micFifoMs) && top.micFifoMs >= LIMITS.MIC_FIFO_NOTE_MS
@@ -1162,26 +1402,66 @@ function delayRow(results) {
   return row(name, "fail", `${text} Too slow.`);
 }
 
-/** The check failed because the microphone itself stopped (longVerdict's "capture paused" reason). */
+/** The check failed because the microphone itself sent only digital silence (longVerdict's "capture paused" reason). */
 const micStopped = (run) =>
   run.verdict === "fail" && Array.isArray(run.reasons) && run.reasons.some((t) => typeof t === "string" && t.startsWith(MIC_STOPPED));
+
+/**
+ * The check could not judge the microphone's own silences: it sends digital silence in pauses (a noise gate),
+ * or no record of them was kept. Such a check cannot pass the gaps row, only make it a note.
+ */
+const micUnchecked = (run) => run.micSilence?.checked === false || run.micPath?.noiseGate === true;
+
+/** The gaps row's note for the first of `runs` that could not judge the microphone's silences, with what it saw. */
+function micUncheckedText(runs) {
+  const run = runs.find(micUnchecked);
+  if (!run) return "";
+  const s = run.micSilence ?? {};
+  if (s.checked === false && s.gate === false) return " Whether your microphone itself stopped was not checked (no record of its silences).";
+  const top = list(s.longest)[0];
+  const saw =
+    isNum(s.count) && s.count > 0 && top && isNum(top.ms)
+      ? `it sent only digital silence ${times(s.count)} (the longest for ${lengthOfMs(top.ms)}${whereText(top.atSec, top.phase)}): a noise gate, or a microphone that kept stopping`
+      : "it sends digital silence in pauses (a noise gate?)";
+  return ` Whether your microphone itself stopped could not be checked: ${saw}. I decide with the details.`;
+}
+
+/** The check failed because the microphone itself dropped out for 20 to 100 ms (longVerdict's reason). */
+const micDropped = (run) =>
+  run.verdict === "fail" && Array.isArray(run.reasons) && run.reasons.some((t) => typeof t === "string" && t.startsWith(MIC_DROPPED));
+
+/** "the microphone itself dropped out twice for 20 to 100 ms", for the checks that failed on it. */
+function droppedWords(runs) {
+  const n = runs.reduce((a, r) => a + (isNum(r.micDropouts?.count) ? r.micDropouts.count : 0), 0);
+  return `the microphone itself dropped out${n > 0 ? ` ${times(n)}` : ""} for 20 to 100 ms`;
+}
 
 /** A check that measured nothing: its signal never reached CABLE Output. It counts as no check at all. */
 const measuredNothing = (run) => run.verdict === "no-signal";
 
+/**
+ * Why a long check ended early for a reason nobody chose (CABLE Output or the test tone lost, the voice
+ * stopped, …): its endedEarly note; null when it ran to its end or was stopped.
+ */
+const earlyNote = (run) => {
+  const e = run?.endedEarly;
+  return e && typeof e === "object" && typeof e.note === "string" && e.note ? e.note : null;
+};
+
 /** "1 gap", "2 gaps"; "1 recovery", "3 recoveries". */
 const count = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
 
-/** The outages, rendering pauses and recoveries of some checks, in words: ["1 outage", "2 recoveries"]. */
+/** The outages, rendering pauses and recoveries of some checks, in words: ["the app had to bring the sound back once"]. */
 function stopWords(runs) {
   const sum = (f) => runs.reduce((a, r) => a + f(r), 0);
   const outages = sum((r) => list(r.outages).length);
   const pauses = sum((r) => list(r.renderPauses).length);
   const recoveries = sum((r) => (isNum(r.recoveries) ? r.recoveries : 0));
   const out = [];
-  if (outages) out.push(count(outages, "outage"));
-  if (pauses) out.push(count(pauses, "rendering pause"));
-  if (recoveries) out.push(count(recoveries, "recovery", "recoveries"));
+  // A recovery is one of the outages: the larger of the two counts, never both.
+  const stops = Math.max(outages, recoveries);
+  if (stops) out.push(`the app had to bring the sound back ${times(stops)}`);
+  if (pauses) out.push(`the app's sound paused ${times(pauses)}`);
   return out;
 }
 
@@ -1199,12 +1479,38 @@ function otherSound(run) {
 
 const NOTHING_MEASURED = " In the last one the test tone never reached “CABLE Output”, so it measured nothing.";
 
+/** Minutes, rounded, of a number of seconds (0 for anything else). */
+const minutesOf = (sec) => Math.round((isNum(sec) ? sec : 0) / 60);
+
+/**
+ * The long drop-outs (DROPOUT_MS or more) of a check with your voice: its
+ * speech.longDropoutCount (every one). Results made before the count was
+ * kept list only their first 50 drop-outs, short and long mixed: those in
+ * the list, or the number its own reason gives, whichever is more.
+ */
+function longDropouts(run) {
+  const n = run.speech?.longDropoutCount;
+  if (isNum(n)) return n;
+  const listed = list(run.speech?.dropouts).filter((d) => (d.ms ?? 0) >= LIMITS.DROPOUT_MS).length;
+  const said = Array.isArray(run.reasons) ? run.reasons.find((t) => typeof t === "string" && t.startsWith(CABLE_DROPPED)) : null;
+  return Math.max(listed, said ? timesIn(said.slice(CABLE_DROPPED.length)) : 0);
+}
+
 function gapsRow(results) {
   const name = "No gaps while minimized and hidden";
-  const meet = " Meet call still open at the end: your note (step 7.5).";
+  const meet = " Meet call still open at the end: your note (Session B step 7.5).";
   const long = list(results.checks?.long);
-  const toneRuns = long.filter((r) => r.mode === "tone");
-  const enough = (r) => (r.phases?.minimizedSec ?? 0) >= LIMITS.MIN_PHASE_SEC && (r.phases?.hiddenSec ?? 0) >= LIMITS.MIN_PHASE_SEC;
+  // Checks forced onto the audio element (Session B step 7.6) are comparisons: they never count here.
+  const counted = long.filter(isNormalRoute);
+  const toneRuns = counted.filter((r) => r.mode === "tone");
+  // A page in Edge cannot tell minimized from hidden (both are just "not visible"): an Edge run is judged on the
+  // time it was not on screen, both phases together.
+  const edge = results.shell === "browser";
+  const away = (r) => (r.phases?.minimizedSec ?? 0) + (r.phases?.hiddenSec ?? 0);
+  const enough = (r) =>
+    edge
+      ? away(r) >= 2 * LIMITS.MIN_PHASE_SEC
+      : (r.phases?.minimizedSec ?? 0) >= LIMITS.MIN_PHASE_SEC && (r.phases?.hiddenSec ?? 0) >= LIMITS.MIN_PHASE_SEC;
   const run = lastOf(toneRuns, (r) => !measuredNothing(r) && enough(r));
   if (!run) {
     const latest = toneRuns[toneRuns.length - 1];
@@ -1212,10 +1518,19 @@ function gapsRow(results) {
       ? ""
       : measuredNothing(latest)
         ? NOTHING_MEASURED
-        : ` The last one had ${Math.round((latest.phases?.minimizedSec ?? 0) / 60)} min minimized and ${Math.round((latest.phases?.hiddenSec ?? 0) / 60)} min hidden.`;
-    return row(name, "todo", `Run the long check (step 7): it needs 25 min minimized and 25 min hidden.${sofar}${meet}`);
+        : edge
+          ? ` The last one was ${minutesOf(away(latest))} min not on screen.`
+          : ` The last one had ${minutesOf(latest.phases?.minimizedSec)} min minimized and ${minutesOf(latest.phases?.hiddenSec)} min hidden.`;
+    const why = latest && !measuredNothing(latest) && earlyNote(latest) ? ` ${earlyNote(latest)}` : "";
+    const need = edge
+      ? "Run the long check with the Edge window minimized (Session B step 7): it needs 50 min not on screen (Edge can't tell minimized from hidden)."
+      : "Run the long check (Session B step 7): it needs 25 min minimized and 25 min hidden.";
+    return row(name, "todo", `${need}${sofar}${why}${meet}`);
   }
-  const stopped = "the microphone itself stopped (Windows paused it)";
+  // A check that ended early for a reason nobody chose did not cover what it was asked to, whatever the part
+  // it recorded says (its own verdict fails): so does this row, with that reason first.
+  const early = earlyNote(run);
+  const stopped = "your microphone sent only digital silence (muted, or paused by Windows)";
   const problems = [];
   const gaps = run.tone?.counts?.gaps ?? 0;
   const dropouts = run.tone?.counts?.dropouts ?? 0;
@@ -1224,24 +1539,33 @@ function gapsRow(results) {
   if (dropouts) problems.push(count(dropouts, "drop-out"));
   problems.push(...stopWords([run]));
   if (noise) problems.push(`other sound mixed into the test tone${noise > 0 ? ` ${times(noise)}` : ""}`);
-  // The tone replaced the microphone on the cable, but a microphone that stopped while hidden is a gap in the voice.
+  // The tone replaced the microphone on the cable, but a microphone that stopped or dropped out while hidden is a
+  // gap or a drop-out in the voice.
   if (micStopped(run)) problems.push(stopped);
+  if (micDropped(run)) problems.push(droppedWords([run]));
   // The checks with your voice fail this row on the same problems. One that measured nothing counts for nothing.
-  const voiceRuns = long.filter((r) => r.mode === "mic" && !measuredNothing(r));
+  const voiceRuns = counted.filter((r) => r.mode === "mic" && !measuredNothing(r));
   const sum = (f) => voiceRuns.reduce((a, r) => a + f(r), 0);
   const words = sum((m) => list(m.speech?.gaps).length);
-  const drops = sum((m) => list(m.speech?.dropouts).filter((d) => (d.ms ?? 0) >= LIMITS.DROPOUT_MS).length);
+  const drops = sum(longDropouts);
   const voice = [];
   if (words) voice.push(`missing words ${times(words)}`);
   if (drops) voice.push(count(drops, "drop-out"));
   voice.push(...stopWords(voiceRuns));
   if (voiceRuns.some(micStopped)) voice.push(stopped);
-  const phases = `${Math.round(run.phases.minimizedSec / 60)} min minimized and ${Math.round(run.phases.hiddenSec / 60)} min hidden`;
-  if (problems.length || voice.length) {
+  if (voiceRuns.some(micDropped)) voice.push(droppedWords(voiceRuns.filter(micDropped)));
+  if (voiceRuns.some(earlyNote)) voice.push("it ended early");
+  const phases = edge
+    ? `${minutesOf(away(run))} min not on screen (Edge can't tell minimized from hidden)`
+    : `${minutesOf(run.phases.minimizedSec)} min minimized and ${minutesOf(run.phases.hiddenSec)} min hidden`;
+  if (early || problems.length || voice.length) {
     const tonePart = problems.length ? `In ${phases}: ${problems.join(", ")}.` : `No gaps in ${phases}.`;
     const voicePart = voice.length ? ` In the check${voiceRuns.length > 1 ? "s" : ""} with your voice: ${voice.join(", ")}.` : "";
-    return row(name, "fail", `${tonePart}${voicePart}${meet}`);
+    return row(name, "fail", `${early ? `${early} ` : ""}${tonePart}${voicePart}${meet}`);
   }
+  // A microphone whose own silences could not be judged (a noise gate) never passes this row silently: whether
+  // it stopped while hidden is unknown, so I decide with the details.
+  const unchecked = micUncheckedText([run, ...voiceRuns]);
   // Settings checks that belong to this row (they ask for "Do nothing" and a re-run, and fail nothing by
   // themselves): the tone's level, and the voice's level in CABLE Output in a delay run on the normal route.
   const quiet = delayRuns(results)
@@ -1250,49 +1574,68 @@ function gapsRow(results) {
   if (run.verdict === "fix-setting" || quiet) {
     const notes = run.verdict === "fix-setting" && Array.isArray(run.reasons) ? run.reasons.filter((x) => typeof x === "string") : [];
     if (quiet) {
-      notes.push(`In “Measure the delay” the voice arrived ${(-quiet.levelDiffDb).toFixed(1)} dB quieter in CABLE Output: ${QUIET_ADVICE}`);
+      notes.push(`In “Measure the delay” the voice arrived ${(-quiet.levelDiffDb).toFixed(1)} dB quieter in CABLE Output. ${QUIET_ADVICE}`);
     }
-    return row(name, "note", `No gaps in ${phases}, but a setting needs changing.${notes.length ? ` ${notes.join(" ")}` : ""}${meet}`);
+    return row(name, "note", `No gaps in ${phases}, but a setting needs changing.${notes.length ? ` ${notes.join(" ")}` : ""}${unchecked}${meet}`);
   }
+  if (unchecked) return row(name, "note", `No gaps in ${phases}.${unchecked}${meet}`);
   return row(name, "pass", `No gaps in ${phases}.${meet}`);
 }
 
 function ticksRow(results) {
-  const name = "No clock-crossing clicks";
+  const name = "No regular clicks";
   const longEnough = list(results.checks?.long).filter((r) => r.mode === "tone" && (r.recordedSec ?? 0) >= 30 * 60);
-  const run = lastOf(longEnough, (r) => !measuredNothing(r));
+  const counted = longEnough.filter(isNormalRoute);
+  // Session B step 7.6's checks through the audio element: their meeting's side is listed beside the row.
+  const compared = longEnough.filter((r) => isElementComparison(r) && !measuredNothing(r));
+  const perRun = (r) => (isNum(r.tonePath?.ticksPer30Min) ? `about ${per30(r.tonePath.ticksPer30Min)} per 30 min` : "not measured");
+  const comparedText = compared.length ? ` Through the audio element (not counted): ${compared.map(perRun).join(", ")}.` : "";
+  const run = lastOf(counted, (r) => !measuredNothing(r));
   if (!run) {
-    const latest = longEnough[longEnough.length - 1];
+    const latest = counted[counted.length - 1];
     const extra = latest && measuredNothing(latest) ? NOTHING_MEASURED : "";
-    return row(name, "todo", `Needs a long check with the test tone of at least 30 minutes (step 7).${extra}`);
+    return row(name, "todo", `Needs a long check with the test tone of at least 30 minutes (Session B step 7).${extra}${comparedText}`);
   }
   const tone = run.tonePath?.ticksPer30Min;
   const mp = run.micPath ?? null;
   let mic = null;
+  let atLeast = false; // a noise gate hides a slower clock's clicks: mic is only a lower bound
   if (mp && mp.noiseGate === true) {
-    // The holes say nothing with a noise gate: the buffer's slope alone, as in the check's own verdict.
-    const slope = slopeOf(mp);
-    mic = slope ? dropsOf(slope.ppm) : null;
+    // As in the check's own verdict: the holes seen count, but only as a lower bound unless the buffer's slope
+    // shows a faster clock.
+    const road = gatedMicRoad(mp);
+    mic = road ? road.ticks : null;
+    atLeast = road !== null && road.atLeast;
   } else if (mp && (isNum(mp.ppm) || (mp.holes ?? 0) > 0)) {
     mic = isNum(mp.ticksPer30Min) ? mp.ticksPer30Min : null;
   }
+  const tooMany = (x) => isNum(x) && x > LIMITS.TICKS_PER_30_MIN;
   const toneText = isNum(tone) ? `about ${per30(tone)} per 30 min` : "not measured";
-  const micText = isNum(mic) ? `about ${per30(mic)} per 30 min` : "not measured";
+  const micText = !isNum(mic)
+    ? "not measured"
+    : !atLeast
+      ? `about ${per30(mic)} per 30 min`
+      : tooMany(mic)
+        ? `at least ${per30(mic)} per 30 min`
+        : `not measured${mic > 0 ? `, at least ${per30(mic)} per 30 min` : ""}`;
+  const gate = atLeast && !tooMany(mic) ? " Your microphone's noise gate hides the clicks a slower clock makes: I decide with the details." : "";
   const sibling = results.voice?.devices?.defaultOutputIsMicSibling === true
     ? " Windows' default playback device is your headset's own earpiece."
     : "";
-  const text = `The meeting's side: ${toneText}; your microphone's side: ${micText} (6 at most each).${sibling}`;
-  if ((isNum(tone) && tone > LIMITS.TICKS_PER_30_MIN) || (isNum(mic) && mic > LIMITS.TICKS_PER_30_MIN)) {
-    return row(name, "fail", `${text} Run the comparison through the audio element (step 7.6).`);
+  // A check that ended early still counts: it recorded 30 minutes or more, and the rate comes from what it recorded.
+  const early = earlyNote(run) ? ` That check ended early: these come from its first ${minutesOf(run.recordedSec)} min.` : "";
+  const text = `The meeting's side: ${toneText}; your microphone's side: ${micText} (6 at most each).${gate}${sibling}${early}${comparedText}`;
+  if (tooMany(tone) || tooMany(mic)) {
+    return row(name, "fail", compared.length ? text : `${text} Run the comparison through the audio element (Session B step 7.6).`);
   }
-  if (!isNum(tone) || !isNum(mic)) return row(name, "note", text);
+  if (!isNum(tone) || !isNum(mic) || atLeast) return row(name, "note", text);
   return row(name, "pass", text);
 }
 
 function restartRow(results) {
   const name = "Windows Audio restart: back within 2 s";
   const rec = lastOf(list(results.voice?.recoveries), (r) => r.micToo === true);
-  if (!rec) return row(name, "todo", "Restart Windows Audio (step 9), then wait for a new line under Recoveries.");
+  if (!rec) return row(name, "todo", "Restart Windows Audio (Session B step 9), then wait for a new line under Recoveries in step 2 of this page.");
   const v = rec.restart && typeof rec.restart === "object" && rec.restart.verdict ? rec.restart : restartVerdict(rec);
   const back = isNum(rec.outageMs) ? `Back after ${(rec.outageMs / 1000).toFixed(1)} s: ` : "";
   return row(name, v.verdict === "pass" ? "pass" : "fail", `${back}${v.text}.`);
@@ -1301,31 +1644,46 @@ function restartRow(results) {
 function connectRow(results) {
   const ok = results.sanas?.ok;
   if (ok === true) return row("Connect only", "pass", "Sanas accepted the key and this app's address.");
-  if (ok === false) return row("Connect only", "fail", "Sanas did not accept the connection: see the Connect step.");
-  return row("Connect only", "todo", "Press “Connect only” (step 10).");
+  if (ok === false) return row("Connect only", "fail", "Sanas did not accept the connection: see step 5 of this page.");
+  return row("Connect only", "todo", "Press “Connect only” in step 5 of this page (Session B step 10).");
 }
 
 /**
  * The Gate 1 checklist from the collected results (schema 2), in order:
- * secure page; the microphone with its processing off (and the user's note
- * on prompts at the 1st and 3rd start; a microphone that took more than
- * 1.5 s to open hints at a prompt); the voice into CABLE Input (the route
- * method and its changes; "sink-refused" fails); Zoom's Test Mic (the user's
- * note); the delay (the highest estimate of the runs on the normal route;
- * runs forced onto the audio element are listed, not counted); no gaps
- * while minimized and hidden (25 min of each needed, plus the user's note
- * that the Meet call stayed open; the tone check's gaps, drop-outs,
- * outages, rendering pauses, recoveries and other sound in the tone fail it,
- * and so do the checks with your voice: missing words, drop-outs, outages,
- * rendering pauses and recoveries; a microphone that stopped by itself
- * fails it too; with nothing failing, the tone check's "fix-setting" and a
- * delay run on the normal route whose voice arrived more than 3 dB quieter
- * in CABLE Output make it a note); no clock-crossing clicks (each road at
- * most 6 per 30 minutes; with a noise gate the microphone's road from its
- * buffer's slope alone); the Windows Audio restart (the latest recovery
- * that involved both the microphone and the context); Connect only. A long
- * check whose verdict is "no-signal" measured nothing and counts for no
- * row.
+ * secure page; the microphone with its processing off (a note, never a
+ * pass: whether anything asked at the 1st and 3rd start is the user's note;
+ * a first open of the launch (voice.start) that took more than 1.5 s hints
+ * at a prompt); the voice into CABLE Input (the route method and its
+ * changes; "sink-refused" fails); Zoom's Test Mic (the user's note); the
+ * delay (the highest estimate of the runs on the normal route; runs forced
+ * onto the audio element are listed, not counted); no gaps while minimized
+ * and hidden (the latest tone check on the normal route with 25 min of
+ * each, or in Edge, which cannot tell them apart, 50 min not on screen;
+ * plus the user's note that the Meet call stayed open; the tone check's
+ * gaps, drop-outs, outages, rendering pauses, recoveries and other sound in
+ * the tone fail it, and so do the checks with your voice on the normal
+ * route: missing words, every long drop-out, outages, rendering pauses and
+ * recoveries; a microphone that sent only digital silence, or dropped out
+ * by itself for 20 to 100 ms, fails it too (in a tone check as well: the
+ * voice would carry it); a check that ended early for a reason nobody
+ * chose (its endedEarly, as its own verdict does; a stop is not one: it is
+ * judged on what it recorded) fails it with that reason first; with
+ * nothing failing, the tone check's "fix-setting", a delay run on the
+ * normal route whose voice arrived more than 3 dB quieter in CABLE Output,
+ * and a check that could not judge the microphone's own silences
+ * (micSilence.checked false, or a noise gate) make it a note); no regular
+ * clicks (the latest tone check of 30 minutes or more on the normal route,
+ * each road at most 6 per 30 minutes; with a noise gate the microphone's
+ * road is gatedMicRoad's, as in the check's own verdict: unless its
+ * buffer's slope shows a faster clock it is a lower bound, which fails
+ * above 6 and is a note otherwise, never a pass; a check that ended early
+ * still counts, and the row says so; tone checks forced onto the audio
+ * element, Session B step 7.6, are listed with their meeting's side, not
+ * counted); the Windows Audio restart (the latest recovery that involved
+ * both the microphone and the context); Connect only. A long check whose
+ * verdict is "no-signal" measured nothing and counts for no row. Step
+ * numbers in the texts are Session B's (README); the page's own steps are
+ * named as "step N of this page".
  * → [{ row, status: "pass" | "fail" | "todo" | "note", text }]
  */
 export function gateSummary(results) {
@@ -1334,7 +1692,7 @@ export function gateSummary(results) {
     securePageRow(r),
     microphoneRow(r),
     cableRow(r),
-    row("Zoom's Test Mic hears you", "todo", "Your note from step 5: did Zoom's Test Mic play your voice back?"),
+    row("Zoom's Test Mic hears you", "todo", "Your note from Session B step 5: did Zoom's Test Mic play your voice back?"),
     delayRow(r),
     gapsRow(r),
     ticksRow(r),

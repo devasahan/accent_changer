@@ -24,7 +24,7 @@
  * AudioContext are only used inside the functions.
  */
 import { VIRTUAL_MIC, isCableOutput, usableMics, findCableInput } from "../core/devices-match.js";
-import { WARNINGS, findCableOutput, micSettingsReport } from "../core/device-choice.js";
+import { PSEUDO_IDS, WARNINGS, findCableOutput, micSettingsReport } from "../core/device-choice.js";
 import { abortError } from "../core/async.js";
 import { redact } from "../core/redact.js";
 
@@ -39,8 +39,6 @@ export const NO_ANSWER_MS = 15000;
 /** How long closing a probe context may take (readOutputRate). */
 const PROBE_CLOSE_MS = 2000;
 
-/** Chromium's pseudo-devices that follow Windows' default and default communications device. */
-const PSEUDO_IDS = ["default", "communications"];
 
 /** VB-Audio's endpoints (VB-CABLE's and its other cables'), by their driver's name. */
 const VB_AUDIO = /vb-audio/i;
@@ -49,10 +47,11 @@ const VB_AUDIO = /vb-audio/i;
 // browser's is the probe's, which tells Edge users where site permissions live.
 const TEXTS = Object.freeze({
   appSystem:
-    "Windows blocked the microphone: Settings → Privacy & security → Microphone → turn on microphone access and “Let desktop apps access your microphone”, then try again.",
+    "Windows blocked the microphone: Settings → Privacy & security → Microphone (on Windows 10: Settings → Privacy → Microphone) → turn on microphone access and let desktop apps access your microphone, then press “Check the microphone”.",
   browserSystem:
-    "Windows blocked the microphone: Settings → Privacy & security → Microphone → turn on microphone access and “Let desktop apps access your microphone”, then reload this page.",
-  appRefused: "The microphone was refused for this app. Write that in your notes.",
+    "Windows blocked the microphone: Settings → Privacy & security → Microphone (on Windows 10: Settings → Privacy → Microphone) → turn on microphone access and let desktop apps access your microphone, then reload this page.",
+  appRefused:
+    "The microphone was refused for this app. Write that in your notes, press “Copy results” and send them to me, then close the app and open it again.",
   browserRefused:
     "The browser blocked the microphone for this page: click the icon left of the address bar → Permissions for this site → Microphone → Allow, then reload the page.",
   busy: "The microphone could not be opened: another app may be holding it. Close apps that use it and try again.",

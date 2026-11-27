@@ -6,6 +6,7 @@ import {
   PSEUDO_IDS,
   RENAMED_CABLE,
   WARNINGS,
+  causeText,
   chooseMic,
   chooseOutput,
   deviceWarnings,
@@ -15,6 +16,7 @@ import {
   micSettingsReport,
   pseudoTarget,
   reportLabel,
+  routeWords,
   siblingOutput,
   toneOutput,
   virtualOutputs,
@@ -406,10 +408,18 @@ test("micSettingsReport: allOff only when every processing is exactly false", ()
 
 // ---------- warnings ----------
 
+const QUIET_INPUT = { micLabel: "Headset Microphone (USB Audio Device)", outputFound: true };
+
 test("WARNINGS: the feedback texts are devices-match's own; the rest are plain texts or functions", () => {
   assert.equal(WARNINGS.MIC_IS_CABLE, feedbackWarnings({ micLabel: "CABLE Output (VB-Audio Virtual Cable)" })[0]);
   assert.equal(WARNINGS.OUTPUT_IS_CABLE, feedbackWarnings({ defaultOutputLabel: "CABLE Input (VB-Audio Virtual Cable)" })[0]);
-  assert.equal(WARNINGS.INPUT_IS_CABLE, feedbackWarnings({ defaultInputLabel: "CABLE Output (VB-Audio Virtual Cable)" })[0]);
+  // INPUT_IS_CABLE is this module's own: devices-match's (a Step 3 module) speaks of a converted voice this build has not.
+  assert.notEqual(WARNINGS.INPUT_IS_CABLE, feedbackWarnings({ defaultInputLabel: "CABLE Output (VB-Audio Virtual Cable)" })[0]);
+  assert.ok(!/converted/.test(WARNINGS.INPUT_IS_CABLE) && WARNINGS.INPUT_IS_CABLE.includes("CABLE Output"));
+  assert.deepEqual(
+    deviceWarnings({ ...QUIET_INPUT, defaultInputLabel: "Default - CABLE Output (VB-Audio Virtual Cable)" }).map((w) => [w.code, w.text]),
+    [["INPUT_IS_CABLE", WARNINGS.INPUT_IS_CABLE]],
+  );
   assert.equal(WARNINGS.INPUT_IS_LOOPBACK, feedbackWarnings({ defaultInputLabel: "Stereo Mix (Realtek(R) Audio)" })[0]);
   for (const [code, value] of Object.entries(WARNINGS)) {
     const text = typeof value === "function" ? value("A", "B") : value;
@@ -555,4 +565,52 @@ test("device-choice.js is pure: no clock, timer, console or DOM", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/(^|[^:])\/\/.*$/gm, "$1");
   assert.doesNotMatch(code, /Date\.now|performance\.|new Date|setTimeout|setInterval|requestAnimationFrame|console\.|document\.|window\.|navigator\.|globalThis/);
+});
+
+test("deviceWarnings: CABLE Input gone after the app found it is 'gone for now', not 'not installed'", () => {
+  const base = { micLabel: "Headset Microphone (USB Audio Device)", outputFound: false };
+  assert.deepEqual(deviceWarnings(base).map((w) => w.code), ["NO_CABLE"], "never seen: not installed yet");
+  const gone = deviceWarnings({ ...base, cableSeen: true });
+  assert.deepEqual(gone.map((w) => w.code), ["CABLE_GONE"]);
+  assert.ok(!/restart Windows|not installed/i.test(gone[0].text), gone[0].text);
+  assert.ok(/Copy results/.test(gone[0].text), "it says what to do if it stays gone");
+  assert.deepEqual(deviceWarnings({ ...base, outputFound: true, cableSeen: true }), []);
+});
+
+test("deviceWarnings: a microphone that records at 16 kHz or less is called out whatever its name; more Bluetooth names", () => {
+  const usb = { micLabel: "Headset Microphone (USB Audio Device)", outputFound: true };
+  for (const hz of [8000, 16000]) {
+    const list = deviceWarnings({ ...usb, micRateHz: hz });
+    assert.deepEqual(list.map((w) => w.code), ["NARROW_MIC"], `${hz}`);
+    assert.ok(list[0].text.includes(`${hz / 1000} kHz`), list[0].text);
+  }
+  assert.deepEqual(deviceWarnings({ ...usb, micRateHz: 44100 }), []);
+  assert.deepEqual(deviceWarnings({ ...usb, micRateHz: null }), []);
+  // A Bluetooth name gives one warning, not two.
+  assert.deepEqual(deviceWarnings({ micLabel: "Headset (AirPods Pro)", outputFound: true, micRateHz: 16000 }).map((w) => w.code), ["BLUETOOTH_MIC"]);
+  for (const label of ["Headset (Galaxy Buds2 Pro)", "Headset (boAt Airdopes 141)", "Headset (Galaxy Buds Live)"]) {
+    assert.equal(labelFlags(label).bluetooth, true, label);
+  }
+  assert.equal(labelFlags("Headset Microphone (USB Audio Device)").bluetooth, false);
+});
+
+test("WARNINGS: Windows paths work on Windows 10 and 11, and no text assumes a laptop", () => {
+  const rate = WARNINGS.CABLE_RATE(44100);
+  assert.ok(rate.includes("mmsys.cpl") && !rate.includes("More sound settings"), rate);
+  for (const [code, value] of Object.entries(WARNINGS)) {
+    const text = typeof value === "function" ? value("A", "B") : value;
+    assert.ok(!/laptop/i.test(text), `${code}: ${text}`);
+    assert.ok(!/converted voice/i.test(text), `${code}: ${text}`);
+  }
+});
+
+test("routeWords and causeText: one wording for the page, the warnings and the checklist", () => {
+  assert.equal(routeWords("context"), "the normal route");
+  assert.equal(routeWords("element"), "a slower backup route");
+  assert.equal(routeWords("context-after-permission"), "the normal route, after a permission fix");
+  assert.equal(routeWords("element-after-permission"), "a slower backup route, after a permission fix");
+  assert.equal(routeWords(null), "not yet");
+  assert.equal(routeWords("", "none"), "none");
+  assert.equal(causeText("mic-ended"), "the microphone stopped");
+  assert.equal(causeText("something new"), "a problem with the sound");
 });

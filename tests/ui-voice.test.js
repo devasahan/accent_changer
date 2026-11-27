@@ -221,7 +221,7 @@ test("recoveryResult: a Windows Audio restart keeps the timings and the restart 
   // The app's own part too slow: the verdict fails, and says why.
   const slow = recoveryResult({ ...restartRecord(lostAtMs), outageMs: 4000, serviceBackAtMs: lostAtMs + 2800, appMs: 900, waitMs: 300 });
   assert.equal(slow.restart.verdict, "fail");
-  assert.equal(slow.restart.text, "fail (back after 4.0 s; the app's own part took 1200 ms: 300 ms of waiting, then 900 ms to rebuild)");
+  assert.equal(slow.restart.text, "fail (back after 4.0 s; the app's own part took 1200 ms: it waited 300 ms before trying again, then took 900 ms to bring the voice back)");
   assert.equal(slow.serviceBackAfterMs, 2800);
 });
 

@@ -286,6 +286,53 @@ test("micBus holes in the first 10 s of a new microphone source are not counted"
   assert.equal(await stopsAtOnce(graph), true);
 });
 
+test("renewMicSource: a new microphone source only while the test tone feeds inBus; the voice path stays whole", async (t) => {
+  const fake = useFakeAudio(t);
+  const graph = await runningGraph();
+  const fedSources = () => fake.sources.filter((s) => s.context === graph.context && s.mediaStream === graph.micStream && s.links.length > 0);
+  const gen0 = graph.micGen;
+  // The microphone feeds the cable: a new source would be heard there. Nothing changes.
+  assert.equal(await graph.renewMicSource(), false);
+  assert.equal(graph.micGen, gen0);
+  assert.equal(fedSources().length, 1);
+  const first = fedSources()[0];
+  // The tone check: the tone feeds inBus, so micBus gets a new source (its buffer empty) and the old one goes.
+  await graph.setTestSource({ id: "tone", getTracks: () => [], getAudioTracks: () => [] });
+  assert.equal(await graph.renewMicSource(), true);
+  assert.equal(graph.micGen, gen0 + 1);
+  assert.equal(fedSources().length, 1);
+  assert.notEqual(fedSources()[0], first);
+  assert.equal(first.links.length, 0, "the old source is disconnected");
+  // After the check the voice goes through the new source.
+  await graph.setTestSource(null);
+  assert.equal(voicePath(fake, graph), PASSTHROUGH_PATH);
+  assert.equal(await graph.renewMicSource(), false);
+  assert.equal(graph.micGen, gen0 + 1);
+  assert.equal(await stopsAtOnce(graph), true);
+});
+
+test("startRecord keeps the first start's microphone open time; a slow reopen later does not replace it", async (t) => {
+  const fake = useFakeAudio(t);
+  // performance.now() follows the mocked clock here (the fakes mock setTimeout and Date only).
+  const realNow = performance.now;
+  Object.defineProperty(performance, "now", { value: () => Date.now() - 1_000_000, configurable: true, writable: true });
+  t.after(() => Object.defineProperty(performance, "now", { value: realNow, configurable: true, writable: true }));
+  const graph = await runningGraph();
+  const first = graph.startRecord;
+  assert.ok(first && typeof first.openedInMs === "number", JSON.stringify(first));
+  assert.ok(first.openedInMs < 1500, `the fake opens at once: ${first.openedInMs}`);
+  assert.equal(first.unlockMs, graph.mic.unlockMs);
+  fake.hang.gum = 1; // the next getUserMedia answers late
+  fake.endMic(); // the microphone stops (a Windows Audio restart, say)
+  await advance(1800);
+  fake.answerLate("gum");
+  await advance(1000);
+  assert.equal(graph.state, "running");
+  assert.ok(graph.mic.openedInMs >= 1500, `the reopen took ${graph.mic.openedInMs} ms`);
+  assert.equal(graph.startRecord.openedInMs, first.openedInMs, "the first start's own open time");
+  assert.equal(await stopsAtOnce(graph), true);
+});
+
 test("a once-tap whose build fails is gone: later recoveries do not build it again", async (t) => {
   useFakeAudio(t);
   const graph = await runningGraph();

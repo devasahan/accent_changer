@@ -495,6 +495,54 @@ test("the minimized phase: the window's state is asked for every 5th summary", a
   assert.ok(s.logs.includes("info check long phase minimized"), s.logs.join("\n"));
 });
 
+test("the page's own visibility, the focus after a Hide and the main thread's lateness are kept per phase", async (t) => {
+  // A page that WebView2 marks hidden while the window is minimized, and again while the app hides it.
+  const doc = new EventTarget();
+  doc.visibilityState = "visible";
+  const had = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "document", { value: doc, configurable: true, writable: true });
+  t.after(() => {
+    if (had) Object.defineProperty(globalThis, "document", had);
+    else delete globalThis.document;
+  });
+  const setVisibility = (v) => {
+    doc.visibilityState = v;
+    doc.dispatchEvent(new Event("visibilitychange"));
+  };
+  const s = setup();
+  s.platform.hideMs = 10_000;
+  const { handle, node, start } = await startTone(s, 1);
+  // Minimized from 10 to 20 s (the page hidden from 12 to 20 s), then Hide for 10 s at 30 s: the page hidden from
+  // 31 to 40 s. After the Hide the window answers that it does not have the focus.
+  s.platform.windowState = async () => {
+    const at = clock.now - start;
+    return { visible: !(at >= 30_000 && at < 40_000), minimized: at >= 10_000 && at < 20_000, focused: false };
+  };
+  for (let k = 1; k <= 50; k++) {
+    // The 15th summary, while minimized, reaches the main thread 900 ms late.
+    summary(node, { frame: k * 48000, at: start + k * 1000, arrive: start + k * 1000 + (k === 15 ? 900 : 0) });
+    await flush(1);
+    if (k === 12) setVisibility("hidden");
+    if (k === 20) setVisibility("visible");
+    if (k === 30) await s.checks.hideFor(30);
+    if (k === 31) setVisibility("hidden");
+    if (k === 40) setVisibility("visible");
+  }
+  const p = handle.stop();
+  await flush();
+  node.port.emit({ type: "done", frame: 50 * 48000 });
+  const r = await p;
+  assert.deepEqual(r.pageVisibility, { hiddenSec: { visible: 0, minimized: 8, hidden: 9 }, changes: 4 }, JSON.stringify(r.pageVisibility));
+  assert.deepEqual(r.focusAfterHide, [false]);
+  assert.equal(r.mainThreadLateByPhase.minimized.count, 1);
+  assert.equal(r.mainThreadLateByPhase.minimized.maxMs, 900);
+  assert.equal(r.mainThreadLateByPhase.hidden.count, 0);
+  assert.deepEqual(
+    s.logs.filter((l) => l.startsWith("info check long visibility")),
+    ["info check long visibility visible", "info check long visibility hidden", "info check long visibility visible", "info check long visibility hidden", "info check long visibility visible"],
+  );
+});
+
 test("the microphone's buffer: a 1 s reading at summary 2 and every 120 after, through a once-tap at the graph", async () => {
   const s = setup();
   const { handle, node, start } = await startTone(s, 10);
@@ -528,6 +576,46 @@ test("the microphone's buffer: a 1 s reading at summary 2 and every 120 after, t
   assert.equal(r.micPath.readingsTaken, 2);
   assert.deepEqual(r.micPath.readings, [{ atSec: 242, lagMs: 30 }]);
   assert.equal(s.graph.taps.size, 0);
+});
+
+test("the microphone's buffer: the tone check gives micBus a new source once the tone feeds the cable, before its first reading", async () => {
+  // The source made at the start (or the last rebuild) may hold a buffer that filled long before the check (H1):
+  // the check's readings must start from an empty one.
+  const s = setup();
+  const gen0 = s.graph.micGen;
+  const { handle, node, start } = await startTone(s, 10);
+  assert.deepEqual(s.graph.testSourceCalls, ["on"]);
+  assert.deepEqual(s.graph.renewCalls, [true], "renewed once, while the tone fed the cable");
+  assert.equal(s.graph.micGen, gen0 + 1);
+  summary(node, { frame: 48000, at: start + 1000 });
+  summary(node, { frame: 96000, at: start + 2000 });
+  await flush();
+  await answerReading(newest("ac-recorder"), 480);
+  node.port.emit({ type: "done", frame: 2 * 48000 });
+  const r = await handle.done;
+  assert.equal(r.micPath.renewed, true);
+  assert.equal(r.micPath.fullAtStart, false);
+  assert.deepEqual(r.micPath.readings, [{ atSec: 2, lagMs: 10 }]);
+  assert.equal(s.graph.micGen, gen0 + 1, "no other source change");
+});
+
+test("the microphone's buffer: no new source in mic mode (the meeting hears the microphone) or on the element route", async () => {
+  let s = setup();
+  let handle = await s.checks.startLong({ mode: "mic", minutes: 1 });
+  let p = handle.stop();
+  await flush();
+  newest("ac-cablewatch").port.emit({ type: "done", frame: 48000 });
+  let r = await p;
+  assert.deepEqual(s.graph.renewCalls, []);
+  assert.equal(r.micPath.renewed, false);
+  s = setup({ method: "element", routePreference: "element" });
+  handle = await s.checks.startLong({ mode: "tone", minutes: 1 });
+  p = handle.stop();
+  await flush();
+  newest("ac-cablewatch").port.emit({ type: "done", frame: 48000 });
+  r = await p;
+  assert.deepEqual(s.graph.renewCalls, [], "its own context has no micBus");
+  assert.equal(r.micPath, null);
 });
 
 test("the microphone's buffer: a check with more than 40 readings keeps 40 in its result, the first and the last among them", async () => {
@@ -578,6 +666,83 @@ test("the microphone's holes: 8–11 ms runs after a watcher's first 10 s count;
   assert.equal(r.micPath.holesPer30Min, 60);
 });
 
+test("the microphone's holes behind a noise gate: the ones seen still count, as a lower bound", async () => {
+  // Tone mode, 2 minutes. A noise gate: 30 silences of 0.4 s (10 % of the check). A slower clock's 10 ms holes
+  // that fall into them are not seen; 3 fall into the sound, at 45.5, 60.5 and 75.5 s: 45 per 30 minutes at least.
+  const s = setup();
+  const { handle, node, start } = await startTone(s, 2);
+  const gateRun = (k) => ({ startFrame: Math.round((k - 0.7) * 48000), frames: 0.4 * 48000 });
+  const hole = (sec) => ({ startFrame: Math.round(sec * 48000), frames: 480 });
+  seconds(node, start, 1, 120, (k) => ({
+    refRuns: [...(k > 10 && k <= 40 ? [gateRun(k)] : []), ...([46, 61, 76].includes(k) ? [hole(k - 0.5)] : [])],
+    refZeroFrames: Math.min(30, Math.max(0, k - 10)) * 0.4 * 48000 + [46, 61, 76].filter((h) => k >= h).length * 480,
+  }));
+  node.port.emit({ type: "done", frame: 120 * 48000 });
+  const r = await handle.done;
+  assert.equal(r.micPath.noiseGate, true, JSON.stringify(r.micPath));
+  assert.equal(r.micPath.holes, 3);
+  assert.equal(r.verdict, "fail", JSON.stringify(r.lines));
+  assert.deepEqual(r.reasons, ["Too many clicks from your microphone's side: at least 45.0 per 30 minutes (6 at most)."]);
+  assert.ok(r.lines.some((l) => l.startsWith("Your microphone sends digital silence in pauses")), r.lines.join(" | "));
+});
+
+test("the microphone's drop-outs: 20–99 ms runs after a watcher's first 10 s fail the check; not around an outage or a new source", async () => {
+  const s = setup();
+  const { handle, node, start } = await startTone(s, 10);
+  const run = (sec, ms) => ({ startFrame: Math.round(sec * 48000), frames: ms * 48 });
+  seconds(node, start, 1, 60, (k) => {
+    const runs = [];
+    if (k === 5) runs.push(run(4.2, 30)); // in the watcher's first 10 s: its sources settling
+    if (k === 20) runs.push(run(19.5, 40)); // counts
+    if (k === 21) runs.push(run(20.5, 19)); // under 20 ms: not a drop-out
+    if (k === 31) runs.push(run(30.5, 50)); // within 2 s after the outage below
+    if (k === 46) runs.push(run(45.5, 30)); // after the microphone source changed at 45 s
+    if (k === 59) runs.push(run(58.5, 99)); // counts
+    if (k === 45) s.graph.micGen++;
+    return { refRuns: runs };
+  });
+  // An outage from 29.9 to 30.0 s, recovered without a rebuild.
+  s.graph.lost("context-suspended", start + 29_900);
+  s.graph.back("context-suspended", start + 29_900, 100);
+  node.port.emit({ type: "done", frame: 60 * 48000 });
+  const r = await handle.done;
+  assert.equal(r.micDropouts.count, 2, JSON.stringify(r.micDropouts));
+  assert.equal(r.micDropouts.longestMs, 99);
+  assert.deepEqual(
+    r.micDropouts.runs.map((x) => [x.atSec, x.ms]),
+    [
+      [19.5, 40],
+      [58.5, 99],
+    ],
+  );
+  assert.equal(r.verdict, "fail");
+  const reason = r.reasons.find((x) => x.startsWith("The microphone itself dropped out"));
+  assert.ok(reason?.startsWith("The microphone itself dropped out twice for 20 to 100 ms (the longest 99 ms at 0:58"), JSON.stringify(r.reasons));
+  assert.equal(r.micPath.holes, 0, "a drop-out is not a 10 ms hole");
+
+  // Mic mode: a 50 ms drop-out that CABLE Output repeats 40 ms later is the microphone's, and fails the check.
+  const m = setup();
+  const handle2 = await m.checks.startLong({ mode: "mic", minutes: 1 });
+  const node2 = newest("ac-cablewatch");
+  const start2 = clock.now;
+  for (let k = 1; k <= 60; k++) {
+    const at = 30.25 * 48000;
+    summary(node2, {
+      mode: "mic",
+      frame: k * 48000,
+      at: start2 + k * 1000,
+      refRuns: k === 31 ? [{ startFrame: at, frames: 2400 }] : [],
+      sigRuns: k === 31 ? [{ startFrame: at + 40 * 48, frames: 2400 }] : [],
+    });
+  }
+  node2.port.emit({ type: "done", frame: 60 * 48000 });
+  const r2 = await handle2.done;
+  assert.deepEqual(r2.speech.dropouts, [], "CABLE Output's own: none");
+  assert.equal(r2.micDropouts.count, 1);
+  assert.equal(r2.verdict, "fail");
+  assert.ok(r2.reasons.some((x) => x.startsWith("The microphone itself dropped out once for 20 to 100 ms (the longest 50 ms at 0:30")), JSON.stringify(r2.reasons));
+});
+
 test("priming: runs in a watcher's first 100 ms that last less than 100 ms are its sources starting; longer ones count", async () => {
   // Mic mode, where it matters: a new source node's buffer starts empty, so CABLE Output starts every watcher
   // with a short silence at its frame 0 (20–31 ms in headless Chromium on the fake VB-CABLE loop), and no
@@ -597,9 +762,11 @@ test("priming: runs in a watcher's first 100 ms that last less than 100 ms are i
   let r = await handle.done;
   assert.deepEqual(r.speech.dropouts, [], "CABLE Output's 30 ms at frame 0 is not a drop-out");
   assert.equal(r.speech.micHoles, 1, "nor is the microphone's 15 ms at frame 0 one of its short runs");
-  // The 125 ms run is kept: the microphone itself stopped.
+  // The 125 ms run is kept: the microphone itself sent only digital silence.
   assert.equal(r.verdict, "fail");
-  assert.deepEqual(r.reasons, ["The microphone itself stopped once (the longest for 125 ms): Windows paused it."]);
+  assert.deepEqual(r.reasons, [
+    "Your microphone sent only digital silence once (the longest for 125 ms at 0:00 while open): it was muted, or Windows paused it.",
+  ]);
 
   // Tone mode keeps the same 125 ms run.
   s = setup();
@@ -608,7 +775,42 @@ test("priming: runs in a watcher's first 100 ms that last less than 100 ms are i
   node.port.emit({ type: "done", frame: 48000 });
   r = await handle.done;
   assert.equal(r.verdict, "fail");
-  assert.ok(r.reasons.some((x) => x.startsWith("The microphone itself stopped once")), JSON.stringify(r.reasons));
+  assert.ok(r.reasons.some((x) => x.startsWith("Your microphone sent only digital silence once")), JSON.stringify(r.reasons));
+});
+
+test("the microphone's silences: one long one fails however long; a noise gate's many short ones are not judged; the result says which", async () => {
+  // Tone mode, 2 minutes: the microphone sends only digital silence from 0:30 to 1:30, half the check in one run.
+  let s = setup();
+  let { handle, node, start } = await startTone(s, 2);
+  const long = { startFrame: 30 * 48000, frames: 60 * 48000 };
+  seconds(node, start, 1, 120, (k) => ({ refRuns: k === 91 ? [long] : [], refZeroFrames: k >= 91 ? long.frames : 0 }));
+  node.port.emit({ type: "done", frame: 120 * 48000 });
+  let r = await handle.done;
+  assert.equal(r.verdict, "fail");
+  assert.deepEqual(r.reasons, [
+    "Your microphone sent only digital silence once (the longest for 60.0 s at 0:30 while open): it was muted, or Windows paused it.",
+  ]);
+  assert.deepEqual(r.micSilence, { checked: true, gate: false, zeroFraction: 0.5, count: 1, longest: [{ atSec: 30, phase: "visible", ms: 60000 }] });
+  assert.equal(r.micPath.noiseGate, false);
+
+  // A noise gate: 30 short silences of 0.4 s, 10 % of the check. The check cannot judge them, and says so.
+  s = setup();
+  ({ handle, node, start } = await startTone(s, 2));
+  const gateRun = (k) => ({ startFrame: Math.round((k - 0.7) * 48000), frames: 0.4 * 48000 });
+  seconds(node, start, 1, 120, (k) => ({
+    refRuns: k > 10 && k <= 40 ? [gateRun(k)] : [],
+    refZeroFrames: Math.min(30, Math.max(0, k - 10)) * 0.4 * 48000,
+  }));
+  node.port.emit({ type: "done", frame: 120 * 48000 });
+  r = await handle.done;
+  assert.equal(r.verdict, "pass", JSON.stringify(r.reasons));
+  assert.equal(r.micSilence.gate, true);
+  assert.equal(r.micSilence.checked, false);
+  assert.equal(r.micSilence.zeroFraction, 0.1);
+  assert.equal(r.micSilence.count, 30);
+  assert.equal(r.micSilence.longest.length, 20, "the 20 longest");
+  assert.equal(r.micPath.noiseGate, true, "the clicks row reads the same decision");
+  assert.ok(r.lines.some((l) => l.startsWith("Your microphone sends digital silence in pauses")), r.lines.join(" | "));
 });
 
 test("tone events around an outage are the outage's own: left out of the counts; level changes always count", async () => {
@@ -648,6 +850,9 @@ async function answerStop(node, start, sec, extra = {}) {
   node.port.emit({ type: "done", frame });
 }
 
+/** An early end's reason as the result gives it: what happened, then what to do next. */
+const early = (text, mode = "tone") => `${text} ${CHECK_TEXTS.runAgain(mode)}`;
+
 test("ending early for a reason nobody chose fails the check, with that reason first", async () => {
   // Four clean seconds of a 10-minute check, then the end comes from outside. Each must not pass.
   const cases = [
@@ -665,7 +870,9 @@ test("ending early for a reason nobody chose fails the check, with that reason f
     await answerStop(t.node, t.start, 4.4);
     const r = await t.handle.done;
     assert.equal(r.verdict, "fail", why);
-    assert.deepEqual(r.reasons, [text], why);
+    assert.deepEqual(r.reasons, [early(text)], why);
+    assert.deepEqual(r.endedEarly, { why, note: early(text) }, why);
+    assert.ok(r.reasons[0].endsWith("Start the long check again (Session B step 7)."), why);
     assert.equal(r.recordedSec, 4.4, why);
     assert.equal(r.minutesAsked, 10, why);
     assert.ok(!r.notes.includes(text), `${why}: the reason is not repeated in the notes`);
@@ -684,7 +891,7 @@ test("ending early: the reason goes before what the check found; a check that fo
   await answerStop(t.node, t.start, 4.4, { counts: { gaps: 1 } });
   let r = await t.handle.done;
   assert.equal(r.verdict, "fail");
-  assert.equal(r.reasons[0], CHECK_TEXTS.toneLost);
+  assert.equal(r.reasons[0], early(CHECK_TEXTS.toneLost));
   assert.ok(r.reasons.slice(1).some((x) => /stopped once/.test(x)), JSON.stringify(r.reasons));
 
   // CABLE Output ended before the tone was ever found: it measured nothing, and the reason says why.
@@ -695,8 +902,22 @@ test("ending early: the reason goes before what the check found; a check that fo
   await answerStop(t.node, t.start, 2.3, { locked: false });
   r = await t.handle.done;
   assert.equal(r.verdict, "no-signal");
-  assert.equal(r.reasons[0], CHECK_TEXTS.cableLost);
+  assert.equal(r.reasons[0], early(CHECK_TEXTS.cableLost));
+  assert.deepEqual(r.endedEarly, { why: "cable-ended", note: early(CHECK_TEXTS.cableLost) });
   assert.ok(r.reasons.slice(1).some((x) => /never reached/.test(x)), JSON.stringify(r.reasons));
+});
+
+test("ending early: the check with your voice says to start it again (Session B step 8)", async () => {
+  const s = setup();
+  const handle = await s.checks.startLong({ mode: "mic", minutes: 1 });
+  const node = newest("ac-cablewatch");
+  cableTracks[cableTracks.length - 1].dispatchEvent(new Event("ended"));
+  await flush();
+  node.port.emit({ type: "done", frame: 48000 });
+  const r = await handle.done;
+  assert.equal(r.endedEarly?.why, "cable-ended");
+  assert.equal(r.endedEarly.note, `${CHECK_TEXTS.cableLost} Start the check with your voice again (Session B step 8).`);
+  assert.equal(r.reasons[0], r.endedEarly.note);
 });
 
 test("a check you stop yourself, or the page stops, is judged on what it recorded", async () => {
@@ -708,6 +929,7 @@ test("a check you stop yourself, or the page stops, is judged on what it recorde
   let r = await p;
   assert.equal(r.verdict, "pass", JSON.stringify(r.reasons));
   assert.deepEqual(r.reasons, []);
+  assert.equal(r.endedEarly, null);
   assert.equal(r.recordedSec, 5.5);
   assert.ok(!s.logs.some((l) => /ended early/.test(l)), s.logs.join("\n"));
 
@@ -720,6 +942,7 @@ test("a check you stop yourself, or the page stops, is judged on what it recorde
   await stopping;
   r = await t.handle.done;
   assert.equal(r.verdict, "pass", JSON.stringify(r.reasons));
+  assert.equal(r.endedEarly, null);
 });
 
 test("ending early: no summaries after the planned end (the voice never came back), the 1 s timer ends it", async () => {
@@ -734,7 +957,8 @@ test("ending early: no summaries after the planned end (the voice never came bac
   const r = await Promise.race([t.handle.done, new Promise((res) => setTimeout(() => res(null), 6000).unref())]);
   assert.ok(r, "ended by the backstop");
   assert.equal(r.verdict, "fail");
-  assert.equal(r.reasons[0], CHECK_TEXTS.notBack, JSON.stringify(r.reasons));
+  assert.equal(r.reasons[0], early(CHECK_TEXTS.notBack), JSON.stringify(r.reasons));
+  assert.deepEqual(r.endedEarly, { why: "not-back", note: early(CHECK_TEXTS.notBack) });
   assert.ok(r.reasons.some((x) => /stopped once/.test(x)), JSON.stringify(r.reasons));
   assert.equal(r.outages.length, 1);
   assert.equal(r.outages[0].notOver, true);
@@ -853,6 +1077,7 @@ test("a check that starts on the audio element route and records in the graph's 
   const r = await p;
   assert.equal(r.site, "graph");
   assert.equal(r.route, "element");
+  assert.equal(r.routePreference, "element", "Gate 1 lists a check forced onto the audio element, and does not count it");
   assert.deepEqual(r.notes, [CHECK_TEXTS.ownCrossing]);
 });
 
@@ -867,6 +1092,7 @@ test("a check that starts on the context route and is rebuilt on the audio eleme
   await answerStop(node2, t.start + 6_000, 2);
   const r = await p;
   assert.equal(r.route, "context", "the route the check began on");
+  assert.equal(r.routePreference, "auto");
   assert.deepEqual(r.notes, [CHECK_TEXTS.routeChanged]);
 
   // A rebuild that stays on the context route says nothing.
@@ -878,6 +1104,59 @@ test("a check that starts on the context route and is rebuilt on the audio eleme
   const p2 = t2.handle.stop();
   await answerStop(n2, t2.start + 6_000, 2);
   assert.deepEqual((await p2).notes, []);
+});
+
+test("a check records whether it ran on the route the user chose: the route at its end, and a choice not in effect yet", async () => {
+  // On the normal route from start to end.
+  let s = setup();
+  let t = await startTone(s, 1);
+  seconds(t.node, t.start, 1, 3);
+  let p = t.handle.stop();
+  await answerStop(t.node, t.start, 3.5);
+  let r = await p;
+  assert.equal(r.routeAtEnd, "context");
+  assert.equal(r.routeAsChosen, true);
+  // Forced onto the audio element, but rebuilt on the context route meanwhile (the element could not be used).
+  s = setup({ method: "element", routePreference: "element" });
+  env.sinkFails = true; // its own context is refused CABLE Input: it records in the graph's context
+  t = await startTone(s, 1);
+  seconds(t.node, t.start, 1, 3);
+  await s.graph.rebuild({ backAtMs: t.start + 4_000, method: "context" });
+  const node2 = newest("ac-cablewatch");
+  p = t.handle.stop();
+  await answerStop(node2, t.start + 4_000, 2);
+  r = await p;
+  assert.equal(r.route, "element");
+  assert.equal(r.routeAtEnd, "context");
+  assert.equal(r.routeAsChosen, false, "neither a comparison through the audio element nor a check on the normal route");
+  env.sinkFails = false;
+  // A route chosen during an outage, not applied yet when the check starts (graph.output.routePreferenceInEffect).
+  s = setup({ method: "element", routePreference: "auto" });
+  s.graph.output.routePreferenceInEffect = false;
+  t = await startTone(s, 1);
+  seconds(t.node, t.start, 1, 3);
+  p = t.handle.stop();
+  await answerStop(t.node, t.start, 3.5);
+  r = await p;
+  assert.equal(r.routePreference, "auto");
+  assert.equal(r.routeAsChosen, false);
+});
+
+test("measureDelay records whether the route was the one chosen", async () => {
+  const s = setup({ method: "element", routePreference: "auto" });
+  s.graph.output.routePreferenceInEffect = false; // Automatic chosen during an outage on the element route
+  const before = nodes.length;
+  const p = s.checks.measureDelay();
+  const node = await nextNode("ac-recorder", before);
+  await answerDelay(node, delaySignals());
+  const r = await p;
+  assert.equal(r.routePreference, "auto");
+  assert.equal(r.routeAsChosen, false);
+  const s2 = setup();
+  const before2 = nodes.length;
+  const p2 = s2.checks.measureDelay();
+  await answerDelay(await nextNode("ac-recorder", before2), delaySignals());
+  assert.equal((await p2).routeAsChosen, true);
 });
 
 test("mic mode: the speech analysis of the envelopes, a CABLE Output drop-out where it was, Analysing first", async () => {
@@ -1044,7 +1323,24 @@ test("the element route's long check: its own context follows the microphone whe
   const r = await p;
   assert.equal(r.site, "own-context");
   assert.equal(r.micPath, null);
+  assert.equal(r.routePreference, "element");
   assert.equal(own.state, "closed");
+});
+
+test("a check whose analysis failed still says which route it was forced onto", async () => {
+  const s = setup({ method: "element", routePreference: "element" });
+  const t = await startTone(s, 1);
+  s.checks._long.analyse = async () => {
+    throw Object.assign(new Error("broken"), { name: "RangeError" });
+  };
+  seconds(t.node, t.start, 1, 3);
+  const p = t.handle.stop();
+  await answerStop(t.node, t.start, 3.5);
+  const r = await p;
+  assert.equal(r.verdict, "no-signal");
+  assert.deepEqual(r.reasons, [CHECK_TEXTS.notAnalysed("RangeError")]);
+  assert.equal(r.route, "element");
+  assert.equal(r.routePreference, "element");
 });
 
 test("mic mode: when a run list is full, both lists stop at that moment and the result says so", async () => {

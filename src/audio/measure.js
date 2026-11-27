@@ -97,7 +97,8 @@ const EXTRA_MINUTES = LIMITS.EXTEND_MAX_SEC / 60; // room in the envelope arrays
 /** Texts the page shows (plain English, no device names). */
 export const CHECK_TEXTS = Object.freeze({
   notRunning: "The checks need your voice going into “CABLE Input” first: wait until step 2 is green, then try again.",
-  noCableOutput: "“CABLE Output” is not among the microphones: is VB-CABLE installed?",
+  noCableOutput:
+    "“CABLE Output” is not among the microphones. Press Windows key + R, type mmsys.cpl and press Enter → Recording: right-click the list, tick “Show Disabled Devices”, then right-click “CABLE Output” → Enable. Then try again.",
   noMic: "The microphone is not running, so it can't be recorded. Press “Check the microphone”, then try again.",
   busy: "Another check is running. Wait until it has finished.",
   restarted: "The audio was restarted during the measurement: press the button again.",
@@ -105,9 +106,10 @@ export const CHECK_TEXTS = Object.freeze({
   stalled: "The recording stopped before the end. Press the button again.",
   cableEnded: "“CABLE Output” stopped recording. Press the button again.",
   minutes: "The long check runs for 0.25 to 120 minutes.",
-  longNoStart: "The long check could not start its recorder. Try again; if it keeps failing, restart the app.",
-  ownCrossing: "The recording adds its own clock crossing: it could not run on VB-CABLE's clock.",
-  routeChanged: "The output route changed during the check, so part of the recording adds its own clock crossing.",
+  longNoStart:
+    "The long check could not start its recorder. Try again; if it keeps failing, press “Copy results” and send them to me, then close the app and open it again.",
+  ownCrossing: "The recording could not run in step with VB-CABLE, so it may count a few clicks of its own.",
+  routeChanged: "The output route changed during the check, so part of the recording may count a few clicks of its own.",
   toneLost: "The test tone stopped (Windows' default playback device went away or failed), so the check ended early.",
   cableLost: "“CABLE Output” stopped recording (did Windows Audio restart?), so the check ended early.",
   rebuildFailed: "The check's recorder could not be added again after the audio was restarted, so the check ended early.",
@@ -115,10 +117,13 @@ export const CHECK_TEXTS = Object.freeze({
   voiceStopped: "The voice was stopped, so the check ended early.",
   notBack: "The recording stopped before the end of the check, so the check ended early.",
   defaultOutput: "Windows switched its default playback device",
+  // After an early end: what to do next (the check with your voice is Session B step 8, the tone check step 7).
+  runAgain: (mode) =>
+    mode === "mic" ? "Start the check with your voice again (Session B step 8)." : "Start the long check again (Session B step 7).",
   analysing: (sec) => `Analysing (about ${sec} s)…`,
-  runsFull: (sec) => `Too many runs of digital silence to keep them all: drop-outs were checked for the first ${formatClock(sec)} only.`,
+  runsFull: (sec) => `There were too many short silences to keep them all: drop-outs were checked for the first ${formatClock(sec)} only.`,
   defaultOutputGap: (atSec) => `The sound stopped at ${formatClock(atSec)} when Windows switched its default playback device.`,
-  notAnalysed: (name) => `The check could not be analysed (${name}).`,
+  notAnalysed: (name) => `The check could not be analysed (${name}). Press “Copy results” and send them to me.`,
 });
 
 const NOOP_HANDLE = Object.freeze({ dispose() {} });
@@ -251,8 +256,8 @@ const isContextRoute = (method) => typeof method === "string" && method.startsWi
 /** ISO time of an epoch ms (now when it is not a number). */
 const isoOf = (epochMs) => new Date(isNum(epochMs) ? epochMs : Date.now()).toISOString();
 
-/** The epoch ms of a performance.now() time. */
-const epochOf = (perfMs) => Date.now() + (perfMs - performance.now());
+/** The epoch ms of a performance.now() time (one source for the page: ui/voice.js may import it from here). */
+export const epochOf = (perfMs) => Date.now() + (perfMs - performance.now());
 
 /** At most `n` items, spread evenly over the list, the first and the last kept. */
 function thin(items, n) {
@@ -404,12 +409,17 @@ class LongCheck {
     this.t0Ms = performance.now();
     this.startMs = null; // the worklet's own time of the first frame watched (page timeline)
     this.route = this.graph.output?.method ?? null;
+    // "element": forced onto the audio element under Advanced (README step 7.6), a comparison Gate 1 lists, not counts.
+    this.routePreference = this.graph.output?.routePreference ?? "auto";
+    // false while a route chosen during an outage waits to be applied (the voice still on the route before it).
+    this.routeInEffect = this.graph.output?.routePreferenceInEffect !== false;
     this.contextRoute = isContextRoute(this.route);
     this.site = null;
     this.ownCtx = null;
     this.cable = null;
     this.tone = null;
     this.testSourceSet = false;
+    this.micRenewed = false; // the tone check gave micBus a new microphone source (its buffer empty) at its start
     this.removeTap = null;
 
     this.segments = [];
@@ -418,6 +428,7 @@ class LongCheck {
     this.lastSync = null;
     this.marks = [];
     this.lastPhase = null;
+    this.lastVisibility = null;
 
     this.events = [];
     this.eventsDropped = 0;
@@ -429,7 +440,9 @@ class LongCheck {
     this.runsDropped = 0;
     this.micHoleRuns = []; // the microphone's 10 ms holes, on the check's timeline
     this.micHolesOver = 0; // holes beyond MAX_RUNS (counted, not kept)
-    this.settling = []; // [fromFrame, toFrame): the microphone's holes do not count there
+    this.micDropRuns = []; // the microphone's drop-outs (DROPOUT_MS up to GAP_MS), on the check's timeline
+    this.micDropsOver = 0; // drop-outs beyond MAX_RUNS (counted, not kept)
+    this.settling = []; // [fromFrame, toFrame): the microphone's holes and drop-outs do not count there
     this.lastMicGen = this.graph.micGen;
     this.envRef = null;
     this.envSig = null;
@@ -519,6 +532,13 @@ class LongCheck {
         this.testSourceSet = true;
         await limit(graph.setTestSource(this.tone.stream), GRAPH_WAIT_MS, "The test tone").catch(() => {});
         alive();
+        if (this.site === "graph" && typeof graph.renewMicSource === "function") {
+          // The microphone's buffer may have filled long before the check (H1): a new source starts it empty, so
+          // the readings below measure the microphone's clock from here. The meeting hears the tone now.
+          this.micRenewed = await limit(graph.renewMicSource(), GRAPH_WAIT_MS, "The microphone source").catch(() => false);
+          this.lastMicGen = graph.micGen;
+          alive();
+        }
       }
       if (this.ownCtx) {
         await this.buildOwn();
@@ -849,14 +869,22 @@ class LongCheck {
     const startup = (r) => r.startFrame < PRIME_FRAMES && r.frames < PRIME_FRAMES;
     const usable = (r) => r && isNum(r.startFrame) && isNum(r.frames) && !startup(r);
     const gapFrames = LIMITS.GAP_MS * FRAMES_PER_MS;
+    const dropFrames = LIMITS.DROPOUT_MS * FRAMES_PER_MS;
     for (const r of Array.isArray(m.refRuns) ? m.refRuns : []) {
       if (!usable(r)) continue;
       const run = { startFrame: seg.offset + r.startFrame, frames: r.frames };
-      if (this.contextRoute && this.site === "graph" && r.startFrame >= SETTLE_FRAMES && !this.isSettling(run.startFrame)) {
+      const settled = r.startFrame >= SETTLE_FRAMES && !this.isSettling(run.startFrame);
+      if (this.contextRoute && this.site === "graph" && settled) {
         if (micHoleCount([run]) > 0) {
           if (this.micHoleRuns.length < MAX_RUNS) this.micHoleRuns.push(run);
           else this.micHolesOver++;
         }
+      }
+      // The microphone's drop-outs (several 10 ms holes in a row, a USB hiccup, a late capture), once its sources
+      // have settled, on every route: the voice carries them to the meeting.
+      if (settled && run.frames >= dropFrames && run.frames < gapFrames) {
+        if (this.micDropRuns.length < MAX_RUNS) this.micDropRuns.push(run);
+        else this.micDropsOver++;
       }
       if (this.mode === "tone") {
         // Tone mode keeps only what "capture paused" needs: the microphone's runs of 100 ms or more.
@@ -997,7 +1025,12 @@ class LongCheck {
 
   markVisibility() {
     const v = globalThis.document?.visibilityState;
-    if (typeof v === "string") this.mark({ atMs: performance.now(), visibility: v });
+    if (typeof v !== "string") return;
+    // Whether WebView2 tells the page it is hidden when its window is minimized or hidden (platform-facts C4,
+    // open question 1): a code in the log, and pageVisibility in the result.
+    if (v !== this.lastVisibility && !this.finished) this.log("info", `check long visibility ${v === "hidden" ? "hidden" : "visible"}`);
+    this.lastVisibility = v;
+    this.mark({ atMs: performance.now(), visibility: v });
   }
 
   poll() {
@@ -1173,7 +1206,8 @@ class LongCheck {
   end(note = null, why = "stop") {
     if (!this.finishing) {
       if (note) {
-        this.earlyEnd = { note, why };
+        // What happened, then what to do next: the page shows it, and the Gate 1 gaps row starts with it.
+        this.earlyEnd = { note: `${note} ${CHECK_TEXTS.runAgain(this.mode)}`, why };
         this.log("warn", `check long ended early ${why}`);
       }
       if (!this.builtOnce) this.firstBuild.reject(named("AbortError", note ?? CHECK_TEXTS.longNoStart));
@@ -1319,9 +1353,26 @@ class LongCheck {
     const runShadowed = (r) => shadowed(timeOf(r.startFrame).wallMs);
     // Mic mode: once a list was full, both lists stop there (a CABLE Output run needs its microphone run).
     const covered = (r) => this.runsFullAt === null || r.startFrame < this.runsFullAt;
-    const refRuns = this.refRuns.filter((r) => covered(r) && !runShadowed(r));
+    // The microphone's silences of GAP_MS or more carry their time and phase (for the reason and the result).
+    const gapFrames = LIMITS.GAP_MS * FRAMES_PER_MS;
+    const refRuns = this.refRuns
+      .filter((r) => covered(r) && !runShadowed(r))
+      .map((r) => {
+        if (r.frames < gapFrames) return r;
+        const t = timeOf(r.startFrame);
+        return { ...r, atSec: t.atSec, phase: t.phase };
+      });
+    // The microphone's own drop-outs (DROPOUT_MS up to GAP_MS) once its sources settled, with when and where.
+    const micDropRuns = this.micDropRuns
+      .filter((r) => !runShadowed(r))
+      .map((r) => {
+        const t = timeOf(r.startFrame);
+        return { startFrame: r.startFrame, frames: r.frames, atSec: t.atSec, phase: t.phase };
+      });
+    const isDrop = (r) => r.frames >= LIMITS.DROPOUT_MS * FRAMES_PER_MS && r.frames < gapFrames;
 
-    // The microphone: its share of digital silence (a noise gate), its 10 ms holes and its buffer's slope.
+    // The microphone: its share of digital silence (a noise gate: longVerdict decides, from the pattern of its
+    // silences), its 10 ms holes and its buffer's slope.
     let frames = 0;
     let zeroFrames = 0;
     for (const seg of this.segments) {
@@ -1329,7 +1380,6 @@ class LongCheck {
       zeroFrames += seg.refZeroFrames;
     }
     const micZeroFraction = frames > 0 ? zeroFrames / frames : 0;
-    const noiseGate = micZeroFraction >= LIMITS.NOISE_GATE_FRACTION;
     let micPath = null;
     if (this.contextRoute && this.site === "graph") {
       const holes = this.micHoleRuns.filter((r) => !runShadowed(r)).length + this.micHolesOver;
@@ -1342,11 +1392,13 @@ class LongCheck {
         ppmIsLowerBound: mc.ppmIsLowerBound,
         direction: mc.direction,
         saturatedAtSec: mc.saturatedAtSec,
+        fullAtStart: mc.fullAtStart,
+        renewed: this.micRenewed,
         dropsPer30Min: round(mc.dropsPer30Min, 2),
         ticksPer30Min: round(mc.ticksPer30Min, 2),
         slopePpm: round(mc.slopePpm, 1),
         slopeIsLowerBound: mc.slopeIsLowerBound,
-        noiseGate,
+        noiseGate: false, // longVerdict's decision, set below
         readingsTaken: this.readings.length,
         readingsFailed: this.readingsFailed,
       };
@@ -1363,9 +1415,16 @@ class LongCheck {
       phases,
       verdict: null,
       reasons: [],
+      endedEarly: null, // { why, note } when it ended early for a reason nobody chose (see end())
       lines: [],
       tonePath: null,
       micPath,
+      // Diagnostics as well: they are listed even when a noise gate keeps the verdict from judging them.
+      micDropouts: {
+        count: micDropRuns.length + this.micDropsOver,
+        longestMs: round(micDropRuns.reduce((m, r) => Math.max(m, r.frames / FRAMES_PER_MS), 0), 1),
+        runs: micDropRuns.slice(0, 20).map((r) => ({ atSec: r.atSec, phase: r.phase, ms: round(r.frames / FRAMES_PER_MS, 1) })),
+      },
     };
 
     const verdictInput = {
@@ -1380,7 +1439,8 @@ class LongCheck {
       micPath,
       micZeroFraction,
       late,
-      refRuns,
+      // Its stops (GAP_MS or more) and its settled drop-outs; the speech analysis below gets every run.
+      refRuns: [...refRuns.filter((r) => !isDrop(r)), ...micDropRuns],
     };
 
     if (this.mode === "tone") {
@@ -1464,6 +1524,9 @@ class LongCheck {
           return Object.assign(out, underrunsNear(t.wallMs, t.wallMs + r.ms));
         }),
         dropoutCount: speech.dropouts.length,
+        // Every one of DROPOUT_MS or more (the list above keeps only the first 50, short and long mixed): the
+        // Gate 1 gaps row counts these.
+        longDropoutCount: speech.dropouts.filter((r) => r.ms >= LIMITS.DROPOUT_MS).length,
         micHoles: speech.micHoles,
         micSilentSec: round(speech.micSilentSec, 2),
         micPauses: speech.micPauses.length,
@@ -1477,11 +1540,28 @@ class LongCheck {
     }
 
     const v = longVerdict(verdictInput);
+    // The microphone's own silences, for whoever reads the results: a noise gate's many short ones, or a few long
+    // ones (muted, or paused by Windows). Runs of GAP_MS or more, the longest first; in tone mode only those are
+    // kept, so the ones over the list's limit are counted too.
+    const silences = refRuns.filter((r) => r.frames >= gapFrames);
+    if (micPath) micPath.noiseGate = v.micSilence.gate;
+    result.micSilence = {
+      checked: v.micSilence.checked,
+      gate: v.micSilence.gate,
+      zeroFraction: round(micZeroFraction, 4),
+      count: silences.length + (this.mode === "tone" ? this.runsDropped : 0),
+      longest: [...silences]
+        .sort((a, b) => b.frames - a.frames)
+        .slice(0, 20)
+        .map((r) => ({ atSec: r.atSec, phase: r.phase, ms: round(r.frames / FRAMES_PER_MS, 0) })),
+    };
     // A check that ended early for a reason nobody chose did not cover what it was asked to: it fails, with
     // that reason first, whatever the part it recorded says. One that measured nothing stays "no-signal".
+    // endedEarly says so in the result itself, for gateSummary (a stop or the planned end leaves it null).
     const early = this.earlyEnd;
     result.verdict = early && v.verdict !== "no-signal" ? "fail" : v.verdict;
     result.reasons = early ? [early.note, ...v.reasons] : v.reasons;
+    result.endedEarly = early ? { why: early.why, note: early.note } : null;
     result.lines = v.lines;
     result.tonePath = v.tonePath
       ? { ticksPer30Min: round(v.tonePath.ticksPer30Min, 2), ppm: round(v.tonePath.ppm, 1), direction: v.tonePath.direction }
@@ -1491,12 +1571,83 @@ class LongCheck {
     result.mainThreadLate = late;
     result.recoveries = this.recoveries;
     result.timerLateMs = this.timerLateness(tl);
+    result.mainThreadLateByPhase = this.mainThreadLateByPhase(tl);
+    result.pageVisibility = this.pageVisibility(startMs, endMs);
+    result.focusAfterHide = this.focusAfterHide();
     result.playback = this.anyStats ? this.playbackByPhase(tl) : null;
     result.defaultOutputChanges = this.defaultOutputs.map((t) => ({ atSec: round((t - startMs) / 1000, 1) }));
     result.route = this.route;
+    result.routePreference = this.routePreference;
+    Object.assign(result, this.routeAtEnd());
     result.site = this.site;
     result.notes = [...new Set(notes)];
     return result;
+  }
+
+  /**
+   * The page's own visibility (document.visibilityState, from its marks
+   * alone) crossed with the window's phases (from the window-state polls and
+   * Hide alone): how long the page itself was hidden in each window phase,
+   * and how often it changed. Session B answers with it whether WebView2
+   * tells the page it is hidden while its window is minimized or hidden.
+   * → { hiddenSec: { visible, minimized, hidden }, changes }
+   */
+  pageVisibility(fromMs, toMs) {
+    const out = { hiddenSec: { visible: 0, minimized: 0, hidden: 0 }, changes: 0 };
+    if (!isNum(fromMs) || !isNum(toMs) || !(toMs > fromMs)) return out;
+    const windowTl = phaseTimeline(this.marks.filter((m) => typeof m.visibility !== "string"));
+    const seen = this.marks.filter((m) => typeof m.visibility === "string" && isNum(m.atMs)).sort((a, b) => a.atMs - b.atMs);
+    let state = null;
+    let since = fromMs;
+    const close = (until) => {
+      if (state !== "hidden" || !(until > since)) return;
+      const spans = windowTl.spans(since, until);
+      out.hiddenSec.visible += spans.visibleSec + spans.unknownSec;
+      out.hiddenSec.minimized += spans.minimizedSec;
+      out.hiddenSec.hidden += spans.hiddenSec;
+    };
+    for (const m of seen) {
+      if (m.atMs <= fromMs) {
+        state = m.visibility;
+        continue;
+      }
+      if (m.atMs >= toMs) break;
+      if (m.visibility === state) continue;
+      close(m.atMs);
+      if (state !== null) out.changes++;
+      state = m.visibility;
+      since = m.atMs;
+    }
+    close(toMs);
+    for (const k of Object.keys(out.hiddenSec)) out.hiddenSec[k] = round(out.hiddenSec[k], 1);
+    return out;
+  }
+
+  /**
+   * For each Hide: whether the window had the focus at the first window-state
+   * answer after it ended (the quiet re-show must not take the keyboard from
+   * the meeting app); null when no answer said.
+   */
+  focusAfterHide() {
+    const polls = this.marks.filter((m) => typeof m.focused === "boolean").sort((a, b) => a.atMs - b.atMs);
+    return this.marks
+      .filter((m) => m.hiddenByApp === true && isNum(m.untilMs))
+      .map((h) => polls.find((p) => p.atMs >= h.untilMs)?.focused ?? null);
+  }
+
+  /** How late the worklet's messages reached the main thread, per phase: how many more than 200 ms, and the most. */
+  mainThreadLateByPhase(tl) {
+    const out = {};
+    for (const phase of ["visible", "minimized", "hidden"]) out[phase] = { count: 0, maxMs: 0 };
+    for (const p of this.sync) {
+      if (!isNum(p.wallMs) || !isNum(p.producedMs)) continue;
+      const slot = out[tl.phaseAt(p.wallMs)];
+      if (!slot) continue;
+      const late = p.wallMs - p.producedMs;
+      if (late > LIMITS.PAUSE_STEP_MS) slot.count++;
+      if (late > slot.maxMs) slot.maxMs = Math.round(late);
+    }
+    return out;
   }
 
   /** Timer lateness per phase: the most, and how many ticks came a second or more late. */
@@ -1523,6 +1674,19 @@ class LongCheck {
     return out;
   }
 
+  /**
+   * The route at the check's end, and whether the check ran on the route the
+   * user had chosen (routeAsChosen): the choice in effect at its start, and a
+   * check forced onto the audio element on that route from start to end.
+   * Gate 1 counts a check only where it belongs (normal route or comparison).
+   */
+  routeAtEnd() {
+    const routeAtEnd = this.graph.output?.method ?? null;
+    const element = (m) => typeof m === "string" && m.startsWith("element");
+    const routeAsChosen = this.routeInEffect && (this.routePreference !== "element" || (element(this.route) && element(routeAtEnd)));
+    return { routeAtEnd, routeAsChosen };
+  }
+
   /** The result when the analysis itself failed: what is known, and why there is no verdict. */
   failedResult(err) {
     return {
@@ -1534,17 +1698,24 @@ class LongCheck {
       phases: { visibleSec: 0, minimizedSec: 0, hiddenSec: 0, unknownSec: 0 },
       verdict: "no-signal",
       reasons: [...(this.earlyEnd ? [this.earlyEnd.note] : []), CHECK_TEXTS.notAnalysed(nameOf(err))],
+      endedEarly: this.earlyEnd ? { why: this.earlyEnd.why, note: this.earlyEnd.note } : null,
       lines: [],
       tonePath: null,
       micPath: null,
+      micDropouts: null,
       outages: [],
       renderPauses: [],
       mainThreadLate: { count: 0, maxMs: 0 },
       recoveries: this.recoveries,
       timerLateMs: null,
+      mainThreadLateByPhase: null,
+      pageVisibility: null,
+      focusAfterHide: [],
       playback: null,
       defaultOutputChanges: [],
       route: this.route,
+      routePreference: this.routePreference,
+      ...this.routeAtEnd(),
       site: this.site,
       notes: this.notes.slice(),
     };
@@ -1586,7 +1757,7 @@ export class Checks extends EventTarget {
    * seconds, ok, passthroughMs, estimateMs, micFifoMs, micFifoScore,
    * captureLatencyMs, score, method, levelDiffDb, verdict, text, notes,
    * cableCaptureLatencyMs, outputLatencyMs, baseLatencyMs,
-   * cableOutputRateHz, route, routePreference, site }. Throws an Error the
+   * cableOutputRateHz, route, routePreference, routeAsChosen, site }. Throws an Error the
    * page shows when it cannot run or was cut short (the voice not running,
    * no CABLE Output, the audio restarted meanwhile, another check running).
    */
@@ -1601,6 +1772,9 @@ export class Checks extends EventTarget {
       const graph = this._graph;
       const route = graph.output?.method ?? null;
       const routePreference = graph.output?.routePreference ?? "auto";
+      // A delay run ends on any rebuild, so its route stays as it began: chosen, unless the choice made during an
+      // outage was not applied yet, or a forced audio element route could not be used.
+      const routeAsChosen = graph.output?.routePreferenceInEffect !== false && (routePreference !== "element" || !isContextRoute(route));
       const contextRoute = isContextRoute(route);
       cable = await openCableOutput(graph.snapshot);
       const frames = Math.round(sec * SAMPLE_RATE);
@@ -1631,6 +1805,7 @@ export class Checks extends EventTarget {
         cableOutputRateHz: cable.settings?.sampleRateHz ?? null,
         route,
         routePreference,
+        routeAsChosen,
         site: rec.site,
       };
       this._log(

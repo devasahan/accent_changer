@@ -153,6 +153,7 @@ export class FakeGraph extends EventTarget {
     this.taps = new Set();
     this.testSource = null;
     this.testSourceCalls = [];
+    this.renewCalls = [];
     this.snapshot = { cableOut: { deviceId: "cable-out" }, cableIn: { deviceId: "cable-in" }, defaultOutputLabel: "Default - Headset Earphone" };
     this.output = { method, routePreference, entry: { deviceId: "cable-in" } };
     this.micTrack = micTrack;
@@ -203,6 +204,14 @@ export class FakeGraph extends EventTarget {
     this.testSource = stream ?? null;
     this.testSourceCalls.push(stream ? "on" : "off");
     return Promise.resolve();
+  }
+
+  /** graph.js renewMicSource(): a new microphone source (micGen + 1), only while a test source feeds inBus. */
+  renewMicSource() {
+    const renewed = this.testSource !== null && this.state === "running";
+    this.renewCalls.push(renewed);
+    if (renewed) this.micGen++;
+    return Promise.resolve(renewed);
   }
 
   lost(cause = "render-error", atMs = clock.now) {
