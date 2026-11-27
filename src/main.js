@@ -1,31 +1,64 @@
 /**
- * The app's first page: diagnostics for the test build (plan Step 1).
- * It checks, without spending Sanas minutes, what the rest of the app
- * depends on: a secure page, the microphone without a prompt, the key in
- * Windows Credential Manager, and Sanas accepting this app's address.
- * "Copy results" gives a summary with no key, token or device ids in it.
- * The results live in this page's memory only (nothing is saved), so the
- * app forgets them when it closes: the page says to copy them before that.
+ * The app's page: the Session B test build (plan Step 2).
+ * From launch it sends the microphone into VB-CABLE's "CABLE Input", so that
+ * Zoom, Teams or Meet can use "CABLE Output" as the microphone, and keeps it
+ * going through device changes and errors (src/audio/graph.js). Step 3 of
+ * the page runs the Session B checks: the delay, the long check of what the
+ * meeting hears, and Hide (src/audio/measure.js). Step 1's checks stay: the
+ * key in Windows Credential Manager and Sanas accepting this app's address.
+ * "Copy results" gives a summary with no key, token, device id or device
+ * name in it (names pass through reportLabel). The results live in this
+ * page's memory only (nothing is saved), so the app forgets them when it
+ * closes: the page says to copy them before that. The log file gets codes
+ * and numbers only (platform.log).
  */
 import { platform } from "./platform/index.js";
 import { configureSanas, connectSanas, disconnectSanas } from "./engines/sanas.js";
+import { validateSettings } from "./core/settings.js";
+import { redact, redactObject } from "./core/redact.js";
+import { gateSummary } from "./core/cable-check.js";
+import { VoiceGraph } from "./audio/graph.js";
+import { Monitor } from "./audio/monitor.js";
+import { Checks } from "./audio/measure.js";
+import { VoiceView, fillList } from "./ui/voice.js";
+import { ChecksView, delayKind } from "./ui/checks.js";
 
 const $ = (id) => document.getElementById(id);
 
 const results = {
   tool: "accent-changer diagnostics",
-  schema: 1,
+  schema: 2,
   at: null,
   shell: platform.name,
   app: null,
   page: null,
-  microphone: null,
   key: null,
   sanas: null,
   errors: [],
+  microphone: null,
+  settings: null,
+  voice: null,
+  checks: { delay: [], long: [], hide: [], beep: [] },
+  gate: [],
+  csp: [],
 };
 
+/** How often the results are drawn again while only the levels change (the debug counts, the holes). */
+const RESULTS_EVERY_MS = 1000;
+const NOT_STARTED = "The app is still starting. Try again in a moment.";
+
 configureSanas({ tokenProvider: platform.tokenProvider, where: platform.name === "app" ? "app" : "probe" });
+
+/** The validated settings (the defaults until the saved ones are read). */
+let settings = validateSettings(null).settings;
+let graph = null;
+let monitor = null;
+let checks = null;
+let voiceView = null;
+const checksView = new ChecksView({ $ });
+/** The long check that runs (its handle), or null. */
+let longHandle = null;
+let lastRenderMs = 0;
 
 function recordError(message) {
   results.errors.push({ at: new Date().toISOString(), message });
@@ -39,26 +72,23 @@ function setStatus(message, kind = "info") {
   renderResults();
 }
 
+/** The results as "Copy results" gives them: drawn afresh, then passed through redactObject. */
 function renderResults() {
   results.at = new Date().toISOString();
-  $("results").textContent = JSON.stringify(results, null, 2);
+  if (voiceView) {
+    try {
+      results.voice = voiceView.results();
+    } catch (err) {
+      results.voice = { error: err?.name ?? "Error" };
+    }
+  }
+  results.gate = gateSummary(results);
+  checksView.renderGate(results.gate);
+  $("results").textContent = JSON.stringify(redactObject(results), null, 2);
+  lastRenderMs = performance.now();
 }
 
-function fillList(dl, pairs) {
-  dl.replaceChildren(
-    ...pairs.flatMap(([term, value]) => {
-      const dt = document.createElement("dt");
-      dt.textContent = term;
-      const dd = document.createElement("dd");
-      if (Array.isArray(value)) {
-        const ul = document.createElement("ul");
-        ul.append(...value.map((v) => Object.assign(document.createElement("li"), { textContent: v })));
-        dd.append(value.length ? ul : "none");
-      } else dd.textContent = String(value);
-      return [dt, dd];
-    }),
-  );
-}
+const messageOf = (err) => (typeof err?.message === "string" && err.message ? err.message : String(err));
 
 /**
  * Run a button's action once at a time, errors shown in the status line.
@@ -76,10 +106,25 @@ function action(id, fn, { usable = () => true } = {}) {
       await fn();
     } catch (err) {
       console.error(err);
-      setStatus(err?.message ?? String(err), "error");
+      setStatus(messageOf(err), "error");
     } finally {
       delete button.dataset.busy;
       button.disabled = !usable();
+      renderResults();
+    }
+  });
+}
+
+/** A select's change, with errors in the status line (the selects stay usable while the voice recovers). */
+function onSelect(id, fn) {
+  const select = $(id);
+  select.addEventListener("change", async () => {
+    try {
+      await fn(select);
+    } catch (err) {
+      console.error(err);
+      setStatus(messageOf(err), "error");
+    } finally {
       renderResults();
     }
   });
@@ -119,67 +164,259 @@ async function showApp() {
   ]);
 }
 
-// ---------- 2 · microphone ----------
+// ---------- settings ----------
 
-function micErrorText(err) {
-  const name = err?.name ?? "";
-  const message = err?.message ?? String(err);
-  if (name === "NotAllowedError" && /system/i.test(message)) {
-    return "Windows blocked the microphone: Settings → Privacy & security → Microphone → turn on microphone access and “Let desktop apps access your microphone”, then try again.";
+/** Read the saved settings (never fails: unreadable settings mean the defaults, and the results say so). */
+async function loadSettings() {
+  let loaded;
+  try {
+    loaded = await platform.loadSettings();
+  } catch (err) {
+    loaded = { raw: null, error: messageOf(err) };
   }
-  if (name === "NotAllowedError") return "The microphone was refused for this app. Write that in your notes.";
-  if (name === "NotReadableError" || name === "AbortError") {
-    return "The microphone could not be opened: another app may be holding it. Close apps that use it and try again.";
-  }
-  if (name === "NotFoundError") return "No microphone was found. Plug in your headset and try again.";
-  return `Microphone error: ${message}`;
+  const raw = loaded?.raw ?? null;
+  const error = loaded?.error ?? null;
+  const checked = validateSettings(raw);
+  settings = checked.settings;
+  const source = error ? "unreadable" : raw === null ? "none" : typeof raw === "object" && !Array.isArray(raw) ? "saved" : "unreadable";
+  results.settings = { source, errors: error ? [error, ...checked.errors] : checked.errors };
+  platform.log("info", `settings ${source}`);
 }
 
-action("btnMic", async () => {
-  setStatus("Opening the microphone…");
-  const t0 = performance.now();
-  let stream;
+/**
+ * Change and save the settings. A failure to save does not stop the change:
+ * it applies until the app closes. → null, or why the settings could not be saved
+ */
+async function saveSettings(changes) {
+  settings = validateSettings({ ...settings, ...changes }).settings;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
+    await platform.saveSettings(settings);
+    return null;
   } catch (err) {
-    results.microphone = { ok: false, error: err?.name ?? "error" };
-    throw new Error(micErrorText(err));
+    platform.log("warn", "settings save failed");
+    return messageOf(err);
   }
-  const ms = Math.round(performance.now() - t0);
-  const track = stream.getAudioTracks()[0];
-  const s = track.getSettings();
-  stream.getTracks().forEach((t) => t.stop());
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const labels = (kind) => devices.filter((d) => d.kind === kind && !["default", "communications"].includes(d.deviceId)).map((d) => d.label || "(no name)");
-  const microphones = labels("audioinput");
-  const outputs = labels("audiooutput");
-  results.microphone = {
-    ok: true,
-    openedInMs: ms,
-    used: track.label,
-    echoCancellation: s.echoCancellation ?? null,
-    noiseSuppression: s.noiseSuppression ?? null,
-    autoGainControl: s.autoGainControl ?? null,
-    sampleRate: s.sampleRate ?? null,
-    microphones,
-    outputs,
-    cableInputFound: outputs.some((l) => /cable input/i.test(l)),
-  };
-  const off = (v) => (v === false ? "off" : v === true ? "ON" : "unknown");
-  fillList($("micInfo"), [
-    ["Opened in", `${ms} ms${ms > 1500 ? " (slow: did a question appear?)" : ""}`],
-    ["Microphone used", track.label || "(no name)"],
-    ["Echo cancellation / noise suppression / auto gain", `${off(s.echoCancellation)} / ${off(s.noiseSuppression)} / ${off(s.autoGainControl)}`],
-    ["Microphones", microphones],
-    ["Playback devices", outputs],
-    ["VB-CABLE", results.microphone.cableInputFound ? "installed (CABLE Input found)" : "not installed yet (needed later)"],
-  ]);
-  setStatus("Microphone checked.", "ok");
+}
+
+/** The status after a change of device: done or not, and whether it could be saved (the app keeps going either way). */
+function changeStatus(ok, done, failed, notSaved) {
+  const saveText = notSaved ? ` Could not save the settings: ${notSaved}` : "";
+  if (!ok) setStatus(failed + saveText, "warn");
+  else setStatus(done + saveText, notSaved ? "warn" : "ok");
+}
+
+/** The user's choices as the graph reads them before every operation. */
+const getSaved = () => ({
+  mic: { deviceId: settings.micDeviceId, label: settings.micLabel },
+  output: { deviceId: settings.cableDeviceId, label: settings.cableLabel },
 });
 
-// ---------- 3 · key ----------
+// ---------- 2 · your voice to the meeting ----------
+
+/** The voice graph, the monitor (beeps, the test tone) and the checks, wired to the page. */
+function startVoice() {
+  const shell = platform.name === "app" ? "app" : "browser";
+  graph = new VoiceGraph({ getSaved, allowPermission: platform.allowMicPermission, log: platform.log, where: shell, shell });
+  monitor = new Monitor({ getSnapshot: () => graph.snapshot, getMic: () => graph.mic, log: platform.log });
+  graph.addEventListener("devices", () => monitor.refresh());
+  graph.addEventListener("tap-error", (ev) => {
+    recordError(`A check's recorder failed: ${ev.detail?.message ?? "unknown"}`);
+    renderResults();
+  });
+  checks = new Checks({ graph, monitor, platform, log: platform.log });
+  checks.addEventListener("busy", () => {
+    syncCheckControls();
+    renderResults();
+  });
+  voiceView = new VoiceView({
+    $,
+    graph,
+    getSettings: () => settings,
+    onChange: () => renderResults(),
+    onLevels: () => {
+      if (performance.now() - lastRenderMs >= RESULTS_EVERY_MS) renderResults();
+    },
+  });
+  voiceView.attach();
+  voiceView.started();
+  const starting = graph.start();
+  voiceView.renderAll();
+  return starting;
+}
+
+// Edge dev mode only: the page may play sound after one click (the app never needs it).
+$("btnStartVoice").addEventListener("click", () => {
+  graph?.resumeFromGesture();
+  setStatus("Starting your voice…");
+});
+
+onSelect("micSelect", async (select) => {
+  if (!graph) return;
+  const id = select.value;
+  const entry = (graph.snapshot?.usable ?? []).find((d) => d.deviceId === id);
+  if (!entry) return;
+  voiceView.pendingMic = id;
+  setStatus("Switching the microphone…");
+  platform.log("info", "user mic");
+  try {
+    const notSaved = await saveSettings({ micDeviceId: id, micLabel: entry.label });
+    const r = await graph.setMic(id);
+    changeStatus(r.ok, "Microphone switched.", "The microphone could not be switched: see step 2.", notSaved);
+  } finally {
+    if (voiceView.pendingMic === id) voiceView.pendingMic = null;
+    voiceView.renderSelects();
+  }
+});
+
+onSelect("outSelect", async (select) => {
+  if (!graph) return;
+  const id = select.value;
+  const entry = id ? (graph.snapshot?.outputs ?? []).find((d) => d.deviceId === id) : null;
+  if (id && !entry) return;
+  setStatus("Switching where your voice goes…");
+  platform.log("info", `user output ${id ? "chosen" : "auto"}`);
+  const notSaved = await saveSettings({ cableDeviceId: id, cableLabel: entry?.label ?? "" });
+  const r = await graph.setOutput(id || null);
+  changeStatus(r.ok, "Switched where your voice goes.", "That device could not be used: see step 2.", notSaved);
+});
+
+// Advanced (diagnostics only, not saved): the audio element route.
+onSelect("routeSelect", async (select) => {
+  if (!graph) return;
+  const value = select.value === "element" ? "element" : "auto";
+  setStatus("Switching the output route…");
+  platform.log("info", `user route ${value}`);
+  const r = await graph.setRoutePreference(value);
+  setStatus(r.ok ? "Output route switched." : "The output route could not be switched: see step 2.", r.ok ? "ok" : "warn");
+});
+
+// "Check the microphone": a fresh look at the devices; no new microphone request when one is open.
+action("btnMic", async () => {
+  if (!graph) throw new Error(NOT_STARTED);
+  setStatus("Checking the microphone…");
+  await graph.retry();
+  const mic = voiceView.microphoneCheck();
+  if (mic) {
+    results.microphone = mic;
+    setStatus("Microphone checked.", "ok");
+  } else {
+    results.microphone = { ok: false, error: graph.state };
+    setStatus(graph.stateInfo.text, "error");
+  }
+});
+
+action("btnBeep", async () => {
+  if (!monitor) throw new Error(NOT_STARTED);
+  setStatus("Playing a test beep…");
+  const at = new Date().toISOString();
+  try {
+    const r = await monitor.beep("test");
+    results.checks.beep.push({ at, ok: true, sink: r.sink });
+    setStatus("Beep played in your headphones. The meeting can't hear it.", "ok");
+  } catch (err) {
+    if (err?.name !== "MonitorError") {
+      results.checks.beep.push({ at, ok: false, error: err?.name ?? "Error" });
+      throw err;
+    }
+    results.checks.beep.push({ at, ok: false, error: err.code });
+    setStatus(err.message, "warn");
+  }
+});
+
+// ---------- 3 · checks for the meeting ----------
+
+/** The check buttons and the device choices follow the check that runs (one at a time). */
+function syncCheckControls() {
+  const busy = checks?.busy ?? null;
+  voiceView?.setChecksBusy(busy);
+  $("longSource").disabled = Boolean(busy);
+  $("longMinutes").disabled = Boolean(busy);
+  for (const [id, usable] of [
+    ["btnMeasure", canStartCheck],
+    ["btnLongStart", canStartCheck],
+    ["btnLongStop", canStopLong],
+  ]) {
+    const button = $(id);
+    if (!button.dataset.busy) button.disabled = !usable();
+  }
+}
+const canStartCheck = () => !checks?.busy;
+const canStopLong = () => checks?.busy === "long" && longHandle !== null;
+
+action(
+  "btnMeasure",
+  async () => {
+    if (!checks) throw new Error(NOT_STARTED);
+    setStatus("Measuring the delay…");
+    let r;
+    try {
+      r = await checks.measureDelay({ onProgress: (secondsLeft) => checksView.delayProgress(secondsLeft) });
+    } catch (err) {
+      checksView.delayFailed(messageOf(err));
+      throw err;
+    }
+    results.checks.delay.push(r);
+    checksView.delayDone(r);
+    setStatus("Delay measured.", delayKind(r.verdict));
+  },
+  { usable: canStartCheck },
+);
+
+action(
+  "btnLongStart",
+  async () => {
+    if (!checks) throw new Error(NOT_STARTED);
+    const mode = $("longSource").value === "mic" ? "mic" : "tone";
+    const minutes = Number($("longMinutes").value);
+    setStatus("Starting the long check…");
+    checksView.longStarting();
+    let handle;
+    try {
+      handle = await checks.startLong({ mode, minutes, onProgress: (p) => checksView.longProgress(p) });
+    } catch (err) {
+      checksView.longFailed(messageOf(err));
+      throw err;
+    }
+    longHandle = handle;
+    syncCheckControls();
+    handle.done.then((result) => {
+      try {
+        if (longHandle === handle) longHandle = null;
+        results.checks.long.push(result);
+        setStatus("Long check done.", checksView.longDone(result));
+      } catch (err) {
+        recordError(`The long check's result could not be shown: ${err?.name ?? "Error"}`);
+      } finally {
+        syncCheckControls();
+        renderResults();
+      }
+    });
+    setStatus("Long check running…", "info");
+  },
+  { usable: canStartCheck },
+);
+
+action(
+  "btnLongStop",
+  async () => {
+    const handle = longHandle;
+    if (!handle) return;
+    setStatus("Stopping the long check…");
+    await handle.stop(); // its result is shown by the start's done handler
+  },
+  { usable: canStopLong },
+);
+
+action("btnHide", async () => {
+  if (!checks) throw new Error(NOT_STARTED);
+  setStatus("Hiding the app…");
+  const r = await checks.hideFor(30);
+  results.checks.hide.push(r);
+  checksView.hideDone(r);
+  setStatus("The app was hidden for 30 minutes.", "ok");
+});
+
+// ---------- 4 · key ----------
 
 // Whether Remove key has something to remove: a key the app holds (in Edge
 // dev mode the server holds it, and only the server can drop it).
@@ -232,7 +469,7 @@ action("btnSaveKey", async () => {
   if (saved.checked === "accepted") setStatus("Sanas accepted the key. It is saved in Windows Credential Manager.", "ok");
   else {
     const why = saved.note ? ` (${saved.note})` : "";
-    setStatus(`Saved, but Sanas could not be asked right now${why}. Step 4 will tell whether it works.`, "warn");
+    setStatus(`Saved, but Sanas could not be asked right now${why}. Step 5 will tell whether it works.`, "warn");
   }
 });
 
@@ -248,7 +485,7 @@ action(
   { usable: () => keyRemovable },
 );
 
-// ---------- 4 · connect only ----------
+// ---------- 5 · connect only ----------
 
 action("btnConnect", async () => {
   setStatus("Connecting to Sanas (no audio)…");
@@ -270,11 +507,12 @@ action("btnConnect", async () => {
   }
 });
 
-// ---------- 5 · copy ----------
+// ---------- 6 · copy ----------
 
 action("btnCopy", async () => {
   renderResults();
   const text = $("results").textContent;
+  platform.log("info", "results copied");
   try {
     await navigator.clipboard.writeText(text);
     $("copyInfo").textContent = "Copied. Paste it into your message.";
@@ -286,13 +524,35 @@ action("btnCopy", async () => {
 
 // ---------- start ----------
 
-window.addEventListener("pagehide", () => disconnectSanas());
+// The CSP blocked something: kept in the results (redacted), and its directive in the log.
+document.addEventListener("securitypolicyviolation", (e) => {
+  results.csp.push(redact(`${e.violatedDirective} ${e.blockedURI}`));
+  platform.log("warn", `csp ${e.violatedDirective}`);
+  renderResults();
+});
+
+window.addEventListener("pagehide", () => {
+  const quietly = (fn) => {
+    try {
+      Promise.resolve(fn()).catch(() => {});
+    } catch {
+      // The page is going away: nothing more to do.
+    }
+  };
+  quietly(() => checks?.stop());
+  quietly(() => graph?.stop());
+  quietly(() => monitor?.close());
+  quietly(() => disconnectSanas());
+});
 
 await showApp();
 await showKey();
+await loadSettings();
 renderResults();
 if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
   setStatus("This page is not a secure page, so the microphone can't work here. Write that in your notes.", "error");
 } else {
-  setStatus("Ready. Start with step 2.", "info");
+  await startVoice();
+  syncCheckControls();
+  setStatus("Ready. Step 2 shows where your voice goes; step 3 has the Session B checks.", "info");
 }

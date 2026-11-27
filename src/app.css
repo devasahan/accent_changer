@@ -40,6 +40,7 @@ header, main { max-width: 860px; margin: 0 auto; padding: 0 16px; }
 header { padding-top: 18px; }
 h1 { font-size: 1.3rem; margin: 0 0 4px; }
 h2 { font-size: 1.05rem; margin: 0 0 8px; }
+h3 { font-size: 0.95rem; margin: 12px 0 4px; }
 
 section {
   background: var(--card);
@@ -49,20 +50,21 @@ section {
   margin: 14px 0;
 }
 
-#status { font-weight: 600; min-height: 1.5em; }
+#status, #voiceStatus { font-weight: 600; min-height: 1.5em; }
 [data-kind="error"] { color: var(--error); }
 [data-kind="warn"] { color: var(--warn); }
 [data-kind="ok"] { color: var(--accent); }
 
 label { display: flex; flex-direction: column; gap: 3px; font-size: 0.9rem; color: var(--muted); }
-input, button { font: inherit; color: var(--text); }
-input {
+input, button, select { font: inherit; color: var(--text); }
+input, select {
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 5px 8px;
   min-width: 18em;
 }
+meter { width: 12em; height: 0.9em; }
 button {
   background: var(--accent);
   color: var(--on-accent);
@@ -77,11 +79,16 @@ button.quiet { background: transparent; color: var(--accent); border: 1px solid 
 button:disabled { background: var(--line); color: var(--muted); cursor: default; }
 
 .row { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 8px 0; }
+.meters { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+/* .row (and anything else with a display of its own) would otherwise show what the hidden attribute hides. */
+[hidden] { display: none !important; }
 .hint { color: var(--muted); font-size: 0.9rem; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 6px 0; }
 dt { color: var(--muted); }
 dd { margin: 0; overflow-wrap: anywhere; }
 ul { margin: 4px 0; padding-left: 20px; }
+#voiceWarnings li, #gateList li[data-kind="warn"] { color: var(--warn); }
+details.advanced summary { color: var(--muted); cursor: pointer; }
 
 pre {
   max-height: 260px;

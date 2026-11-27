@@ -16,7 +16,8 @@ Results so far: [spike/FINDINGS.md](spike/FINDINGS.md).
 2. **Part 2, 5–6 days before your interview** (about 2 hours): try Krisp and the Sanas desktop app with the same page, and ask a friend for a short blind listening test.
 3. **Your interview:** follow [INTERVIEW.md](INTERVIEW.md) with the app that passes its bar. Our own app can't be ready in time.
 4. **When I say the app's test build is ready** (about 15 minutes, any day): [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes) below.
-5. **Send me the results file** after every sitting.
+5. **When I say the Session B build is ready** (about 2 hours in all, about 50 minutes of it with you): [Session B](#session-b-your-voice-into-the-meeting-about-2-hours) below.
+6. **Send me the results file** after every sitting.
 
 Two rules for every sitting:
 
@@ -171,6 +172,51 @@ When I tell you the test build is ready:
 
 To uninstall later: Windows Settings → Apps → Installed apps (Windows 10: Apps & features) → Accent Changer → Uninstall (in Windows 11, under its **…** button). To remove the key too, open the app first and press **Remove key**.
 
+## Session B: your voice into the meeting (about 2 hours)
+
+Do this when I tell you the Session B build is ready. It takes about 2 hours in all: the long check runs by itself for an hour, and about 50 minutes need you. This build sends your microphone into VB-CABLE, a free virtual cable, so that Zoom, Teams or Meet can use "CABLE Output" as your microphone. It uses no Sanas minutes.
+
+**You need:** the laptop on its charger, your wired or USB headset plugged in, Zoom installed, Google Meet in Edge, your phone (for a timer), and an hour in which the laptop does nothing heavy.
+
+**Before you start:** Windows Settings → System → Power & battery → **Screen and sleep** (on newer Windows 11: **Screen, sleep, & hibernate timeouts**) → "When plugged in, put my device to sleep after" → **Never**. Set it back afterwards. The screen may still turn off: that is fine.
+
+1. **Install VB-CABLE** (10 min). In Edge, open vb-audio.com/Cable and download the Windows "VBCABLE_Driver_Pack" zip. Right-click it → **Extract All** → **Extract**. In the new folder, right-click **VBCABLE_Setup_x64** → **Run as administrator** → **Yes** → **Install Driver** → **OK**. Restart Windows. (Running it from inside the zip fails.)
+2. **Windows sound settings** (10 min). Press Windows key + R, type `mmsys.cpl` and press Enter.
+   1. **Playback:** right-click your headset → **Set as Default Device**, and again → **Set as Default Communication Device**. CABLE Input must not have the green tick.
+   2. **Playback:** right-click **CABLE Input** → **Properties** → **Advanced** → Default Format "2 channel, 24 bit, 48000 Hz" (or 16 bit, 48000 Hz) → **OK**.
+   3. **Recording:** make your headset microphone the default device and the default communication device. CABLE Output must have neither tick. Right-click **CABLE Output** → **Properties** → **Advanced** → 48000 Hz as above. Then the **Listen** tab: "Listen to this device" must be unticked → **OK**.
+   4. **Communications** tab → **Do nothing** → **OK**.
+3. **Remove the old test build, then install the new one** (7 min).
+   1. Windows Settings → Apps → Installed apps → **Accent Changer** → **…** → **Uninstall** → **Uninstall**. In the window that opens, tick **Delete the application data**, then press **Uninstall**. This makes the next start a true first start, like on your friend's PC. Your Sanas key stays saved: it lives in Windows Credential Manager. (No Accent Changer in the list? Skip this.)
+   2. Install the new build as in [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes), steps 2 and 3, from the link I send.
+4. **Open the app three times** (5 min). Open Accent Changer, look at the page, and close it with the X. Do this three times in all, and leave the third one open. **Each time, note whether Windows or the app asked anything.** The first time matters most. On the page:
+   - step 1 says "Secure page: yes";
+   - step 2 is green: "Your voice goes into “CABLE Input”…", and shows "off / off / off";
+   - step 2 shows no yellow warnings. If it does, do what they say, then press **Check the microphone**.
+
+   Speak: the "Your microphone" and "Going to the meeting" bars move. (The true first start on your friend's PC is checked again when they install it.)
+5. **Zoom's microphone test** (5 min). Zoom → Settings → Audio: Microphone **CABLE Output (VB-Audio Virtual Cable)**, Speaker your headset. Untick "Automatically adjust microphone volume". Press **Test Mic**, say a sentence and listen to the playback. Note: did you hear yourself?
+6. **Measure the delay** (2 min). In step 3 of the page, press **Measure the delay**, then say "pa-ta-ka" over and over until it stops (12 seconds). Note the number.
+7. **The long check** (about 70 min; you are needed at the start, after 30 minutes and at the end).
+   1. In the app: Long check → Send **a test tone**, Minutes **65** → **Start the long check**. From now on the meeting hears a steady tone instead of you: that is expected. (Starting it before the meeting lets the app notice if Windows turns the sound down when the meeting starts.)
+   2. In Edge, go to meet.google.com → **New meeting** → **Start an instant meeting**. In the meeting: **⋮** → **Settings** → **General** → turn **Leave empty calls** off. Otherwise Meet ends a call in which you are alone after a few minutes. Then **Audio** → Microphone **CABLE Output (VB-Audio Virtual Cable)**, Speaker your headset. Keep the meeting open, with the camera on or off. If you can't find "Leave empty calls", join the same meeting from your phone instead, with the phone's microphone and sound off, and leave the phone there.
+   3. Minimize the app (the – at the top right). Set a 30-minute timer on your phone.
+   4. After 30 minutes: check that the Meet tab still shows the meeting (if it ended, note the time). Click the app in the taskbar and press **Hide the app for 30 minutes**. It disappears. It comes back by itself after 30 minutes, without jumping in front of other windows: look for it on the taskbar. (To bring it back sooner, open it from the Start menu.)
+   5. When it is back, check that the Meet tab still shows the meeting (if it ended, note it). Wait until the long check says **done** (about 2 minutes after the app comes back), and note its result line. **Still in the meeting**, press **Measure the delay** and say "pa-ta-ka" until it stops: this shows how the delay grew during the hour, and whether the meeting made Windows turn the sound down. Then leave the meeting.
+   6. **Only if it says "too many clicks":** step 2 → Advanced → Output route **Through an audio element (test)**. Press **Measure the delay** again. Run the long check again with Minutes **30** (no meeting needed; the app can stay open). Then set Output route back to **Automatic**.
+8. **A short check with your voice** (7 min). Long check → Send **your microphone**, Minutes **5** → **Start the long check**. Minimize the app and read anything aloud (a news article) with normal pauses for 5 minutes. Then open the app and note the result.
+9. **Restart Windows Audio** (5 min). Start → type `services` → right-click **Services** → **Run as administrator** → **Yes**. Find **Windows Audio** → right-click → **Restart**. If Windows asks whether to restart other services too, press **Yes**. Then look at step 2 → **Recoveries**, and wait until a new line appears there (up to 30 seconds). It should say that your voice came back, and after how long. Speak: the bars move again.
+10. **Connect only** (1 min) in step 5 of the page.
+11. **Copy results** and paste them into your message, with your notes from steps 4, 5, 7.4 and 7.5 (and anything odd, with the time). Do not close the app before you have pasted them. The "Session B checklist" in step 3 shows what passed. Also send the log file: press Windows key + R, paste the line below and press Enter:
+
+    ```
+    %LOCALAPPDATA%\io.github.devasahan.accentchanger\logs
+    ```
+
+    Attach **Accent Changer.log** from the folder that opens. It holds the first start's timings and the permission answers, and no device names.
+
+**If I ask you to compare with Edge** (only then): start the test server as in Part 1, step 2, open http://localhost:8080/src/ in Edge, press **Start** if step 2 of the page shows it, and do steps 6 to 8 there. Instead of Hide, minimize the Edge window.
+
 ## Troubleshooting
 
 | You see | Do this |
@@ -194,11 +240,18 @@ To uninstall later: Windows Settings → Apps → Installed apps (Windows 10: Ap
 | Step 4 shows far fewer lines than your script has | You paused too briefly between lines: record or read again with about one second of pause. |
 | Step 7: the other microphone "is silent" or "stayed silent" | The app must be running, with your headset as its microphone and accent conversion on. Some apps convert only while a call app uses their microphone: the page counts as one. |
 | Accent Changer (the test build) doesn't open, or closes at once | Send me its log file: see [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes), step 4. |
+| Session B: step 2 says VB-CABLE is not installed | Do Session B step 1 again, then restart Windows. |
+| Zoom's Test Mic plays nothing | In Zoom the microphone must be CABLE Output, and the app must be open with step 2 green. |
+| I hear myself all the time | "Listen to this device" on CABLE Output is ticked: see Session B step 2.3. |
+| The meeting hears a tone | The long check is running (that is expected), or it was stopped early: press **Stop and check**. |
+| The app came back, but I can't see it | It is behind the meeting window: click it on the taskbar. |
+| Meet left the call by itself | "Leave empty calls" was on (Session B step 7.2). Note the time, and do step 7 again if I ask. |
 
 ## Privacy
 
 - **API key, test page (Parts 1 and 2):** only in the test server's memory. It never reaches the browser, the disk or the logs.
 - **API key, app (Session A2):** you paste it once into the app's page. The app checks it with Sanas and keeps it in Windows Credential Manager until you press **Remove key**. It is never written to the app's log or to the results; the page shows only its last 4 characters.
+- **Session B results and log:** they hold no device ids. Device names are hidden, except VB-CABLE's own names and Windows' generic ones such as "Headset Microphone". The log holds codes and numbers only.
 - **Audio:** goes to Sanas Cloud (Ohio or Mumbai). Sanas says it is processed in real time and not stored.
 - **Krisp and the Sanas desktop app:** their vendors say accent conversion runs on your laptop. Their meeting-notes features upload transcripts, so keep those off.
 - **Recordings and downloads:** stay on your PC (your Downloads folder). If you copy them into this folder, `.gitignore` keeps WAV files and `sanas-check-*.json` results out of git.
@@ -208,14 +261,15 @@ To uninstall later: Windows Settings → Apps → Installed apps (Windows 10: Ap
 ```
 npm test               # unit tests (Node 20+, no install)
 npm run test:browser   # the probe page in headless Chromium with fake microphones and the Mock engine (needs Playwright)
-npm run test:app       # the app's page the same way: in Edge dev mode, and as the installed app with its Rust side and Sanas faked
+npm run test:app       # the app's page the same way: in Edge dev mode, and as the installed app with its Rust side, Sanas and VB-CABLE faked
 cd src-tauri && cargo test   # the app's Rust side
 ```
 
 | Path | What |
 |---|---|
-| `spike/` | The Step 0 probe:<ul><li>`serve.mjs`: local server, key check, Sanas address check, token exchange</li><li>`index.html` / `probe.js`: the UI</li><li>`engines.js`: Sanas and Mock</li><li>`quiet-test.js`: the quiet test's rules</li><li>`webrtc-stats.js`, `recorder.worklet.js`</li></ul> |
-| `src/` | The app's page (no bundler): `index.html`, `main.js`, `engines/`, `platform/`, and `core/`, the pure logic shared with the probe |
+| `spike/` | The Step 0 probe:<ul><li>`serve.mjs`: local server, key check, Sanas address check, token exchange</li><li>`index.html` / `probe.js`: the UI</li><li>`engines.js`: Sanas and Mock</li><li>`quiet-test.js`: the quiet test's rules</li><li>`webrtc-stats.js`</li></ul> |
+| `src/` | The app's page (no bundler): `index.html`, `main.js`, `ui/` (its steps 2 and 3), `audio/`, `engines/`, `platform/`, and `core/`, the pure logic shared with the probe |
+| `src/audio/` | The voice into VB-CABLE: `graph.js` (the passthrough and its recovery), `devices.js`, `sink.js`, `monitor.js` (beeps and the test tone, never on the cable), `measure.js` (the Session B checks), and `worklets/` (the recorder the probe uses too) |
 | `src-tauri/` | The app's Rust side (Tauri 2): key in Windows Credential Manager, token exchange, window and microphone rules |
 | `src/vendor/` | The Sanas Browser SDK, unchanged (see its README for version and hashes) |
 | `tests/` | `node --test` unit tests and the headless browser checks |
