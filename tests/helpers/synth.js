@@ -138,3 +138,74 @@ export function bandNoise(sampleRate, seconds, cutoffHz, seed = 3) {
   for (const { w, p } of parts) for (let i = 0; i < n; i++) out[i] += amp * Math.sin(w * i + p);
   return out;
 }
+
+/**
+ * A steady sine (the long check's test tone by default: 1031.25 Hz, exactly
+ * 11 cycles per 512 samples at 48 kHz) with a peak level of `dbfs`.
+ */
+export function tone({ sampleRate = 48000, seconds = 1, hz = 1031.25, dbfs = -12, phase = 0.3 } = {}) {
+  const n = Math.round(seconds * sampleRate);
+  const out = new Float32Array(n);
+  const amp = 10 ** (dbfs / 20);
+  const w = (2 * Math.PI * hz) / sampleRate;
+  // The phase wraps every `period` samples when the tone fits a whole number of cycles into it (1031.25 Hz: 512).
+  const period = Number.isInteger((hz * 512) / sampleRate) ? 512 : 0;
+  for (let i = 0; i < n; i++) out[i] = amp * Math.sin(w * (period ? i % period : i) + phase);
+  return out;
+}
+
+// Positions and lengths below are sample counts; fractional ones (seconds × rate) are rounded.
+
+/** `x` without the `n` samples from `at` (a clock crossing that dropped a buffer): shorter by n. */
+export function dropFrames(x, at, n) {
+  at = Math.round(at);
+  n = Math.round(n);
+  const out = new Float32Array(x.length - n);
+  out.set(x.subarray(0, at));
+  out.set(x.subarray(at + n), at);
+  return out;
+}
+
+/** `x` with `n` zeros inserted at `at` (a clock crossing that ran short): longer by n. */
+export function insertZeros(x, at, n) {
+  at = Math.round(at);
+  n = Math.round(n);
+  const out = new Float32Array(x.length + n);
+  out.set(x.subarray(0, at));
+  out.set(x.subarray(at), at + n);
+  return out;
+}
+
+/** A copy of `x` with the `n` samples from `at` set to zero (a dropout): same length. */
+export function zeroFill(x, at, n) {
+  at = Math.round(at);
+  const out = Float32Array.from(x);
+  out.fill(0, at, Math.min(x.length, at + Math.round(n)));
+  return out;
+}
+
+/** A copy of `x` whose gain moves by `db` from `at`, over `rampFrames` samples (linear in dB; 0 = at once). */
+export function gainStep(x, at, db, rampFrames = 0) {
+  const out = Float32Array.from(x);
+  for (let i = Math.round(at); i < out.length; i++) {
+    const k = rampFrames > 0 ? Math.min(1, (i - at) / rampFrames) : 1;
+    out[i] *= 10 ** ((db * k) / 20);
+  }
+  return out;
+}
+
+/** A copy of `x` with `value` added to the sample at `at` (a click). */
+export function addSpike(x, at, value) {
+  const out = Float32Array.from(x);
+  out[Math.round(at)] += value;
+  return out;
+}
+
+/** `n` samples of seeded white noise (uniform) with an RMS level of `dbfs`. */
+export function whiteNoise(n, seed, dbfs = -60) {
+  const rand = rng(seed);
+  const amp = 10 ** (dbfs / 20) * Math.sqrt(3);
+  const out = new Float32Array(Math.round(n));
+  for (let i = 0; i < n; i++) out[i] = amp * (rand() * 2 - 1);
+  return out;
+}
