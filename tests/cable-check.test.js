@@ -89,7 +89,7 @@ test("delayVerdict: unclear, silent microphone, silent cable", () => {
 test("delayVerdict: notes for a quiet cable and for a microphone buffer that grew", () => {
   let v = delayVerdict(run(60, { levelDiffDb: -6.24 }));
   assert.deepEqual(v.notes, [
-    "The voice arrives 6.2 dB quieter in CABLE Output: check that CABLE Input and CABLE Output are at 100 % in Windows sound settings, and that Communications is set to “Do nothing”.",
+    "The voice arrives 6.2 dB quieter in CABLE Output. In Windows sound settings (Windows key + R, type mmsys.cpl, Enter): Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100.",
   ]);
   assert.deepEqual(delayVerdict(run(60, { levelDiffDb: -2.9 })).notes, []);
   v = delayVerdict(run(60), { micFifoMs: 25 });
@@ -741,32 +741,34 @@ test("clockFromEvents: regular skips give the offset; few events give the rate",
   r = clockFromEvents(holes, 3600);
   near(r.ppm, -16.67, 0.01, "ppm from holes");
   assert.equal(r.direction, "slower");
+  assert.equal(r.steady, true);
+  // One or two events are counted, but they are no measured offset: any glitch can make one.
   r = clockFromEvents([{ kind: "skip", atSec: 10 }], 1800);
-  assert.equal(r.ticksPer30Min, 1);
-  near(r.ppm, 5.56, 0.01, "ppm from one event");
-  assert.equal(r.direction, "faster");
+  assert.deepEqual(r, { ppm: null, direction: null, ticksPer30Min: 1, steady: false });
+  r = clockFromEvents([{ kind: "hole", atSec: 10 }, { kind: "hole", atSec: 900 }], 1800);
+  assert.deepEqual(r, { ppm: null, direction: null, ticksPer30Min: 2, steady: false });
   r = clockFromEvents([{ kind: "click", atSec: 10 }, { kind: "level", atSec: 20 }], 900);
   assert.equal(r.ticksPer30Min, 2);
   assert.equal(r.direction, null);
-  assert.deepEqual(clockFromEvents([], 1800), { ppm: 0, direction: null, ticksPer30Min: 0 });
-  assert.deepEqual(clockFromEvents([], 0), { ppm: null, direction: null, ticksPer30Min: null });
+  assert.deepEqual(clockFromEvents([], 1800), { ppm: null, direction: null, ticksPer30Min: 0, steady: false });
+  assert.deepEqual(clockFromEvents([], 0), { ppm: null, direction: null, ticksPer30Min: null, steady: false });
 });
 
 test("clockFromEvents: a burst or a cluster of events is counted, but says nothing about the clocks", () => {
   const at = (kind, times) => times.map((atSec) => ({ kind, atSec }));
   const rate3 = (3 * 1800) / 3900;
   // Three holes within one second (a CPU spike) in a 65-minute check: 1.4 per 30 minutes, not 4000.
-  assert.deepEqual(clockFromEvents(at("hole", [1200, 1200.4, 1200.9]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3 });
+  assert.deepEqual(clockFromEvents(at("hole", [1200, 1200.4, 1200.9]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3, steady: false });
   // Three skips 40 s apart in the middle, then none: steady drift would have gone on.
-  assert.deepEqual(clockFromEvents(at("skip", [1000, 1040, 1080]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3 });
-  assert.deepEqual(clockFromEvents(at("skip", [300, 340, 380]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3 });
+  assert.deepEqual(clockFromEvents(at("skip", [1000, 1040, 1080]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3, steady: false });
+  assert.deepEqual(clockFromEvents(at("skip", [300, 340, 380]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3, steady: false });
   // Four holes: three 40 s apart early on, one at the end.
   assert.equal(clockFromEvents(at("hole", [100, 140, 180, 3870]), 3900).ppm, null);
   // Three skips 40 s apart in the last two minutes: a clock offset would have shown long before.
   assert.equal(clockFromEvents(at("skip", [3780, 3820, 3860]), 3900).ppm, null);
   // Ten holes half a second apart at the start of a 12 s check: no clock drifts 20000 ppm.
   const glitchy = clockFromEvents(at("hole", Array.from({ length: 10 }, (_, k) => 5 + 0.5 * k)), 12);
-  assert.deepEqual(glitchy, { ppm: null, direction: null, ticksPer30Min: 1500 });
+  assert.deepEqual(glitchy, { ppm: null, direction: null, ticksPer30Min: 1500, steady: false });
 });
 
 test("clockFromEvents: steady drift that began once the buffer filled gives its rate from then on", () => {
@@ -801,14 +803,15 @@ test("longVerdict: a clean check passes, with its lines", () => {
   const v = longVerdict(clean());
   assert.equal(v.verdict, "pass");
   assert.deepEqual(v.reasons, []);
-  assert.equal(v.tonePath.direction, "faster");
+  // One skip and one hole: counted, but no measured offset (one click can be any glitch).
+  assert.equal(v.tonePath.direction, null);
   near(v.tonePath.ticksPer30Min, 1800 / 3900, 1e-9, "one skip in 65 min");
-  near(v.tonePath.ppm, 1e4 / 3900, 1e-9, "one 10 ms skip in 3900 s");
+  assert.equal(v.tonePath.ppm, null);
   assert.deepEqual(v.lines, [
     "65 min recorded: 31 min minimized, 29 min hidden, 5 min open.",
     "Gaps: none.",
-    "Clicks from the meeting's side of the sound: 1 (about 0.5 per 30 minutes; Windows' default playback device and VB-CABLE differ by about 3 ppm).",
-    "Clicks from your microphone's side: about 0.5 per 30 minutes (its clock runs 3 ppm slower than VB-CABLE's).",
+    "Clicks from the meeting's side of the sound: 1 (about 0.5 per 30 minutes).",
+    "Clicks from your microphone's side: about 0.5 per 30 minutes (one short hole: too few to tell its clock).",
     "Volume: steady at −12.0 dB.",
   ]);
   assert.deepEqual(v.micPath, clean().micPath, "the microphone's road as given");
@@ -860,7 +863,7 @@ test("longVerdict: 7 clicks per 30 minutes on the microphone's road fail", () =>
   const v = longVerdict(clean({ micPath }));
   assert.equal(v.verdict, "fail");
   assert.deepEqual(v.reasons, ["Too many clicks from your microphone's side: about 7.0 per 30 minutes (6 at most)."]);
-  assert.equal(v.lines[3], "Clicks from your microphone's side: about 7.0 per 30 minutes (its clock runs 39 ppm faster than VB-CABLE's).");
+  assert.equal(v.lines[3], "Clicks from your microphone's side: about 7.0 per 30 minutes (its clock runs faster than VB-CABLE's).");
 });
 
 test("longVerdict: with a noise gate 'capture paused' is skipped, and the holes seen count as a lower bound, never a pass", () => {
@@ -915,14 +918,16 @@ test("longVerdict: a tone 2 dB too quiet needs a setting changed; 0.8 dB is fine
   let v = longVerdict(clean({ tone: { lockDb: -14, minStableDb: -14 } }));
   assert.equal(v.verdict, "fix-setting");
   assert.deepEqual(v.reasons, [
-    "The meeting hears your voice 2.0 dB quieter than it should: in Windows sound settings set Communications to “Do nothing”, set CABLE Input and CABLE Output to 100 %, and in Zoom untick “Automatically adjust microphone volume”. Then run the check again.",
+    "The meeting hears the sound 2.0 dB quieter than it should. In Windows sound settings (Windows key + R, type mmsys.cpl, Enter): Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100. In the meeting app, turn off its automatic microphone volume. Then tell me before you run the hour-long check again (Session B step 7.5).",
   ]);
+  // Exact places, no meeting app named (the check runs in Meet), and which re-run is meant.
+  assert.ok(!/Zoom|run the check again/.test(v.reasons[0]), v.reasons[0]);
   v = longVerdict(clean({ tone: { lockDb: -12.8, minStableDb: -12.8 } }));
   assert.equal(v.verdict, "pass");
   // The limit is −13 dBFS: −13.2 needs the setting, −13.0 is fine.
   v = longVerdict(clean({ tone: { lockDb: -12, minStableDb: -13.2 } }));
   assert.equal(v.verdict, "fix-setting");
-  assert.ok(v.reasons[0].startsWith("The meeting hears your voice 1.2 dB quieter"), v.reasons[0]);
+  assert.ok(v.reasons[0].startsWith("The meeting hears the sound 1.2 dB quieter"), v.reasons[0]);
   assert.equal(longVerdict(clean({ tone: { lockDb: -12, minStableDb: -13 } })).verdict, "pass");
 });
 
@@ -930,7 +935,7 @@ test("longVerdict: Windows turning the voice down during the check needs a setti
   const v = longVerdict(clean({ levelChanges: [{ atSec: 330, fromDb: -12, toDb: -26 }] }));
   assert.equal(v.verdict, "fix-setting");
   assert.deepEqual(v.reasons, [
-    "Windows turned the voice down by 14.0 dB at 5:30, probably when the meeting started: in Windows sound settings set Communications to “Do nothing”. Then run the check again.",
+    "Windows turned the sound down by 14.0 dB at 5:30, probably when the meeting started. In Windows sound settings (Windows key + R, type mmsys.cpl, Enter): Communications tab → “Do nothing” → OK. Then tell me before you run the hour-long check again (Session B step 7.5).",
   ]);
   // Taken from the tone's level events when no list is given.
   const fromEvents = longVerdict(
@@ -1430,11 +1435,11 @@ test("longVerdict: with a noise gate the microphone's road is too short to measu
   const sum = per30Text(faster.slopePpm * 0.18 + 7);
   assert.deepEqual(v.reasons, [`Too many clicks from your microphone's side: about ${sum} per 30 minutes (6 at most).`]);
   const line = v.lines.find((l) => l.startsWith("Clicks from your microphone's side"));
-  assert.equal(line, `Clicks from your microphone's side: about ${sum} per 30 minutes (its clock runs ${Math.round(faster.slopePpm)} ppm faster than VB-CABLE's).`);
+  assert.equal(line, `Clicks from your microphone's side: about ${sum} per 30 minutes (its clock runs faster than VB-CABLE's).`);
   // The same without holes passes on the slope's drops.
   v = longVerdict(clean({ micPath: { ...faster, holes: 0, holesPer30Min: 0 }, micZeroFraction: 0.05 }));
   assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
-  assert.ok(v.lines.includes(`Clicks from your microphone's side: about ${per30Text(faster.slopePpm * 0.18)} per 30 minutes (its clock runs ${Math.round(faster.slopePpm)} ppm faster than VB-CABLE's).`), v.lines.join(" | "));
+  assert.ok(v.lines.includes(`Clicks from your microphone's side: about ${per30Text(faster.slopePpm * 0.18)} per 30 minutes (its clock runs faster than VB-CABLE's).`), v.lines.join(" | "));
   // 80 ppm faster: the slope alone fails it.
   const fast = micClock(readings((t) => Math.min(80, 10 + 0.08 * t), 102), { durationSec: 3600 });
   v = longVerdict(clean({ micPath: fast, micZeroFraction: 0.05 }));
@@ -1443,7 +1448,7 @@ test("longVerdict: with a noise gate the microphone's road is too short to measu
   // A lower bound says so.
   const bound = micClock(readings((t) => Math.min(100, 10 + 0.2 * t), 103), { durationSec: 3600 });
   v = longVerdict(clean({ micPath: bound, micZeroFraction: 0.05 }));
-  assert.ok(v.lines.some((l) => l.includes(`its clock runs at least ${Math.round(bound.slopePpm)} ppm faster`)), v.lines.join(" | "));
+  assert.ok(v.lines.some((l) => l.startsWith(`Clicks from your microphone's side: at least ${per30Text(bound.slopePpm * 0.18)} per 30 minutes (its clock runs faster`)), v.lines.join(" | "));
 });
 
 test("longVerdict, mic mode: 6 short drop-outs per 30 minutes pass, 7 fail", () => {
@@ -1467,7 +1472,7 @@ test("restartVerdict", () => {
   assert.deepEqual(restartVerdict({ outageMs: 2980, serviceBackAfterMs: 2710, appMs: 270, waitMs: 250 }).text, "pass (Windows itself took about 2.7 s)", "a results entry");
   const slow = restartVerdict({ outageMs: 3000, lostAtMs: 100, serviceBackAtMs: 1900, appMs: 900, waitMs: 300 });
   assert.equal(slow.verdict, "fail");
-  assert.equal(slow.text, "fail (back after 3.0 s; the app's own part took 1200 ms: 300 ms of waiting, then 900 ms to rebuild)");
+  assert.equal(slow.text, "fail (back after 3.0 s; the app's own part took 1200 ms: it waited 300 ms before trying again, then took 900 ms to bring the voice back)");
   const unknown = restartVerdict({ outageMs: 2500, lostAtMs: 0, serviceBackAtMs: null, appMs: null, waitMs: null });
   assert.equal(unknown.verdict, "fail");
   assert.equal(unknown.text, "fail (back after 2.5 s; the app could not tell when Windows Audio was running again)");
@@ -1833,7 +1838,7 @@ test("gateSummary: a rendering pause alone fails the gaps row; a slow microphone
   long[0].renderPauses = [{ atSec: 1200, phase: "hidden", ms: 500 }];
   const row = gateSummary({ checks: { long } })[5];
   assert.equal(row.status, "fail");
-  assert.ok(row.text.includes("1 rendering pause"), row.text);
+  assert.ok(row.text.includes("the app's sound paused once"), row.text);
   const mic = gateSummary({ voice: { mic: { settings: { allOff: true }, unlockMs: null, openedInMs: 2400 } } })[1];
   assert.equal(mic.status, "note");
   assert.ok(mic.text.includes("2.4 s to open"));
@@ -1851,7 +1856,7 @@ test("gateSummary: the check with your voice fails the gaps row on its outages, 
   assert.equal(row.status, "fail");
   assert.equal(
     row.text,
-    "No gaps in 31 min minimized and 29 min hidden. In the check with your voice: 1 outage, 1 rendering pause, 1 recovery. Meet call still open at the end: your note (Session B step 7.5).",
+    "No gaps in 31 min minimized and 29 min hidden. In the check with your voice: the app had to bring the sound back once, the app's sound paused once. Meet call still open at the end: your note (Session B step 7.5).",
   );
   for (const extra of [{ outages: [{ atSec: 3, phase: "visible", ms: 300 }] }, { renderPauses: [{ atSec: 3, ms: 300 }] }, { recoveries: 2 }]) {
     long[1] = voice(extra);
@@ -1869,7 +1874,7 @@ test("gateSummary: a voice much quieter in CABLE Output in a delay run is a sett
   assert.equal(row.status, "note");
   assert.equal(
     row.text,
-    "No gaps in 31 min minimized and 29 min hidden, but a setting needs changing. In “Measure the delay” the voice arrived 8.0 dB quieter in CABLE Output: check that CABLE Input and CABLE Output are at 100 % in Windows sound settings, and that Communications is set to “Do nothing”. Meet call still open at the end: your note (Session B step 7.5).",
+    "No gaps in 31 min minimized and 29 min hidden, but a setting needs changing. In “Measure the delay” the voice arrived 8.0 dB quieter in CABLE Output. In Windows sound settings (Windows key + R, type mmsys.cpl, Enter): Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100. Meet call still open at the end: your note (Session B step 7.5).",
   );
   // 3 dB is fine; a run forced onto the audio element is not counted, nor is one that did not measure clearly.
   assert.equal(gateSummary(checks(delayRun(80, "auto", { levelDiffDb: -3 })))[5].status, "pass");
@@ -2004,6 +2009,46 @@ test("gateSummary: a check with your voice forced onto the audio element is a co
   assert.equal(row.status, "pass", row.text);
   voice.routePreference = "auto";
   assert.equal(gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5].status, "fail");
+});
+
+test("gateSummary: the user's own route switches under Advanced are no note; the app's own route changes are", () => {
+  const voice = (routeChanges, extra = {}) => ({ voice: { output: { method: "context", routePreference: "auto", routeChanges, ...extra } } });
+  // Session B step 7.6: to the audio element and back, both the user's choice ("route").
+  const yours = [
+    { at: "t1", from: "context", to: "element", cause: "route" },
+    { at: "t2", from: "element", to: "context", cause: "route" },
+  ];
+  let row = gateSummary(voice(yours))[2];
+  assert.equal(row.status, "pass", row.text);
+  assert.equal(row.text, "Sent through the app's audio engine. You switched the route twice under Advanced (your comparison run).");
+  // The app moved the voice onto the audio element by itself (a recovery): to discuss.
+  row = gateSummary(voice([{ at: "t1", from: "context", to: "element", cause: "render-error" }], { method: "element" }))[2];
+  assert.equal(row.status, "note");
+  assert.equal(
+    row.text,
+    "Sent through a slower backup route. It works, but this route may add delay or clicks. The app changed the route by itself once during the session: to discuss.",
+  );
+  // Left on the forced route: the row says so.
+  row = gateSummary(voice([yours[0]], { method: "element", routePreference: "element" }))[2];
+  assert.equal(row.status, "pass");
+  assert.ok(row.text.includes("It is the one you chose under Advanced: set it back to Automatic."), row.text);
+});
+
+test("gateSummary: a check that did not run on the route chosen counts for no row", () => {
+  // Automatic chosen during an outage on the audio element route: until the voice is back on the app's engine,
+  // a check is neither the normal route nor a comparison.
+  const notChosen = { routePreference: "auto", routeAsChosen: false };
+  let rows = gateSummary({ checks: { delay: [{ ...delayRun(150), ...notChosen }, delayRun(80)] } });
+  assert.equal(rows[4].status, "pass", rows[4].text);
+  assert.equal(rows[4].text, "One measurement: about 80 ms (± 10).");
+  const long = structuredClone(COMPLETE.checks.long);
+  Object.assign(long[0], notChosen, { tone: { counts: { gaps: 2, dropouts: 0 } } });
+  rows = gateSummary({ checks: { long } });
+  assert.equal(rows[5].status, "todo", rows[5].text);
+  assert.equal(rows[6].status, "todo", rows[6].text);
+  // Forced onto the audio element but run on the engine: not a comparison either.
+  rows = gateSummary({ checks: { delay: [{ ...delayRun(140, "element"), routeAsChosen: false }] } });
+  assert.ok(!rows[4].text.includes("not counted"), rows[4].text);
 });
 
 test("gateSummary: a step number in the checklist is Session B's, and names the place on the page", () => {

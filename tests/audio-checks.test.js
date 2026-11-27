@@ -495,6 +495,54 @@ test("the minimized phase: the window's state is asked for every 5th summary", a
   assert.ok(s.logs.includes("info check long phase minimized"), s.logs.join("\n"));
 });
 
+test("the page's own visibility, the focus after a Hide and the main thread's lateness are kept per phase", async (t) => {
+  // A page that WebView2 marks hidden while the window is minimized, and again while the app hides it.
+  const doc = new EventTarget();
+  doc.visibilityState = "visible";
+  const had = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "document", { value: doc, configurable: true, writable: true });
+  t.after(() => {
+    if (had) Object.defineProperty(globalThis, "document", had);
+    else delete globalThis.document;
+  });
+  const setVisibility = (v) => {
+    doc.visibilityState = v;
+    doc.dispatchEvent(new Event("visibilitychange"));
+  };
+  const s = setup();
+  s.platform.hideMs = 10_000;
+  const { handle, node, start } = await startTone(s, 1);
+  // Minimized from 10 to 20 s (the page hidden from 12 to 20 s), then Hide for 10 s at 30 s: the page hidden from
+  // 31 to 40 s. After the Hide the window answers that it does not have the focus.
+  s.platform.windowState = async () => {
+    const at = clock.now - start;
+    return { visible: !(at >= 30_000 && at < 40_000), minimized: at >= 10_000 && at < 20_000, focused: false };
+  };
+  for (let k = 1; k <= 50; k++) {
+    // The 15th summary, while minimized, reaches the main thread 900 ms late.
+    summary(node, { frame: k * 48000, at: start + k * 1000, arrive: start + k * 1000 + (k === 15 ? 900 : 0) });
+    await flush(1);
+    if (k === 12) setVisibility("hidden");
+    if (k === 20) setVisibility("visible");
+    if (k === 30) await s.checks.hideFor(30);
+    if (k === 31) setVisibility("hidden");
+    if (k === 40) setVisibility("visible");
+  }
+  const p = handle.stop();
+  await flush();
+  node.port.emit({ type: "done", frame: 50 * 48000 });
+  const r = await p;
+  assert.deepEqual(r.pageVisibility, { hiddenSec: { visible: 0, minimized: 8, hidden: 9 }, changes: 4 }, JSON.stringify(r.pageVisibility));
+  assert.deepEqual(r.focusAfterHide, [false]);
+  assert.equal(r.mainThreadLateByPhase.minimized.count, 1);
+  assert.equal(r.mainThreadLateByPhase.minimized.maxMs, 900);
+  assert.equal(r.mainThreadLateByPhase.hidden.count, 0);
+  assert.deepEqual(
+    s.logs.filter((l) => l.startsWith("info check long visibility")),
+    ["info check long visibility visible", "info check long visibility hidden", "info check long visibility visible", "info check long visibility hidden", "info check long visibility visible"],
+  );
+});
+
 test("the microphone's buffer: a 1 s reading at summary 2 and every 120 after, through a once-tap at the graph", async () => {
   const s = setup();
   const { handle, node, start } = await startTone(s, 10);
@@ -802,6 +850,9 @@ async function answerStop(node, start, sec, extra = {}) {
   node.port.emit({ type: "done", frame });
 }
 
+/** An early end's reason as the result gives it: what happened, then what to do next. */
+const early = (text, mode = "tone") => `${text} ${CHECK_TEXTS.runAgain(mode)}`;
+
 test("ending early for a reason nobody chose fails the check, with that reason first", async () => {
   // Four clean seconds of a 10-minute check, then the end comes from outside. Each must not pass.
   const cases = [
@@ -819,8 +870,9 @@ test("ending early for a reason nobody chose fails the check, with that reason f
     await answerStop(t.node, t.start, 4.4);
     const r = await t.handle.done;
     assert.equal(r.verdict, "fail", why);
-    assert.deepEqual(r.reasons, [text], why);
-    assert.deepEqual(r.endedEarly, { why, note: text }, why);
+    assert.deepEqual(r.reasons, [early(text)], why);
+    assert.deepEqual(r.endedEarly, { why, note: early(text) }, why);
+    assert.ok(r.reasons[0].endsWith("Start the long check again (Session B step 7)."), why);
     assert.equal(r.recordedSec, 4.4, why);
     assert.equal(r.minutesAsked, 10, why);
     assert.ok(!r.notes.includes(text), `${why}: the reason is not repeated in the notes`);
@@ -839,7 +891,7 @@ test("ending early: the reason goes before what the check found; a check that fo
   await answerStop(t.node, t.start, 4.4, { counts: { gaps: 1 } });
   let r = await t.handle.done;
   assert.equal(r.verdict, "fail");
-  assert.equal(r.reasons[0], CHECK_TEXTS.toneLost);
+  assert.equal(r.reasons[0], early(CHECK_TEXTS.toneLost));
   assert.ok(r.reasons.slice(1).some((x) => /stopped once/.test(x)), JSON.stringify(r.reasons));
 
   // CABLE Output ended before the tone was ever found: it measured nothing, and the reason says why.
@@ -850,9 +902,22 @@ test("ending early: the reason goes before what the check found; a check that fo
   await answerStop(t.node, t.start, 2.3, { locked: false });
   r = await t.handle.done;
   assert.equal(r.verdict, "no-signal");
-  assert.equal(r.reasons[0], CHECK_TEXTS.cableLost);
-  assert.deepEqual(r.endedEarly, { why: "cable-ended", note: CHECK_TEXTS.cableLost });
+  assert.equal(r.reasons[0], early(CHECK_TEXTS.cableLost));
+  assert.deepEqual(r.endedEarly, { why: "cable-ended", note: early(CHECK_TEXTS.cableLost) });
   assert.ok(r.reasons.slice(1).some((x) => /never reached/.test(x)), JSON.stringify(r.reasons));
+});
+
+test("ending early: the check with your voice says to start it again (Session B step 8)", async () => {
+  const s = setup();
+  const handle = await s.checks.startLong({ mode: "mic", minutes: 1 });
+  const node = newest("ac-cablewatch");
+  cableTracks[cableTracks.length - 1].dispatchEvent(new Event("ended"));
+  await flush();
+  node.port.emit({ type: "done", frame: 48000 });
+  const r = await handle.done;
+  assert.equal(r.endedEarly?.why, "cable-ended");
+  assert.equal(r.endedEarly.note, `${CHECK_TEXTS.cableLost} Start the check with your voice again (Session B step 8).`);
+  assert.equal(r.reasons[0], r.endedEarly.note);
 });
 
 test("a check you stop yourself, or the page stops, is judged on what it recorded", async () => {
@@ -892,8 +957,8 @@ test("ending early: no summaries after the planned end (the voice never came bac
   const r = await Promise.race([t.handle.done, new Promise((res) => setTimeout(() => res(null), 6000).unref())]);
   assert.ok(r, "ended by the backstop");
   assert.equal(r.verdict, "fail");
-  assert.equal(r.reasons[0], CHECK_TEXTS.notBack, JSON.stringify(r.reasons));
-  assert.deepEqual(r.endedEarly, { why: "not-back", note: CHECK_TEXTS.notBack });
+  assert.equal(r.reasons[0], early(CHECK_TEXTS.notBack), JSON.stringify(r.reasons));
+  assert.deepEqual(r.endedEarly, { why: "not-back", note: early(CHECK_TEXTS.notBack) });
   assert.ok(r.reasons.some((x) => /stopped once/.test(x)), JSON.stringify(r.reasons));
   assert.equal(r.outages.length, 1);
   assert.equal(r.outages[0].notOver, true);
@@ -1039,6 +1104,59 @@ test("a check that starts on the context route and is rebuilt on the audio eleme
   const p2 = t2.handle.stop();
   await answerStop(n2, t2.start + 6_000, 2);
   assert.deepEqual((await p2).notes, []);
+});
+
+test("a check records whether it ran on the route the user chose: the route at its end, and a choice not in effect yet", async () => {
+  // On the normal route from start to end.
+  let s = setup();
+  let t = await startTone(s, 1);
+  seconds(t.node, t.start, 1, 3);
+  let p = t.handle.stop();
+  await answerStop(t.node, t.start, 3.5);
+  let r = await p;
+  assert.equal(r.routeAtEnd, "context");
+  assert.equal(r.routeAsChosen, true);
+  // Forced onto the audio element, but rebuilt on the context route meanwhile (the element could not be used).
+  s = setup({ method: "element", routePreference: "element" });
+  env.sinkFails = true; // its own context is refused CABLE Input: it records in the graph's context
+  t = await startTone(s, 1);
+  seconds(t.node, t.start, 1, 3);
+  await s.graph.rebuild({ backAtMs: t.start + 4_000, method: "context" });
+  const node2 = newest("ac-cablewatch");
+  p = t.handle.stop();
+  await answerStop(node2, t.start + 4_000, 2);
+  r = await p;
+  assert.equal(r.route, "element");
+  assert.equal(r.routeAtEnd, "context");
+  assert.equal(r.routeAsChosen, false, "neither a comparison through the audio element nor a check on the normal route");
+  env.sinkFails = false;
+  // A route chosen during an outage, not applied yet when the check starts (graph.output.routePreferenceInEffect).
+  s = setup({ method: "element", routePreference: "auto" });
+  s.graph.output.routePreferenceInEffect = false;
+  t = await startTone(s, 1);
+  seconds(t.node, t.start, 1, 3);
+  p = t.handle.stop();
+  await answerStop(t.node, t.start, 3.5);
+  r = await p;
+  assert.equal(r.routePreference, "auto");
+  assert.equal(r.routeAsChosen, false);
+});
+
+test("measureDelay records whether the route was the one chosen", async () => {
+  const s = setup({ method: "element", routePreference: "auto" });
+  s.graph.output.routePreferenceInEffect = false; // Automatic chosen during an outage on the element route
+  const before = nodes.length;
+  const p = s.checks.measureDelay();
+  const node = await nextNode("ac-recorder", before);
+  await answerDelay(node, delaySignals());
+  const r = await p;
+  assert.equal(r.routePreference, "auto");
+  assert.equal(r.routeAsChosen, false);
+  const s2 = setup();
+  const before2 = nodes.length;
+  const p2 = s2.checks.measureDelay();
+  await answerDelay(await nextNode("ac-recorder", before2), delaySignals());
+  assert.equal((await p2).routeAsChosen, true);
 });
 
 test("mic mode: the speech analysis of the envelopes, a CABLE Output drop-out where it was, Analysing first", async () => {

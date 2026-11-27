@@ -14,13 +14,13 @@
  */
 import { platform } from "./platform/index.js";
 import { configureSanas, connectSanas, disconnectSanas } from "./engines/sanas.js";
-import { validateSettings } from "./core/settings.js";
+import { DEFAULTS as SETTINGS_DEFAULTS, validateSettings } from "./core/settings.js";
 import { redact, redactObject } from "./core/redact.js";
 import { gateSummary } from "./core/cable-check.js";
 import { VoiceGraph } from "./audio/graph.js";
 import { Monitor } from "./audio/monitor.js";
 import { Checks } from "./audio/measure.js";
-import { CHOICE_TEXTS, VoiceView, changeOutcome, fillList } from "./ui/voice.js";
+import { CHOICE_TEXTS, VoiceView, changeOutcome, clockText, fillList } from "./ui/voice.js";
 import { ChecksView, delayKind } from "./ui/checks.js";
 
 const $ = (id) => document.getElementById(id);
@@ -61,18 +61,53 @@ let longHandle = null;
 let lastRenderMs = 0;
 /** Counts the status lines shown: an outcome that comes late never replaces a newer line. */
 let statusCount = 0;
+/** Ends the listeners of a status line that waits to be replaced (whenRunningAgain, clearWhenHeadsetBack). */
+let statusWatch = null;
 
 function recordError(message) {
   results.errors.push({ at: new Date().toISOString(), message });
 }
 
-function setStatus(message, kind = "info") {
+/**
+ * The status line. An "error" line goes into results.errors too, unless
+ * `record` is false: a check's own verdict ("Delay measured.", "Long check
+ * done.") takes the error colour when it did not pass, but it is no error of
+ * the app (the verdicts are in checks.delay and checks.long).
+ */
+function setStatus(message, kind = "info", { record = true } = {}) {
   statusCount += 1;
+  // A newer line ends any wait to replace the one before it.
+  statusWatch?.abort();
+  statusWatch = null;
   const el = $("status");
   el.textContent = message;
   el.dataset.kind = kind;
-  if (kind === "error") recordError(message);
+  if (kind === "error" && record) recordError(message);
   renderResults();
+}
+
+/**
+ * `fn` once the voice runs again, unless a newer status line came first
+ * (statusCount moved on from `mine`). For a status that said the voice is not
+ * reaching the meeting yet: once it does, the line says so.
+ */
+function whenRunningAgain(mine, fn) {
+  if (!graph) return;
+  const controller = new AbortController();
+  statusWatch = controller;
+  graph.addEventListener(
+    "state",
+    () => {
+      if (statusCount !== mine) {
+        controller.abort();
+        return;
+      }
+      if (graph.state !== "running") return;
+      controller.abort();
+      fn();
+    },
+    { signal: controller.signal },
+  );
 }
 
 /** Part of the results' text is selected: someone is copying it by hand (or the copy fallback selected it). */
@@ -184,6 +219,20 @@ async function showApp() {
 
 // ---------- settings ----------
 
+/**
+ * What validateSettings says about the defaults themselves: readiness
+ * messages for later steps (today the voice type, which this build has no
+ * way to set). They say nothing about the saved settings, so the results
+ * leave them out.
+ */
+const NOT_FOR_THIS_BUILD = new Set(validateSettings(SETTINGS_DEFAULTS).errors);
+
+/** The settings file came from a newer build: this one leaves it as it is (choices last until the app closes). */
+let settingsFromNewerBuild = false;
+const NEWER_SETTINGS =
+  "These settings come from a newer version of the app: the defaults are used, and the file is left as it is.";
+const NEWER_NOT_SAVED = "they come from a newer version of the app, which this one leaves as they are";
+
 /** Read the saved settings (never fails: unreadable settings mean the defaults, and the results say so). */
 async function loadSettings() {
   let loaded;
@@ -194,19 +243,25 @@ async function loadSettings() {
   }
   const raw = loaded?.raw ?? null;
   const error = loaded?.error ?? null;
-  const checked = validateSettings(raw);
+  const plain = raw !== null && typeof raw === "object" && !Array.isArray(raw);
+  const newer = !error && plain && typeof raw.version === "number" && raw.version > SETTINGS_DEFAULTS.version;
+  const checked = validateSettings(newer ? null : raw);
   settings = checked.settings;
-  const source = error ? "unreadable" : raw === null ? "none" : typeof raw === "object" && !Array.isArray(raw) ? "saved" : "unreadable";
-  results.settings = { source, errors: error ? [error, ...checked.errors] : checked.errors };
+  settingsFromNewerBuild = newer;
+  const source = error ? "unreadable" : raw === null ? "none" : newer ? "newer" : plain ? "saved" : "unreadable";
+  const errors = checked.errors.filter((e) => !NOT_FOR_THIS_BUILD.has(e));
+  results.settings = { source, errors: error ? [error, ...errors] : newer ? [NEWER_SETTINGS, ...errors] : errors };
   platform.log("info", `settings ${source}`);
 }
 
 /**
  * Change and save the settings. A failure to save does not stop the change:
- * it applies until the app closes. → null, or why the settings could not be saved
+ * it applies until the app closes. Settings from a newer build are never
+ * written over. → null, or why the settings could not be saved
  */
 async function saveSettings(changes) {
   settings = validateSettings({ ...settings, ...changes }).settings;
+  if (settingsFromNewerBuild) return NEWER_NOT_SAVED;
   try {
     await platform.saveSettings(settings);
     return null;
@@ -224,8 +279,16 @@ async function saveSettings(changes) {
  * choice could be saved (the app keeps going either way).
  */
 function changeStatus(taken, done, failed, notSaved = null) {
-  const { text, kind } = changeOutcome({ taken, running: graph?.state === "running", done, failed, notSaved });
+  const running = graph?.state === "running";
+  const { text, kind } = changeOutcome({ taken, running, done, failed, notSaved });
   setStatus(text, kind);
+  if (taken && !running) {
+    // "…is not reaching the meeting yet": once the voice is back, the line says what really happened.
+    whenRunningAgain(statusCount, () => {
+      const now = changeOutcome({ taken, running: true, done, failed, notSaved });
+      setStatus(now.text, now.kind);
+    });
+  }
 }
 
 /**
@@ -367,8 +430,29 @@ action("btnBeep", async () => {
     }
     results.checks.beep.push({ at, ok: false, error: err.code });
     setStatus(err.message, "warn");
+    // A refusal while the headset is unplugged ends when the microphone is back: the line does not stay.
+    if (err.code === "STAND_IN_QUIET") clearWhenHeadsetBack(statusCount);
   }
 });
+
+/** After a beep refused while the headset was unplugged: clear the line once no microphone stands in any more. */
+function clearWhenHeadsetBack(mine) {
+  if (!graph) return;
+  const controller = new AbortController();
+  statusWatch = controller;
+  const check = () => {
+    if (statusCount !== mine) {
+      controller.abort();
+      return;
+    }
+    if (graph.mic && !graph.mic.standIn) {
+      controller.abort();
+      setStatus("Your headset is back: sounds play in your headphones again.", "ok");
+    }
+  };
+  graph.addEventListener("mic", check, { signal: controller.signal });
+  graph.addEventListener("warnings", check, { signal: controller.signal });
+}
 
 // ---------- 3 · checks for the meeting ----------
 
@@ -404,7 +488,7 @@ action(
     }
     results.checks.delay.push(r);
     checksView.delayDone(r);
-    setStatus("Delay measured.", delayKind(r.verdict));
+    setStatus("Delay measured.", delayKind(r.verdict), { record: false });
   },
   { usable: canStartCheck },
 );
@@ -430,7 +514,7 @@ action(
       try {
         if (longHandle === handle) longHandle = null;
         results.checks.long.push(result);
-        setStatus("Long check done.", checksView.longDone(result));
+        setStatus("Long check done.", checksView.longDone(result), { record: false });
       } catch (err) {
         recordError(`The long check's result could not be shown: ${err?.name ?? "Error"}`);
       } finally {
@@ -460,7 +544,9 @@ action("btnHide", async () => {
   const r = await checks.hideFor(30);
   results.checks.hide.push(r);
   checksView.hideDone(r);
-  setStatus("The app was hidden for 30 minutes.", "ok");
+  // What happened, with its times: a line that stays true after the window is back.
+  const hm = (iso) => clockText(Date.parse(iso), { seconds: false });
+  setStatus(`The app hid itself at ${hm(r.at)}; it comes back by ${hm(r.showAt)}.`, "ok");
 });
 
 // ---------- 4 · key ----------

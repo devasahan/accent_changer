@@ -27,7 +27,7 @@
  * Nothing touches the page when this module is imported.
  */
 import { OutputRecovery, classifyError } from "../core/recovery.js";
-import { WARNINGS, chooseMic, chooseOutput, deviceWarnings, siblingOutput } from "../core/device-choice.js";
+import { WARNINGS, causeText, chooseMic, chooseOutput, deviceWarnings, routeWords, siblingOutput } from "../core/device-choice.js";
 import { micHoleCount } from "../core/cable-check.js";
 import { redact } from "../core/redact.js";
 import { noMicError, onDeviceChange, openMic, readDevices, readOutputRate, micErrorText, stopStream } from "./devices.js";
@@ -82,35 +82,21 @@ const TEXTS = Object.freeze({
   waitingForCable: " waiting for “CABLE Input” to come back",
 });
 
-const CAUSE_TEXTS = Object.freeze({
-  "render-error": "the audio device reported an error",
-  "render-stalled": "the audio stopped moving",
-  "context-suspended": "the audio was paused",
-  "context-closed": "the audio engine closed",
-  "sink-changed": "the playback device changed",
-  "mic-ended": "the microphone stopped",
-  "change-failed": "the change you made did not work",
-});
-
-const recoveringText = (cause) =>
-  `Your voice stopped reaching the meeting (${CAUSE_TEXTS[cause] ?? "a problem with the sound"}). Bringing it back…`;
+const recoveringText = (cause) => `Your voice stopped reaching the meeting (${causeText(cause)}). Bringing it back…`;
 
 const sinkRefusedText = (name) =>
   `The app could not send your voice into “CABLE Input” (${name}). This is one of the Session B checks: copy the results and send them to me.`;
 
 /** Warnings the graph adds to the device warnings (no device names in them). */
 const GRAPH_TEXTS = Object.freeze({
-  MIC_MUTED: "Windows muted the app's microphone stream.",
+  MIC_MUTED: "Windows paused your microphone for this app. Check your headset's mute switch, then press “Check the microphone”.",
   CHANGE_FAILED: (text) =>
     `Could not switch to that microphone: ${String(text).trim().replace(/\.$/, "")}. The app keeps using the one it had.`,
   PROCESSOR_DIRECT:
-    "The app's audio worklets did not load, so your voice goes straight through and the level meters stay still. Copy the results and send them to me.",
+    "Part of the app's sound engine did not load, so your voice goes straight through and the level meters stay still. Copy the results and send them to me.",
   PROCESSOR_FAILED:
     "The voice processor did not start, so the app sends your own voice unchanged. Copy the results and send them to me.",
 });
-
-/** How ROUTE_CHANGED names a route method. */
-const methodWords = (base) => (base === "element" ? "an audio element (fallback)" : "the app's audio engine");
 
 const STALE = Object.freeze({ stale: true });
 
@@ -291,13 +277,21 @@ export class VoiceGraph extends EventTarget {
     this._mutedCount = 0;
     this._unlockMs = null;
     this._firstOpenedInMs = null; // how long the first start's microphone took to open (kept through reopens)
+    this._cableSeen = false; // CABLE Input was listed at some point since start()
 
     this._snapshot = null;
     this._output = null;
     this._lastMethod = null;
+    this._firstMethod = null; // the route method of the session's first route
     this._routeChanges = [];
-    this._routeChanged = null; // { from, to } of the latest route change
+    this._routeChanged = null; // { from, to }: the app moved the voice onto the audio element route by itself
     this._routePreference = "auto";
+    // The route preference (Advanced) takes effect only through a full-mode route: a recovery keeps the method that
+    // worked. Each choice gets a number; the route in use was made under routePrefApplied's; one that did not take
+    // effect during an outage is asked for once more when the voice is back (routePrefAsked).
+    this._routePrefSeq = 0;
+    this._routePrefApplied = 0;
+    this._routePrefAsked = 0;
     this._rates = { defaultOutputHz: null, cableInputHz: null };
     this._ratesBusy = false;
     this._ratesAgain = null;
@@ -356,6 +350,7 @@ export class VoiceGraph extends EventTarget {
     this._micHolesTotal = 0;
     this._unlockMs = null;
     this._firstOpenedInMs = null;
+    this._cableSeen = false;
     this._blockedError = null;
     this._stillTrying = null;
     this._unsubscribeDevices = onDeviceChange((snap) => this._onDevices(snap), { where: this._where });
@@ -480,6 +475,7 @@ export class VoiceGraph extends EventTarget {
     const next = preference === "element" ? "element" : "auto";
     if (next === this._routePreference) return Promise.resolve({ ok: true, state: this.state });
     this._routePreference = next;
+    this._routePrefSeq++;
     if (this._output) this._output = { ...this._output, routePreference: next };
     return this._request({ type: "rebuild-request", reason: "route" });
   }
@@ -672,14 +668,18 @@ export class VoiceGraph extends EventTarget {
   }
 
   /**
-   * { entry, how, method, tried, routePreference, routeChanges, contextSink,
-   *   sinkRateHz, contextRateHz, baseLatencyMs, outputLatencyMs, processor } | null
+   * { entry, how, method, tried, routePreference, routePreferenceInEffect,
+   *   routeChanges, contextSink, sinkRateHz, contextRateHz, baseLatencyMs,
+   *   outputLatencyMs, processor } | null. routePreferenceInEffect: the route
+   * in use was made under the preference chosen last (false for the moment a
+   * choice made during an outage waits for the voice to be back).
    */
   get output() {
     const o = this._output;
     if (!o) return null;
     return {
       ...o,
+      routePreferenceInEffect: this._routePrefApplied === this._routePrefSeq,
       tried: o.tried.map((t) => ({ ...t })),
       routeChanges: this._routeChanges.map((c) => ({ ...c })),
     };
@@ -732,7 +732,7 @@ export class VoiceGraph extends EventTarget {
     if (this._changeFailedText) list.push({ code: "CHANGE_FAILED", text: this._changeFailedText });
     if (this._routeChanged) {
       const { from, to } = this._routeChanged;
-      list.push({ code: "ROUTE_CHANGED", text: WARNINGS.ROUTE_CHANGED(methodWords(from), methodWords(to)) });
+      list.push({ code: "ROUTE_CHANGED", text: WARNINGS.ROUTE_CHANGED(routeWords(from), routeWords(to)) });
     }
     if (this._gen && !this._gen.disposed && this._gen.processorKind === "direct") {
       list.push({ code: "PROCESSOR_DIRECT", text: GRAPH_TEXTS.PROCESSOR_DIRECT });
@@ -1146,6 +1146,9 @@ export class VoiceGraph extends EventTarget {
     const { ctx } = gen;
     const deviceId = outChoice.entry.deviceId;
     const sibling = siblingOutput(snap.outputs, this._mic?.entry ?? null);
+    // A full-mode route follows the preference chosen last; a recovery keeps the method that worked, so a choice
+    // made during an outage is applied once the voice is back (_checkMoves).
+    gen.routePrefSeq = mode === "full" ? this._routePrefSeq : this._routePrefApplied;
     let route;
     try {
       route = await this._selfOp(async () => {
@@ -1228,16 +1231,26 @@ export class VoiceGraph extends EventTarget {
     return null;
   }
 
-  /** Step 8: the generation is routed; the route method is recorded (a change of method is a warning). */
+  /**
+   * Step 8: the generation is routed; the route method is recorded. Every
+   * change of method is listed (routeChanges, with its cause). One the app
+   * made by itself onto the audio element route is a warning (ROUTE_CHANGED)
+   * until the voice is back on the app's audio engine or on the session's
+   * first route; the user's own choice under Advanced ("route", Session B
+   * step 7.6) never is.
+   */
   _commitRoute(gen, route, { outChoice, initial, cause, micChanged }) {
     gen.awaitingGesture = false;
     gen.routed = true;
     const base = methodBase(route.method);
+    if (Number.isInteger(gen.routePrefSeq)) this._routePrefApplied = gen.routePrefSeq;
+    if (this._firstMethod === null) this._firstMethod = base;
     if (this._lastMethod && this._lastMethod !== base) {
       this._routeChanges.push({ at: new Date().toISOString(), from: this._lastMethod, to: base, cause });
-      this._routeChanged = { from: this._lastMethod, to: base };
+      if (cause !== "route" && base === "element") this._routeChanged = { from: this._lastMethod, to: base };
       this._log("warn", `route change ${this._lastMethod} to ${base} (${cause})`);
     }
+    if (base === "context" || base === this._firstMethod) this._routeChanged = null;
     this._lastMethod = base;
     this._setOutput(outChoice, { method: route.method, tried: route.tried, gen, route });
     this._log(base === "context" && route.method === "context" ? "info" : "warn", `route ${route.method} (${triedSummary(route.tried)})`);
@@ -1899,6 +1912,8 @@ export class VoiceGraph extends EventTarget {
   /** A newer device snapshot: published (event "devices"), warnings updated, presence fed. → false when older. */
   _takeSnapshot(snap) {
     if (this._snapshot && typeof snap.atMs === "number" && snap.atMs < this._snapshot.atMs) return false;
+    // CABLE Input was there once since the start: when it goes, it is gone for now, not uninstalled.
+    if (snap?.cableIn) this._cableSeen = true;
     this._snapshot = snap;
     this._emit("devices", { snapshot: snap });
     this._recomputeWarnings();
@@ -1950,6 +1965,13 @@ export class VoiceGraph extends EventTarget {
     if (now && now.routed && now.route) {
       const out = chooseOutput(snap.outputs, { saved: saved.output });
       if (out.entry && out.entry.deviceId !== now.route.deviceId) this._feed({ type: "rebuild-request", reason: "output-moved" });
+    }
+    // A route preference chosen during an outage: the recovery kept the method that worked. Apply it now, once (a
+    // choice that cannot be used leaves the voice on the route that works, and routePreferenceInEffect false).
+    if (this._routePrefApplied !== this._routePrefSeq && this._routePrefAsked !== this._routePrefSeq) {
+      this._routePrefAsked = this._routePrefSeq;
+      this._log("info", "route preference applied after the outage");
+      this._feed({ type: "rebuild-request", reason: "route" });
     }
   }
 
@@ -2049,6 +2071,8 @@ export class VoiceGraph extends EventTarget {
       commsOutputLabel: snap?.commsOutputLabel ?? "",
       defaultOutputRateHz: this._rates.defaultOutputHz,
       cableRateHz: this._rates.cableInputHz,
+      cableSeen: this._cableSeen,
+      micRateHz: this._mic?.settings?.sampleRateHz ?? null,
     };
   }
 

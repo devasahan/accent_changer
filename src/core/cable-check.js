@@ -16,6 +16,7 @@
  * Pure: no DOM, no Web Audio, no clock. Times come in as numbers (frames at
  * 48 kHz, or ms on the page's performance.now() timeline).
  */
+import { routeWords } from "./device-choice.js";
 import {
   estimateDelayFromEnvelopes,
   findGaps,
@@ -94,9 +95,18 @@ const OTHER_SOUND = "Other sound was mixed into the test tone";
 /** CABLE Output envelope frames at or below this carried nothing: digital silence (−120) or next to it. */
 const SILENT_DB = -100;
 
+/** Windows sound settings, as README Session B step 2 opens them (the same on Windows 10 and 11). */
+const SOUND_SETTINGS = "Windows sound settings (Windows key + R, type mmsys.cpl, Enter)";
+
 /** What to do when the voice arrives much quieter in CABLE Output than it left the microphone. */
-const QUIET_ADVICE =
-  "check that CABLE Input and CABLE Output are at 100 % in Windows sound settings, and that Communications is set to “Do nothing”.";
+const QUIET_ADVICE = `In ${SOUND_SETTINGS}: Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100.`;
+
+/** The long check's settings advice: where exactly, and what about the meeting app's own volume control. */
+const COMMS_FIX = `In ${SOUND_SETTINGS}: Communications tab → “Do nothing” → OK.`;
+const SETTINGS_FIX = `In ${SOUND_SETTINGS}: Communications tab → “Do nothing”; Playback → CABLE Input and Recording → CABLE Output → Properties → Levels → 100. In the meeting app, turn off its automatic microphone volume.`;
+
+/** Which re-run the settings advice means (Session B step 7.5 says what to do with it). */
+const AFTER_FIX = "Then tell me before you run the hour-long check again (Session B step 7.5).";
 
 /** The window phase in words. */
 const PHASE_WORDS = { visible: "open", minimized: "minimized", hidden: "hidden" };
@@ -138,7 +148,7 @@ export function delayVerdict(r, { captureLatencyMs = null, micFifoMs = null } = 
     return result("unclear", "Could not measure clearly. Speak a bit louder, closer to the microphone, and try again.");
   }
   if (isNum(r.levelDiffDb) && r.levelDiffDb < LIMITS.CABLE_QUIET_DB) {
-    notes.push(`The voice arrives ${(-r.levelDiffDb).toFixed(1)} dB quieter in CABLE Output: ${QUIET_ADVICE}`);
+    notes.push(`The voice arrives ${(-r.levelDiffDb).toFixed(1)} dB quieter in CABLE Output. ${QUIET_ADVICE}`);
   }
   if (isNum(micFifoMs) && micFifoMs >= LIMITS.MIC_FIFO_NOTE_MS) {
     notes.push(
@@ -755,9 +765,10 @@ const FIRST_EVENT_WITHIN = 13;
  * their number). Otherwise (a burst of holes in one second, a cluster that
  * stopped) ticksPer30Min = ticks × 1800 / durationSec and ppm and direction
  * are null: they say nothing about the clocks. With fewer than 3 events of
- * one kind, ticksPer30Min is that same count rate and ppm = ticks × 10 ms /
- * durationSec (a bound when there are none).
- * → { ppm, direction: "faster" | "slower" | null, ticksPer30Min }
+ * one kind ticksPer30Min is that same count rate, and ppm and direction are
+ * null too: one or two clicks can be any glitch, not a measured offset.
+ * steady says whether ppm and direction were measured (from regular events).
+ * → { ppm, direction: "faster" | "slower" | null, ticksPer30Min, steady }
  */
 export function clockFromEvents(events, durationSec) {
   const evs = list(events);
@@ -772,7 +783,7 @@ export function clockFromEvents(events, durationSec) {
   const skipCount = evs.filter((e) => e.kind === "skip").length;
   const holeCount = evs.filter((e) => e.kind === "hole").length;
   const ticks = skipCount + holeCount + evs.filter((e) => e.kind === "click").length;
-  if (!isNum(durationSec) || !(durationSec > 0)) return { ppm: null, direction: null, ticksPer30Min: null };
+  if (!isNum(durationSec) || !(durationSec > 0)) return { ppm: null, direction: null, ticksPer30Min: null, steady: false };
   const countRate = (ticks * 1800) / durationSec;
   const regular = skips.length >= 3 && skips.length >= holes.length ? { at: skips, sign: 1 } : holes.length >= 3 ? { at: holes, sign: -1 } : null;
   if (regular) {
@@ -785,16 +796,15 @@ export function clockFromEvents(events, durationSec) {
       every >= 0.01 / (MAX_DRIFT_PPM * 1e-6) &&
       at[0] <= FIRST_EVENT_WITHIN * every &&
       durationSec - at[0] <= 2 * at.length * every;
-    if (!steady) return { ppm: null, direction: null, ticksPer30Min: countRate };
+    if (!steady) return { ppm: null, direction: null, ticksPer30Min: countRate, steady: false };
     return {
       ppm: (regular.sign * 0.01 * 1e6) / every,
       direction: regular.sign > 0 ? "faster" : "slower",
       ticksPer30Min: 1800 / every,
+      steady: true,
     };
   }
-  const direction = skipCount > holeCount ? "faster" : holeCount > skipCount ? "slower" : null;
-  const ppm = ((ticks * 0.01) / durationSec) * 1e6;
-  return { ppm: direction === "slower" ? -ppm : ppm, direction, ticksPer30Min: countRate };
+  return { ppm: null, direction: null, ticksPer30Min: countRate, steady: false };
 }
 
 /** "15 s" for a short check, "65 min" for a long one. */
@@ -1037,11 +1047,14 @@ export function longVerdict(input) {
       fails.push(`Too many clicks from the meeting's side: about ${per30(ticksPer30Min)} per 30 minutes (6 at most).`);
     }
     const n = ticks ?? events.filter((e) => e.kind === "hole" || e.kind === "skip" || e.kind === "click").length;
-    const offset = isNum(fromEvents.ppm) ? Math.round(Math.abs(fromEvents.ppm)) : 0;
-    const differ = offset > 0 ? `; Windows' default playback device and VB-CABLE differ by about ${offset} ppm` : "";
+    // The offset itself (tonePath.ppm) is for the results only; the page says it in words, and only when the
+    // clicks came at a steady pace (one or two can be any glitch).
+    const differ = fromEvents.steady
+      ? ", at a steady pace: Windows' default playback device and VB-CABLE run at slightly different speeds"
+      : "";
     lines.push(
       n > 0
-        ? `Clicks from the meeting's side of the sound: ${n} (about ${per30(ticksPer30Min ?? 0)} per 30 minutes${differ}).`
+        ? `Clicks from the meeting's side of the sound: ${n} (about ${per30(ticksPer30Min ?? 0)} per 30 minutes)${differ}.`
         : "Clicks from the meeting's side of the sound: none.",
     );
   }
@@ -1051,12 +1064,15 @@ export function longVerdict(input) {
     micPath?.fullAtStart === true
       ? "The microphone's clock could not be measured: its buffer had already filled when the check began."
       : "The microphone's clock could not be measured (the check was too short).";
-  const micClicks = (ticks, how) => {
+  // The offset in ppm stays in the results (micPath); the page says it in words.
+  const micClicks = (ticks, how, atLeast = false) => {
+    const about = atLeast ? "at least" : "about";
     if (ticks > LIMITS.TICKS_PER_30_MIN) {
-      fails.push(`Too many clicks from your microphone's side: about ${per30(ticks)} per 30 minutes (6 at most).`);
+      fails.push(`Too many clicks from your microphone's side: ${about} ${per30(ticks)} per 30 minutes (6 at most).`);
     }
-    lines.push(`Clicks from your microphone's side: about ${per30(ticks)} per 30 minutes (${how}).`);
+    lines.push(`Clicks from your microphone's side: ${about} ${per30(ticks)} per 30 minutes (${how}).`);
   };
+  const FASTER_WORDS = "its clock runs faster than VB-CABLE's";
   if (micPath && noiseGate) {
     // With a noise gate a slower clock's holes hide among the gate's silence: the holes seen still count, but only
     // as a lower bound, and the buffer's slope can only tell a faster clock.
@@ -1064,8 +1080,7 @@ export function longVerdict(input) {
     if (!road) {
       lines.push(tooShort);
     } else if (!road.atLeast) {
-      const { slope } = road;
-      micClicks(road.ticks, `its clock runs ${slope.lowerBound ? "at least " : ""}${Math.round(slope.ppm)} ppm faster than VB-CABLE's`);
+      micClicks(road.ticks, FASTER_WORDS, road.slope.lowerBound);
     } else {
       const why = `${road.slope ? "its clock is not faster than VB-CABLE's" : "the check was too short to measure its clock"}; its noise gate hides the clicks a slower clock makes`;
       const n = per30(road.ticks);
@@ -1081,15 +1096,16 @@ export function longVerdict(input) {
     if (!(isNum(micPath.ppm) || holesCount > 0)) {
       lines.push(tooShort);
     } else {
-      const ppm = isNum(micPath.ppm) ? Math.round(Math.abs(micPath.ppm)) : null;
-      micClicks(
-        micPath.ticksPer30Min ?? 0,
-        micPath.direction === "faster" && ppm !== null
-          ? `its clock runs ${micPath.ppmIsLowerBound === true ? "at least " : ""}${ppm} ppm faster than VB-CABLE's`
-          : micPath.direction === "slower" && ppm !== null
-            ? `its clock runs ${ppm} ppm slower than VB-CABLE's`
-            : "its clock keeps time with VB-CABLE's",
-      );
+      const faster = micPath.direction === "faster" && isNum(micPath.ppm);
+      // Holes tell a slower clock only when they come again and again: one or two can be any glitch.
+      const how = faster
+        ? FASTER_WORDS
+        : micPath.direction === "slower"
+          ? holesCount >= 3
+            ? "its clock runs slower than VB-CABLE's"
+            : `${holesCount === 1 ? "one short hole" : "two short holes"}: too few to tell its clock`
+          : "its clock keeps time with VB-CABLE's";
+      micClicks(micPath.ticksPer30Min ?? 0, how, faster && micPath.ppmIsLowerBound === true);
     }
   } else {
     lines.push("The microphone's clock was not measured on this output route.");
@@ -1165,14 +1181,14 @@ export function longVerdict(input) {
     const minDb = isNum(tone.minStableDb) ? tone.minStableDb : tone.lockDb;
     if (minDb < LIMITS.TONE_LEVEL_MIN_DB) {
       fixes.push(
-        `The meeting hears your voice ${(TONE_DB - minDb).toFixed(1)} dB quieter than it should: in Windows sound settings set Communications to “Do nothing”, set CABLE Input and CABLE Output to 100 %, and in Zoom untick “Automatically adjust microphone volume”. Then run the check again.`,
+        `The meeting hears the sound ${(TONE_DB - minDb).toFixed(1)} dB quieter than it should. ${SETTINGS_FIX} ${AFTER_FIX}`,
       );
     }
     for (const c of levelChanges) {
       if (!isNum(c.fromDb) || !isNum(c.toDb) || c.toDb - c.fromDb > LIMITS.LEVEL_WARN_DB) continue;
       const at = isNum(c.atSec) ? ` at ${formatClock(c.atSec)}` : "";
       fixes.push(
-        `Windows turned the voice down by ${(c.fromDb - c.toDb).toFixed(1)} dB${at}, probably when the meeting started: in Windows sound settings set Communications to “Do nothing”. Then run the check again.`,
+        `Windows turned the sound down by ${(c.fromDb - c.toDb).toFixed(1)} dB${at}, probably when the meeting started. ${COMMS_FIX} ${AFTER_FIX}`,
       );
     }
     lines.push(
@@ -1261,7 +1277,7 @@ export function restartVerdict(record) {
   }
   return {
     verdict: "fail",
-    text: `fail (${back}; the app's own part took ${Math.round(app + wait)} ms: ${Math.round(wait)} ms of waiting, then ${Math.round(app)} ms to rebuild)`,
+    text: `fail (${back}; the app's own part took ${Math.round(app + wait)} ms: it waited ${Math.round(wait)} ms before trying again, then took ${Math.round(app)} ms to bring the voice back)`,
   };
 }
 
@@ -1311,26 +1327,24 @@ function microphoneRow(results) {
   return row(name, "note", `Processing is off. ${note}`);
 }
 
-const ROUTE_WORDS = {
-  context: "the app's audio engine",
-  element: "an audio element (fallback)",
-  "context-after-permission": "the app's audio engine, after the permission fix",
-  "element-after-permission": "an audio element (fallback), after the permission fix",
-};
-
 function cableRow(results) {
   const name = "Voice into CABLE Input";
   const voice = results.voice ?? {};
   if (voice.state === "sink-refused") return row(name, "fail", "The app could not send your voice into “CABLE Input”.");
   const method = voice.output?.method;
   if (!method) return row(name, "todo", "The voice is not going into CABLE Input yet.");
-  const words = ROUTE_WORDS[method] ?? method;
+  const words = routeWords(method);
   const changes = list(voice.output?.routeChanges);
+  // The user's own switches under Advanced (Session B step 7.6, cause "route") are a comparison, not a problem.
+  const byApp = changes.filter((c) => c.cause !== "route");
+  const byYou = changes.length - byApp.length;
   const extra = method === "context" ? "" : " It works, but this route may add delay or clicks.";
-  if (changes.length) {
-    return row(name, "note", `Sent through ${words}.${extra} The route changed ${times(changes.length)} during the session: to discuss.`);
+  const forced = voice.output?.routePreference === "element" ? " It is the one you chose under Advanced: set it back to Automatic." : "";
+  const yours = byYou ? ` You switched the route ${times(byYou)} under Advanced (your comparison run).` : "";
+  if (byApp.length) {
+    return row(name, "note", `Sent through ${words}.${extra}${forced} The app changed the route by itself ${times(byApp.length)} during the session: to discuss.${yours}`);
   }
-  return row(name, "pass", `Sent through ${words}.${extra}`);
+  return row(name, "pass", `Sent through ${words}.${extra}${forced}${yours}`);
 }
 
 /**
@@ -1339,12 +1353,25 @@ function cableRow(results) {
  */
 const isComparison = (run) => run?.routePreference === "element";
 
+/**
+ * The check ran on the route the user had chosen. false: a choice made during an outage was not applied yet, or a
+ * forced audio element route was not used: such a check belongs to neither side and counts for no row. Results
+ * made before it was recorded count as chosen.
+ */
+const asChosen = (run) => run?.routeAsChosen !== false;
+
+/** A check on the app's normal route: counted by the rows. */
+const isNormalRoute = (run) => !isComparison(run) && asChosen(run);
+
+/** A comparison check through the audio element, on that route: listed beside its row. */
+const isElementComparison = (run) => isComparison(run) && asChosen(run);
+
 /** The delay runs that measured clearly, on the normal route ("counted") and forced onto the audio element. */
 function delayRuns(results) {
   const runs = list(results.checks?.delay).filter(
     (r) => isNum(r.estimateMs) && ["good", "borderline", "slow"].includes(r.verdict),
   );
-  return { counted: runs.filter((r) => !isComparison(r)), element: runs.filter(isComparison) };
+  return { counted: runs.filter(isNormalRoute), element: runs.filter(isElementComparison) };
 }
 
 function delayRow(results) {
@@ -1415,16 +1442,17 @@ const earlyNote = (run) => {
 /** "1 gap", "2 gaps"; "1 recovery", "3 recoveries". */
 const count = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
 
-/** The outages, rendering pauses and recoveries of some checks, in words: ["1 outage", "2 recoveries"]. */
+/** The outages, rendering pauses and recoveries of some checks, in words: ["the app had to bring the sound back once"]. */
 function stopWords(runs) {
   const sum = (f) => runs.reduce((a, r) => a + f(r), 0);
   const outages = sum((r) => list(r.outages).length);
   const pauses = sum((r) => list(r.renderPauses).length);
   const recoveries = sum((r) => (isNum(r.recoveries) ? r.recoveries : 0));
   const out = [];
-  if (outages) out.push(count(outages, "outage"));
-  if (pauses) out.push(count(pauses, "rendering pause"));
-  if (recoveries) out.push(count(recoveries, "recovery", "recoveries"));
+  // A recovery is one of the outages: the larger of the two counts, never both.
+  const stops = Math.max(outages, recoveries);
+  if (stops) out.push(`the app had to bring the sound back ${times(stops)}`);
+  if (pauses) out.push(`the app's sound paused ${times(pauses)}`);
   return out;
 }
 
@@ -1461,7 +1489,7 @@ function gapsRow(results) {
   const meet = " Meet call still open at the end: your note (Session B step 7.5).";
   const long = list(results.checks?.long);
   // Checks forced onto the audio element (Session B step 7.6) are comparisons: they never count here.
-  const counted = long.filter((r) => !isComparison(r));
+  const counted = long.filter(isNormalRoute);
   const toneRuns = counted.filter((r) => r.mode === "tone");
   // A page in Edge cannot tell minimized from hidden (both are just "not visible"): an Edge run is judged on the
   // time it was not on screen, both phases together.
@@ -1534,7 +1562,7 @@ function gapsRow(results) {
   if (run.verdict === "fix-setting" || quiet) {
     const notes = run.verdict === "fix-setting" && Array.isArray(run.reasons) ? run.reasons.filter((x) => typeof x === "string") : [];
     if (quiet) {
-      notes.push(`In “Measure the delay” the voice arrived ${(-quiet.levelDiffDb).toFixed(1)} dB quieter in CABLE Output: ${QUIET_ADVICE}`);
+      notes.push(`In “Measure the delay” the voice arrived ${(-quiet.levelDiffDb).toFixed(1)} dB quieter in CABLE Output. ${QUIET_ADVICE}`);
     }
     return row(name, "note", `No gaps in ${phases}, but a setting needs changing.${notes.length ? ` ${notes.join(" ")}` : ""}${unchecked}${meet}`);
   }
@@ -1545,9 +1573,9 @@ function gapsRow(results) {
 function ticksRow(results) {
   const name = "No regular clicks";
   const longEnough = list(results.checks?.long).filter((r) => r.mode === "tone" && (r.recordedSec ?? 0) >= 30 * 60);
-  const counted = longEnough.filter((r) => !isComparison(r));
+  const counted = longEnough.filter(isNormalRoute);
   // Session B step 7.6's checks through the audio element: their meeting's side is listed beside the row.
-  const compared = longEnough.filter((r) => isComparison(r) && !measuredNothing(r));
+  const compared = longEnough.filter((r) => isElementComparison(r) && !measuredNothing(r));
   const perRun = (r) => (isNum(r.tonePath?.ticksPer30Min) ? `about ${per30(r.tonePath.ticksPer30Min)} per 30 min` : "not measured");
   const comparedText = compared.length ? ` Through the audio element (not counted): ${compared.map(perRun).join(", ")}.` : "";
   const run = lastOf(counted, (r) => !measuredNothing(r));

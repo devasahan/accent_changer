@@ -97,7 +97,8 @@ const EXTRA_MINUTES = LIMITS.EXTEND_MAX_SEC / 60; // room in the envelope arrays
 /** Texts the page shows (plain English, no device names). */
 export const CHECK_TEXTS = Object.freeze({
   notRunning: "The checks need your voice going into “CABLE Input” first: wait until step 2 is green, then try again.",
-  noCableOutput: "“CABLE Output” is not among the microphones: is VB-CABLE installed?",
+  noCableOutput:
+    "“CABLE Output” is not among the microphones. Press Windows key + R, type mmsys.cpl and press Enter → Recording: right-click the list, tick “Show Disabled Devices”, then right-click “CABLE Output” → Enable. Then try again.",
   noMic: "The microphone is not running, so it can't be recorded. Press “Check the microphone”, then try again.",
   busy: "Another check is running. Wait until it has finished.",
   restarted: "The audio was restarted during the measurement: press the button again.",
@@ -105,9 +106,10 @@ export const CHECK_TEXTS = Object.freeze({
   stalled: "The recording stopped before the end. Press the button again.",
   cableEnded: "“CABLE Output” stopped recording. Press the button again.",
   minutes: "The long check runs for 0.25 to 120 minutes.",
-  longNoStart: "The long check could not start its recorder. Try again; if it keeps failing, restart the app.",
-  ownCrossing: "The recording adds its own clock crossing: it could not run on VB-CABLE's clock.",
-  routeChanged: "The output route changed during the check, so part of the recording adds its own clock crossing.",
+  longNoStart:
+    "The long check could not start its recorder. Try again; if it keeps failing, press “Copy results” and send them to me, then close the app and open it again.",
+  ownCrossing: "The recording could not run in step with VB-CABLE, so it may count a few clicks of its own.",
+  routeChanged: "The output route changed during the check, so part of the recording may count a few clicks of its own.",
   toneLost: "The test tone stopped (Windows' default playback device went away or failed), so the check ended early.",
   cableLost: "“CABLE Output” stopped recording (did Windows Audio restart?), so the check ended early.",
   rebuildFailed: "The check's recorder could not be added again after the audio was restarted, so the check ended early.",
@@ -115,10 +117,13 @@ export const CHECK_TEXTS = Object.freeze({
   voiceStopped: "The voice was stopped, so the check ended early.",
   notBack: "The recording stopped before the end of the check, so the check ended early.",
   defaultOutput: "Windows switched its default playback device",
+  // After an early end: what to do next (the check with your voice is Session B step 8, the tone check step 7).
+  runAgain: (mode) =>
+    mode === "mic" ? "Start the check with your voice again (Session B step 8)." : "Start the long check again (Session B step 7).",
   analysing: (sec) => `Analysing (about ${sec} s)…`,
-  runsFull: (sec) => `Too many runs of digital silence to keep them all: drop-outs were checked for the first ${formatClock(sec)} only.`,
+  runsFull: (sec) => `There were too many short silences to keep them all: drop-outs were checked for the first ${formatClock(sec)} only.`,
   defaultOutputGap: (atSec) => `The sound stopped at ${formatClock(atSec)} when Windows switched its default playback device.`,
-  notAnalysed: (name) => `The check could not be analysed (${name}).`,
+  notAnalysed: (name) => `The check could not be analysed (${name}). Press “Copy results” and send them to me.`,
 });
 
 const NOOP_HANDLE = Object.freeze({ dispose() {} });
@@ -251,8 +256,8 @@ const isContextRoute = (method) => typeof method === "string" && method.startsWi
 /** ISO time of an epoch ms (now when it is not a number). */
 const isoOf = (epochMs) => new Date(isNum(epochMs) ? epochMs : Date.now()).toISOString();
 
-/** The epoch ms of a performance.now() time. */
-const epochOf = (perfMs) => Date.now() + (perfMs - performance.now());
+/** The epoch ms of a performance.now() time (one source for the page: ui/voice.js may import it from here). */
+export const epochOf = (perfMs) => Date.now() + (perfMs - performance.now());
 
 /** At most `n` items, spread evenly over the list, the first and the last kept. */
 function thin(items, n) {
@@ -406,6 +411,8 @@ class LongCheck {
     this.route = this.graph.output?.method ?? null;
     // "element": forced onto the audio element under Advanced (README step 7.6), a comparison Gate 1 lists, not counts.
     this.routePreference = this.graph.output?.routePreference ?? "auto";
+    // false while a route chosen during an outage waits to be applied (the voice still on the route before it).
+    this.routeInEffect = this.graph.output?.routePreferenceInEffect !== false;
     this.contextRoute = isContextRoute(this.route);
     this.site = null;
     this.ownCtx = null;
@@ -421,6 +428,7 @@ class LongCheck {
     this.lastSync = null;
     this.marks = [];
     this.lastPhase = null;
+    this.lastVisibility = null;
 
     this.events = [];
     this.eventsDropped = 0;
@@ -1017,7 +1025,12 @@ class LongCheck {
 
   markVisibility() {
     const v = globalThis.document?.visibilityState;
-    if (typeof v === "string") this.mark({ atMs: performance.now(), visibility: v });
+    if (typeof v !== "string") return;
+    // Whether WebView2 tells the page it is hidden when its window is minimized or hidden (platform-facts C4,
+    // open question 1): a code in the log, and pageVisibility in the result.
+    if (v !== this.lastVisibility && !this.finished) this.log("info", `check long visibility ${v === "hidden" ? "hidden" : "visible"}`);
+    this.lastVisibility = v;
+    this.mark({ atMs: performance.now(), visibility: v });
   }
 
   poll() {
@@ -1193,7 +1206,8 @@ class LongCheck {
   end(note = null, why = "stop") {
     if (!this.finishing) {
       if (note) {
-        this.earlyEnd = { note, why };
+        // What happened, then what to do next: the page shows it, and the Gate 1 gaps row starts with it.
+        this.earlyEnd = { note: `${note} ${CHECK_TEXTS.runAgain(this.mode)}`, why };
         this.log("warn", `check long ended early ${why}`);
       }
       if (!this.builtOnce) this.firstBuild.reject(named("AbortError", note ?? CHECK_TEXTS.longNoStart));
@@ -1557,13 +1571,83 @@ class LongCheck {
     result.mainThreadLate = late;
     result.recoveries = this.recoveries;
     result.timerLateMs = this.timerLateness(tl);
+    result.mainThreadLateByPhase = this.mainThreadLateByPhase(tl);
+    result.pageVisibility = this.pageVisibility(startMs, endMs);
+    result.focusAfterHide = this.focusAfterHide();
     result.playback = this.anyStats ? this.playbackByPhase(tl) : null;
     result.defaultOutputChanges = this.defaultOutputs.map((t) => ({ atSec: round((t - startMs) / 1000, 1) }));
     result.route = this.route;
     result.routePreference = this.routePreference;
+    Object.assign(result, this.routeAtEnd());
     result.site = this.site;
     result.notes = [...new Set(notes)];
     return result;
+  }
+
+  /**
+   * The page's own visibility (document.visibilityState, from its marks
+   * alone) crossed with the window's phases (from the window-state polls and
+   * Hide alone): how long the page itself was hidden in each window phase,
+   * and how often it changed. Session B answers with it whether WebView2
+   * tells the page it is hidden while its window is minimized or hidden.
+   * → { hiddenSec: { visible, minimized, hidden }, changes }
+   */
+  pageVisibility(fromMs, toMs) {
+    const out = { hiddenSec: { visible: 0, minimized: 0, hidden: 0 }, changes: 0 };
+    if (!isNum(fromMs) || !isNum(toMs) || !(toMs > fromMs)) return out;
+    const windowTl = phaseTimeline(this.marks.filter((m) => typeof m.visibility !== "string"));
+    const seen = this.marks.filter((m) => typeof m.visibility === "string" && isNum(m.atMs)).sort((a, b) => a.atMs - b.atMs);
+    let state = null;
+    let since = fromMs;
+    const close = (until) => {
+      if (state !== "hidden" || !(until > since)) return;
+      const spans = windowTl.spans(since, until);
+      out.hiddenSec.visible += spans.visibleSec + spans.unknownSec;
+      out.hiddenSec.minimized += spans.minimizedSec;
+      out.hiddenSec.hidden += spans.hiddenSec;
+    };
+    for (const m of seen) {
+      if (m.atMs <= fromMs) {
+        state = m.visibility;
+        continue;
+      }
+      if (m.atMs >= toMs) break;
+      if (m.visibility === state) continue;
+      close(m.atMs);
+      if (state !== null) out.changes++;
+      state = m.visibility;
+      since = m.atMs;
+    }
+    close(toMs);
+    for (const k of Object.keys(out.hiddenSec)) out.hiddenSec[k] = round(out.hiddenSec[k], 1);
+    return out;
+  }
+
+  /**
+   * For each Hide: whether the window had the focus at the first window-state
+   * answer after it ended (the quiet re-show must not take the keyboard from
+   * the meeting app); null when no answer said.
+   */
+  focusAfterHide() {
+    const polls = this.marks.filter((m) => typeof m.focused === "boolean").sort((a, b) => a.atMs - b.atMs);
+    return this.marks
+      .filter((m) => m.hiddenByApp === true && isNum(m.untilMs))
+      .map((h) => polls.find((p) => p.atMs >= h.untilMs)?.focused ?? null);
+  }
+
+  /** How late the worklet's messages reached the main thread, per phase: how many more than 200 ms, and the most. */
+  mainThreadLateByPhase(tl) {
+    const out = {};
+    for (const phase of ["visible", "minimized", "hidden"]) out[phase] = { count: 0, maxMs: 0 };
+    for (const p of this.sync) {
+      if (!isNum(p.wallMs) || !isNum(p.producedMs)) continue;
+      const slot = out[tl.phaseAt(p.wallMs)];
+      if (!slot) continue;
+      const late = p.wallMs - p.producedMs;
+      if (late > LIMITS.PAUSE_STEP_MS) slot.count++;
+      if (late > slot.maxMs) slot.maxMs = Math.round(late);
+    }
+    return out;
   }
 
   /** Timer lateness per phase: the most, and how many ticks came a second or more late. */
@@ -1590,6 +1674,19 @@ class LongCheck {
     return out;
   }
 
+  /**
+   * The route at the check's end, and whether the check ran on the route the
+   * user had chosen (routeAsChosen): the choice in effect at its start, and a
+   * check forced onto the audio element on that route from start to end.
+   * Gate 1 counts a check only where it belongs (normal route or comparison).
+   */
+  routeAtEnd() {
+    const routeAtEnd = this.graph.output?.method ?? null;
+    const element = (m) => typeof m === "string" && m.startsWith("element");
+    const routeAsChosen = this.routeInEffect && (this.routePreference !== "element" || (element(this.route) && element(routeAtEnd)));
+    return { routeAtEnd, routeAsChosen };
+  }
+
   /** The result when the analysis itself failed: what is known, and why there is no verdict. */
   failedResult(err) {
     return {
@@ -1611,10 +1708,14 @@ class LongCheck {
       mainThreadLate: { count: 0, maxMs: 0 },
       recoveries: this.recoveries,
       timerLateMs: null,
+      mainThreadLateByPhase: null,
+      pageVisibility: null,
+      focusAfterHide: [],
       playback: null,
       defaultOutputChanges: [],
       route: this.route,
       routePreference: this.routePreference,
+      ...this.routeAtEnd(),
       site: this.site,
       notes: this.notes.slice(),
     };
@@ -1656,7 +1757,7 @@ export class Checks extends EventTarget {
    * seconds, ok, passthroughMs, estimateMs, micFifoMs, micFifoScore,
    * captureLatencyMs, score, method, levelDiffDb, verdict, text, notes,
    * cableCaptureLatencyMs, outputLatencyMs, baseLatencyMs,
-   * cableOutputRateHz, route, routePreference, site }. Throws an Error the
+   * cableOutputRateHz, route, routePreference, routeAsChosen, site }. Throws an Error the
    * page shows when it cannot run or was cut short (the voice not running,
    * no CABLE Output, the audio restarted meanwhile, another check running).
    */
@@ -1671,6 +1772,9 @@ export class Checks extends EventTarget {
       const graph = this._graph;
       const route = graph.output?.method ?? null;
       const routePreference = graph.output?.routePreference ?? "auto";
+      // A delay run ends on any rebuild, so its route stays as it began: chosen, unless the choice made during an
+      // outage was not applied yet, or a forced audio element route could not be used.
+      const routeAsChosen = graph.output?.routePreferenceInEffect !== false && (routePreference !== "element" || !isContextRoute(route));
       const contextRoute = isContextRoute(route);
       cable = await openCableOutput(graph.snapshot);
       const frames = Math.round(sec * SAMPLE_RATE);
@@ -1701,6 +1805,7 @@ export class Checks extends EventTarget {
         cableOutputRateHz: cable.settings?.sampleRateHz ?? null,
         route,
         routePreference,
+        routeAsChosen,
         site: rec.site,
       };
       this._log(
