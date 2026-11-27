@@ -31,6 +31,8 @@ export const VOICE_TEXTS = Object.freeze({
   slowOpen: " (slow: did a question appear?)",
   permissionFix: " + the permission fix",
   bringingBack: "bringing it back…",
+  notReaching: " Your voice is not reaching the meeting yet: see step 2.",
+  notSaved: (why) => ` Could not save the settings: ${why}`,
 });
 
 /** Why the voice stopped, in words (the recovery log; the same words as the status line). */
@@ -122,6 +124,21 @@ export function recoveryResult(r) {
   };
   if (out.micToo) out.restart = restartVerdict(r);
   return out;
+}
+
+/**
+ * The status line after the user picked a microphone, an output or a route.
+ * taken: the voice graph now uses the choice. running: the voice reaches the
+ * meeting. notSaved: why the choice could not be saved (it still applies
+ * until the app closes), or null. A choice can be taken while the voice
+ * does not run (no VB-CABLE yet, an outage): then the line says so.
+ * → { text, kind }
+ */
+export function changeOutcome({ taken, running, done, failed, notSaved = null }) {
+  const saveText = notSaved ? VOICE_TEXTS.notSaved(notSaved) : "";
+  if (!taken) return { text: failed + saveText, kind: "warn" };
+  if (!running) return { text: done + VOICE_TEXTS.notReaching + saveText, kind: "warn" };
+  return { text: done + saveText, kind: notSaved ? "warn" : "ok" };
 }
 
 /**
@@ -293,6 +310,29 @@ export class VoiceView {
     outSelect.value = chosen && outs.some((d) => d.deviceId === chosen) ? chosen : "";
   }
 
+  /** The microphone the voice graph has open now is `id`. */
+  usesMic(id) {
+    return Boolean(id) && this.graph.mic?.entry?.deviceId === id;
+  }
+
+  /**
+   * The voice goes to the output the user chose: `id`, or "" for Automatic.
+   * While the voice does not run, the choice counts as taken: every try
+   * reads the saved choice, and a try that failed earlier (no microphone,
+   * say) may not have reached the output yet.
+   */
+  usesOutput(id) {
+    if (this.graph.state !== "running") return true;
+    const out = this.graph.output;
+    return id ? out?.entry?.deviceId === id : out?.how === "auto";
+  }
+
+  /** The route the user chose under Advanced ("auto" or "element") is the graph's (the same rule as usesOutput). */
+  usesRoute(value) {
+    if (this.graph.state !== "running") return true;
+    return (this.graph.output?.routePreference ?? "auto") === value;
+  }
+
   /** A check runs: the device choices wait until it is over. */
   setChecksBusy(busy) {
     this.checksBusy = Boolean(busy);
@@ -332,8 +372,14 @@ export class VoiceView {
     ]);
   }
 
+  /**
+   * The recovery log lists fault outages only (as the results do). The first
+   * start also reports "still trying" while it waits (for VB-CABLE, say):
+   * the status line above shows that, so it is not listed.
+   */
   onRecovery(d) {
     if (!d) return;
+    if ((d.kind === "lost" || d.kind === "still-trying") && d.outage?.kind !== "fault") return;
     if (d.kind === "lost") {
       this.open = { lostAtMs: d.outage?.lostAtMs ?? performance.now(), cause: d.outage?.cause ?? null, sinceMs: null };
     } else if (d.kind === "still-trying") {

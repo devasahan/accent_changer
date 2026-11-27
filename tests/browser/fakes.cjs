@@ -140,7 +140,15 @@ function fakeTauri({ build, tokenResponse, refusedKey, refusedSavedKey }) {
  * an <audio> element whose setSinkId took the cable has its stream mixed in.
  * busGate (a gain) feeds busOut, whose track getUserMedia hands out as
  * "CABLE Output". Every connect(ctx.destination) of an app context is
- * recorded in __fake.destinationConnects with the sink at that moment.
+ * recorded in __fake.destinationConnects with the sink at that moment. A
+ * context that was ever sinked to the cable has __everCable; the voice
+ * graph's contexts have __graph (they make the ac-passthrough and ac-meter
+ * nodes, which the monitor's contexts never do).
+ *
+ * Refusals are worded as Chromium words them, ids included:
+ * AudioContext.setSinkId names Chromium's own (64-hex) device id
+ * ("access to the device <id> is not permitted."), the <audio> element's
+ * does not ("No permission to use requested device").
  *
  * Switches (window.__fake): noCable, cableAlias(id), defaultOutputIsCable,
  * hideLabels, unplug(label) / plug(label) (a fake input, or "Fake Audio
@@ -298,9 +306,9 @@ function fakeAudio() {
     async setSinkId(id) {
       if (fake.sinkDelayMs > 0) await sleep(fake.sinkDelayMs);
       const cable = isCable(id);
-      if ((cable && fake.noCable) || isOldCable(id)) throw refusal("NotFoundError", "The requested playback device is not found.");
-      if (cable && fake.refuseContextSink) throw refusal("NotAllowedError", "No permission to use the requested playback device.");
       const real = toNative(id);
+      if ((cable && fake.noCable) || isOldCable(id)) throw refusal("NotFoundError", `the device ${real} is not found.`);
+      if (cable && fake.refuseContextSink) throw refusal("NotAllowedError", `access to the device ${real} is not permitted.`);
       await nativeCtxSetSink.call(this, real);
       this.__sink = typeof id === "string" && id ? { id, real } : null;
       if (cable) {
@@ -330,6 +338,17 @@ function fakeAudio() {
     }
     return null;
   };
+
+  // The voice graph's contexts: those that make its passthrough and meter nodes.
+  const NativeWorkletNode = window.AudioWorkletNode;
+  if (typeof NativeWorkletNode === "function") {
+    window.AudioWorkletNode = class FakeAudioWorkletNode extends NativeWorkletNode {
+      constructor(context, name, options) {
+        super(context, name, options);
+        if (name === "ac-passthrough" || name === "ac-meter") context.__graph = true;
+      }
+    };
+  }
 
   // ---- connections: a copy into the bus, and a record of every connect to a destination ----
   AudioNode.prototype.connect = function connect(dest, ...rest) {
@@ -388,8 +407,8 @@ function fakeAudio() {
   HTMLMediaElement.prototype.setSinkId = async function setSinkId(id) {
     if (fake.sinkDelayMs > 0) await sleep(fake.sinkDelayMs);
     const cable = isCable(id);
-    if ((cable && fake.noCable) || isOldCable(id)) throw refusal("NotFoundError", "The requested playback device is not found.");
-    if (cable && fake.refuseElementSink) throw refusal("SecurityError", "No permission to use the requested playback device.");
+    if ((cable && fake.noCable) || isOldCable(id)) throw refusal("NotFoundError", "Requested device not found");
+    if (cable && fake.refuseElementSink) throw refusal("SecurityError", "No permission to use requested device");
     await nativeElementSink.call(this, toNative(id));
     if (cable) loop(this);
     else unloop(this);

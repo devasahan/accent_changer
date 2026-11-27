@@ -20,7 +20,7 @@ import { gateSummary } from "./core/cable-check.js";
 import { VoiceGraph } from "./audio/graph.js";
 import { Monitor } from "./audio/monitor.js";
 import { Checks } from "./audio/measure.js";
-import { VoiceView, fillList } from "./ui/voice.js";
+import { VoiceView, changeOutcome, fillList } from "./ui/voice.js";
 import { ChecksView, delayKind } from "./ui/checks.js";
 
 const $ = (id) => document.getElementById(id);
@@ -72,8 +72,21 @@ function setStatus(message, kind = "info") {
   renderResults();
 }
 
-/** The results as "Copy results" gives them: drawn afresh, then passed through redactObject. */
-function renderResults() {
+/** Part of the results' text is selected: someone is copying it by hand (or the copy fallback selected it). */
+function resultsSelected(pre) {
+  const selection = document.getSelection();
+  return Boolean(selection && selection.rangeCount > 0 && !selection.isCollapsed && selection.containsNode(pre, true));
+}
+
+/**
+ * The results as "Copy results" gives them: drawn afresh, then passed
+ * through redactObject. Their text under "Show the results" is not rewritten
+ * while part of it is selected, or the selection would go; nor by the
+ * redraws that only follow the levels (`periodic`) while it is open, so it
+ * does not change under the reader's eyes every second. `force` rewrites it
+ * anyway (Copy results).
+ */
+function renderResults({ force = false, periodic = false } = {}) {
   results.at = new Date().toISOString();
   if (voiceView) {
     try {
@@ -84,8 +97,10 @@ function renderResults() {
   }
   results.gate = gateSummary(results);
   checksView.renderGate(results.gate);
-  $("results").textContent = JSON.stringify(redactObject(results), null, 2);
   lastRenderMs = performance.now();
+  const pre = $("results");
+  if (!force && (resultsSelected(pre) || (periodic && pre.closest("details")?.open))) return;
+  pre.textContent = JSON.stringify(redactObject(results), null, 2);
 }
 
 const messageOf = (err) => (typeof err?.message === "string" && err.message ? err.message : String(err));
@@ -198,11 +213,16 @@ async function saveSettings(changes) {
   }
 }
 
-/** The status after a change of device: done or not, and whether it could be saved (the app keeps going either way). */
-function changeStatus(ok, done, failed, notSaved) {
-  const saveText = notSaved ? ` Could not save the settings: ${notSaved}` : "";
-  if (!ok) setStatus(failed + saveText, "warn");
-  else setStatus(done + saveText, notSaved ? "warn" : "ok");
+/**
+ * The status after a change of device or route. `taken` comes from what the
+ * graph uses now, not from its answer: the graph also answers "not ok" for a
+ * change it made while the voice does not run (no VB-CABLE yet, say). The
+ * status also says whether the voice reaches the meeting, and whether the
+ * choice could be saved (the app keeps going either way).
+ */
+function changeStatus(taken, done, failed, notSaved = null) {
+  const { text, kind } = changeOutcome({ taken, running: graph?.state === "running", done, failed, notSaved });
+  setStatus(text, kind);
 }
 
 /** The user's choices as the graph reads them before every operation. */
@@ -234,7 +254,7 @@ function startVoice() {
     getSettings: () => settings,
     onChange: () => renderResults(),
     onLevels: () => {
-      if (performance.now() - lastRenderMs >= RESULTS_EVERY_MS) renderResults();
+      if (performance.now() - lastRenderMs >= RESULTS_EVERY_MS) renderResults({ periodic: true });
     },
   });
   voiceView.attach();
@@ -245,9 +265,9 @@ function startVoice() {
 }
 
 // Edge dev mode only: the page may play sound after one click (the app never needs it).
+// Step 2's status line shows how the start goes.
 $("btnStartVoice").addEventListener("click", () => {
   graph?.resumeFromGesture();
-  setStatus("Starting your voice…");
 });
 
 onSelect("micSelect", async (select) => {
@@ -260,8 +280,8 @@ onSelect("micSelect", async (select) => {
   platform.log("info", "user mic");
   try {
     const notSaved = await saveSettings({ micDeviceId: id, micLabel: entry.label });
-    const r = await graph.setMic(id);
-    changeStatus(r.ok, "Microphone switched.", "The microphone could not be switched: see step 2.", notSaved);
+    await graph.setMic(id);
+    changeStatus(voiceView.usesMic(id), "Microphone switched.", "The microphone could not be switched: see step 2.", notSaved);
   } finally {
     if (voiceView.pendingMic === id) voiceView.pendingMic = null;
     voiceView.renderSelects();
@@ -276,8 +296,8 @@ onSelect("outSelect", async (select) => {
   setStatus("Switching where your voice goes…");
   platform.log("info", `user output ${id ? "chosen" : "auto"}`);
   const notSaved = await saveSettings({ cableDeviceId: id, cableLabel: entry?.label ?? "" });
-  const r = await graph.setOutput(id || null);
-  changeStatus(r.ok, "Switched where your voice goes.", "That device could not be used: see step 2.", notSaved);
+  await graph.setOutput(id || null);
+  changeStatus(voiceView.usesOutput(id), "Switched where your voice goes.", "That device could not be used: see step 2.", notSaved);
 });
 
 // Advanced (diagnostics only, not saved): the audio element route.
@@ -286,8 +306,8 @@ onSelect("routeSelect", async (select) => {
   const value = select.value === "element" ? "element" : "auto";
   setStatus("Switching the output route…");
   platform.log("info", `user route ${value}`);
-  const r = await graph.setRoutePreference(value);
-  setStatus(r.ok ? "Output route switched." : "The output route could not be switched: see step 2.", r.ok ? "ok" : "warn");
+  await graph.setRoutePreference(value);
+  changeStatus(voiceView.usesRoute(value), "Output route switched.", "The output route could not be switched: see step 2.");
 });
 
 // "Check the microphone": a fresh look at the devices; no new microphone request when one is open.
@@ -510,15 +530,22 @@ action("btnConnect", async () => {
 // ---------- 6 · copy ----------
 
 action("btnCopy", async () => {
-  renderResults();
-  const text = $("results").textContent;
-  platform.log("info", "results copied");
+  renderResults({ force: true });
+  const pre = $("results");
   try {
-    await navigator.clipboard.writeText(text);
+    await navigator.clipboard.writeText(pre.textContent);
+    platform.log("info", "results copied");
     $("copyInfo").textContent = "Copied. Paste it into your message.";
   } catch {
-    $("results").closest("details").open = true;
-    $("copyInfo").textContent = "Could not copy by itself: select the text below and copy it (Ctrl+A, Ctrl+C).";
+    // Select the results alone. Ctrl+A would take the whole page, and step 2 shows the devices' real names.
+    platform.log("warn", "results copy failed");
+    pre.closest("details").open = true;
+    const range = document.createRange();
+    range.selectNodeContents(pre);
+    const selection = document.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    $("copyInfo").textContent = "Could not copy by itself. The results below are selected: press Ctrl+C to copy them.";
   }
 });
 

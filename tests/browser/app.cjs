@@ -182,7 +182,7 @@ function buttonContrast() {
 
 // ---------- 1 · Edge dev mode, no VB-CABLE ----------
 
-async function devMode(browser, base, CHECK_TEXTS) {
+async function devMode(browser, base, CHECK_TEXTS, VOICE_TEXTS) {
   console.log("Edge dev mode (src/platform/browser.js), no VB-CABLE:");
   const context = await browser.newContext();
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: base });
@@ -249,6 +249,18 @@ async function devMode(browser, base, CHECK_TEXTS) {
       json(mic),
     );
 
+    // Another microphone while VB-CABLE is missing: it is switched (the voice runs nowhere yet, and the status says so).
+    const other = await page.$eval("#micSelect", (s) => [...s.options].map((o) => o.value).find((v) => v !== s.value) ?? "");
+    const otherName = await page.$eval("#micSelect", (s, v) => [...s.options].find((o) => o.value === v)?.textContent ?? "", other);
+    await page.selectOption("#micSelect", other);
+    await page.waitForFunction(() => !/^Switching the microphone/.test(document.querySelector("#status").textContent), null, { timeout: 15000 });
+    check(
+      (await status()) === `Microphone switched.${VOICE_TEXTS.notReaching}` && (await statusKind()) === "warn",
+      "a microphone picked while VB-CABLE is missing is switched, and the status says the voice is not reaching the meeting yet",
+      `${await statusKind()}: ${await status()}`,
+    );
+    check(Boolean(otherName) && (await text("#voiceInfo")).includes(otherName), "step 2 shows the new microphone", await text("#voiceInfo"));
+
     // 3 · Hide works only in the installed app; a check needs the voice in the cable
     watch.expectErrors = true;
     await press("btnHide", /works only in the installed app/);
@@ -308,6 +320,16 @@ async function devMode(browser, base, CHECK_TEXTS) {
       json(withCsp.csp),
     );
     check(lines.some((l) => /^csp script-src/.test(l)), "and its directive is logged", lines.slice(-5).join("\n"));
+
+    // 8 · the first start waiting for VB-CABLE "still tries" (its progress is step 2's status): no recovery is listed
+    const end = Date.now() + 15000;
+    while (!lines.some((l) => /^recovery still-trying /.test(l)) && Date.now() < end) await sleep(200);
+    check(lines.some((l) => /^recovery still-trying /.test(l)), "the first start keeps trying while VB-CABLE is missing", lines.filter((l) => /^recovery /.test(l)).join("\n"));
+    check(
+      (await text("#recoveryLog")) === VOICE_TEXTS.noRecoveries && (await results()).voice?.recoveries?.length === 0,
+      "the Recoveries list stays empty during the first start (it lists outages of a running voice)",
+      await text("#recoveryLog"),
+    );
   } catch (err) {
     check(false, "scenario finished", err.stack || err.message);
     console.log(`     status: ${await status().catch(() => "?")}`);
@@ -361,6 +383,11 @@ async function gesture(browser, base, build) {
       const p = await peak(1000);
       check(p > 0.01, "and reaches CABLE Output", `peak ${p}`);
       check(await page.locator("#btnStartVoice").isHidden(), "Start is hidden again");
+      check(
+        !/Starting your voice/.test(await status()) && (await page.locator("#voiceStatus").getAttribute("data-kind")) === "ok",
+        "once the voice runs, no status line still says it is starting (step 2 is green)",
+        `${await status()} | ${await page.locator("#voiceStatus").textContent()}`,
+      );
     } catch (err) {
       check(false, "scenario finished", err.stack || err.message);
       console.log(`     status: ${await status().catch(() => "?")}`);
@@ -427,8 +454,14 @@ const REFUSED_KEY =
 const REFUSED_SAVED_KEY =
   "Sanas refused the saved key (HTTP 401). Paste it again on the Diagnostics page from where you saved it (for example your password manager) and press Save key; if it is still refused, check in the Sanas Console whether it expired or was revoked.";
 
+// The id in a failure answer of Sanas's portal (portal.failWith): 64 hex digits, like Chromium's device ids.
+// The SDK puts the answer into its error message, which reaches the results as it is: only the page's
+// redactObject hides the id.
+const PORTAL_REQUEST_ID = "3c9a5e1f".repeat(8);
+
 const IN1 = "Fake Audio Input 1";
 const IN2 = "Fake Audio Input 2";
+const CABLE_IN_LABEL = "CABLE Input (VB-Audio Virtual Cable)";
 const TONE_HZ = 1031.25;
 
 /**
@@ -451,6 +484,7 @@ function fakePortal(route, base, portal) {
   portal.requests.push({ method: req.method(), path: pathname, auth: req.headers().authorization ?? null });
   const reply = (status, body) => route.fulfill({ status, headers: { ...cors, "content-type": "application/json" }, body: JSON.stringify(body) });
   if (portal.refuseOrigin) return reply(403, { errorCode: "FORBIDDEN", message: "Origin not allowed" });
+  if (portal.failWith) return reply(portal.failWith, { errorCode: "INTERNAL_ERROR", message: "Something went wrong", requestId: PORTAL_REQUEST_ID });
   if (pathname.endsWith("/entitlements")) {
     return reply(200, {
       data: {
@@ -467,8 +501,66 @@ function fakePortal(route, base, portal) {
   return reply(404, { errorCode: "NOT_FOUND", message: `the test has no answer for ${pathname}` });
 }
 
+/**
+ * Copy results (by itself), then look in the copy and in the text under
+ * "Show the results" for what must never leave the page: device ids (the
+ * page's and Chromium's), group ids, device names, the key, the token,
+ * Sanas's ids, and any 64-hex id (Chromium's device ids are 64 hex digits,
+ * and so is the id in the portal's failure answer). → { copied, shown }
+ */
+async function leakCheck(app, what) {
+  const { page, press, text } = app;
+  await page.evaluate(() => {
+    document.querySelector("#copyInfo").textContent = "";
+  });
+  await press("btnCopy", /\S/, "#copyInfo");
+  const copied = await page.evaluate(() => navigator.clipboard.readText().catch(() => ""));
+  const shown = await text("#results");
+  const listed = await page.evaluate(async () =>
+    (await navigator.mediaDevices.enumerateDevices()).flatMap((d) => [d.deviceId, d.groupId]).filter((id) => id && !["default", "communications"].includes(id)),
+  );
+  // Chromium's own ids of the fake devices too (the page sees only the fake's).
+  const native = await page.evaluate(() => Object.values(window.__fake.realIds));
+  const secrets = [
+    ...new Set([...listed, ...native, ...Object.values(app.ids), "fake-cable-output", "fake-cable-2", "fake-headset", "fake-laptop", "fake-cable"]),
+    "Fake Audio Input",
+    "Fake Default",
+    "Fake Headset",
+    ...Object.values(KEYS),
+    TOKEN,
+    USER_ID,
+    GROUP_ID,
+    PORTAL_REQUEST_ID,
+  ];
+  const found = [copied, shown].flatMap((t) => [...secrets.filter((s) => t.includes(s)), ...(t.match(/[0-9a-f]{64}/gi) ?? [])]);
+  check(
+    copied.length > 0 && listed.length > 0 && found.length === 0 && !/sk_live|access_token|deviceId/.test(copied + shown),
+    `${what}: the copied results hold no key, token, Sanas ids, device ids, group ids, 64-hex ids or device names`,
+    [...new Set(found)].join("\n") || `${listed.length} ids to look for; copied ${copied.length} characters`,
+  );
+  return { copied, shown };
+}
+
+/**
+ * Connections to the destination of a graph context that never played into
+ * the cable. On the audio element route the graph context runs on the
+ * headset's earpiece, so anything connected there would play the user's
+ * own voice in their headphones: there must be none. → { connects, open }
+ * (open: such graph contexts still open, the element route's own among
+ * them, so a check that finds no connection has looked at one)
+ */
+const graphOffCable = (app) =>
+  app.fake(() => {
+    const f = window.__fake;
+    const off = (c) => Boolean(c && c.__graph && !c.__everCable);
+    return {
+      connects: f.destinationConnects.filter((d) => off(f.contexts[d.ctx])),
+      open: f.contexts.filter((c) => off(c) && c.state !== "closed").length,
+    };
+  });
+
 /** The app's page with everything faked, and the scenarios that run in it (one page, reloaded where they say). */
-async function appMode(browser, base, WARNINGS) {
+async function appMode(browser, base, WARNINGS, VOICE_TEXTS) {
   console.log("\nThe installed app's page (src/platform/tauri.js; Rust side, Sanas portal and VB-CABLE faked):");
   const context = await browser.newContext();
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: base });
@@ -497,6 +589,7 @@ async function appMode(browser, base, WARNINGS) {
     watch,
     portal,
     WARNINGS,
+    VOICE_TEXTS,
     ids: null,
     ...tools,
     /** Flags for the next loads (fakeFlags reads them before the page's scripts). */
@@ -612,7 +705,14 @@ async function passthrough(app) {
   check(r.voice.start?.attempts === 1, "the first start took one attempt", json(r.voice.start));
   check(r.voice.debug?.contexts === 1 && r.voice.debug?.micSources === 1, "one audio context and one microphone source", json(r.voice.debug));
   check(/Your voice goes into “CABLE Input”/.test(await text("#voiceStatus")), "step 2 says where the voice goes", await text("#voiceStatus"));
+  check((await page.locator("#voiceStatus").getAttribute("data-kind")) === "ok", "and is green while the voice runs");
   check(/the app's audio engine/.test(await text("#voiceInfo")), "and how it is sent", await text("#voiceInfo"));
+  // Gate 1's tick row: the headset's microphone and its earpiece, which is also Windows' default playback device.
+  check(
+    r.voice.devices?.micHasSiblingOutput === true && r.voice.devices?.defaultOutputIsMicSibling === true,
+    "the results say the microphone has its own earpiece, and that it is Windows' default playback device",
+    json(r.voice.devices),
+  );
   const connects = await fake(() => ({ connects: window.__fake.destinationConnects, cable: window.__fake.contexts.map((c) => c.__everCable) }));
   const toCable = connects.connects.filter((c) => connects.cable[c.ctx]);
   check(
@@ -710,6 +810,23 @@ async function keyFlows(app) {
   check(r.key.checked === "accepted", "the key's check is still in the results after Connect only", json(r.key));
   check((await results()).gate.find((g) => g.row === "Connect only")?.status === "pass", "the checklist's Connect only row passes");
 
+  // The portal fails with an id in its answer. The SDK's message keeps the answer and reaches the results
+  // as it is (results.sanas, results.errors): the page's redactObject hides the id.
+  watch.expectErrors = true;
+  portal.failWith = 500;
+  await press("btnConnect", CONNECTED_OR_NOT);
+  portal.failWith = 0;
+  watch.expectErrors = false;
+  r = await results();
+  check(
+    r.sanas?.ok === false &&
+      /HTTP 500/.test(r.sanas.message ?? "") &&
+      r.sanas.message.includes("[redacted]") &&
+      !(await text("#results")).includes(PORTAL_REQUEST_ID),
+    "a portal failure with an id in its answer: the results keep the answer and hide the id",
+    r.sanas?.message,
+  );
+
   // The app's hints
   watch.expectErrors = true;
   portal.refuseOrigin = true;
@@ -770,9 +887,13 @@ async function measureDelay(app) {
 async function monitorSounds(app) {
   const { page, ids, WARNINGS, watch, fake, press, pressFor, results, status, statusKind, waitText, waitResults, choose } = app;
   const oscillators = () => fake(() => window.__fake.oscillators);
+  // The monitor's contexts: never on the cable, and not the voice graph's.
   const monitorConnects = async () => {
-    const c = await fake(() => ({ connects: window.__fake.destinationConnects, cable: window.__fake.contexts.map((x) => x.__everCable) }));
-    return c.connects.filter((x) => !c.cable[x.ctx]);
+    const c = await fake(() => ({
+      connects: window.__fake.destinationConnects,
+      monitor: window.__fake.contexts.map((x) => !x.__everCable && !x.__graph),
+    }));
+    return c.connects.filter((x) => c.monitor[x.ctx]);
   };
   await fake(() => window.__fake.setMicGain(0));
   await sleep(400);
@@ -952,7 +1073,8 @@ async function recovery(app) {
 // ---- 8 · headset lost ----
 
 async function headsetLost(app) {
-  const { ids, fake, peak, waitResults, text, choose, settingsFile } = app;
+  const { ids, fake, peak, waitResults, results, text, choose, settingsFile, press, status, statusKind } = app;
+  const voiceKind = () => app.page.locator("#voiceStatus").getAttribute("data-kind");
   await choose("#micSelect", ids.in1, /Microphone switched/);
   check((await settingsFile())?.micLabel === IN1, "the chosen microphone is saved", json(await settingsFile()));
   await fake(() => {
@@ -962,13 +1084,46 @@ async function headsetLost(app) {
   let r = await waitResults((x) => x.voice?.mic?.standIn === true && x.voice?.state === "running", 3000);
   check(r.voice?.mic?.standIn === true, "the headset is unplugged: a stand-in microphone within 3 s", json(r.voice?.mic));
   check((await text("#voiceWarnings")).includes("is not connected, so the app uses"), "step 2 says which microphone stands in", await text("#voiceWarnings"));
+  check((await voiceKind()) === "warn", "and its status is yellow while a stand-in is used", await voiceKind());
   check((await app.page.$eval("#micSelect", (s) => s.selectedOptions[0]?.textContent ?? "")).endsWith("(for now)"), "the list shows the stand-in (for now)");
+  // The stand-in's warning names both microphones on the page; the copied results must not.
+  check((r.voice?.warnings ?? []).some((w) => w.code === "STAND_IN"), "the results list the stand-in's warning", json(r.voice?.warnings));
+  await leakCheck(app, "during a stand-in");
   const p = await peak(1500);
   check(p > 0.01, "the voice stays on the cable through the stand-in", `peak ${p}`);
   await fake(() => window.__fake.plug("Fake Audio Input 1"));
   r = await waitResults((x) => x.voice?.mic?.standIn === false && x.voice?.state === "running", 3000);
   check(r.voice?.mic?.standIn === false && r.voice.mic.how === "saved-id", "the headset is back within 3 s, and used again", json(r.voice?.mic));
   check((await settingsFile())?.micLabel === IN1, "the settings still name the headset's microphone (a stand-in is never saved)", json(await settingsFile()));
+
+  // No microphone at all: Check the microphone says so as an error, and the results say it is not ok.
+  await fake(() => {
+    window.__fake.unplug("Fake Audio Input 1");
+    window.__fake.unplug("Fake Audio Input 2");
+    window.__fake.endMic();
+  });
+  r = await waitResults((x) => x.voice?.state === "no-mic", 5000);
+  check(r.voice?.state === "no-mic", "both microphones gone: the voice waits for one", r.voice?.state);
+  await press("btnMic", /^(?!Checking the microphone)/);
+  r = await results();
+  check(
+    (await statusKind()) === "error" && (await status()) === (await text("#voiceStatus")) && r.microphone?.ok === false && r.microphone?.error === "no-mic",
+    "Check the microphone without any microphone: an error with step 2's words, and the results say not ok",
+    `${await statusKind()}: ${await status()} | ${json(r.microphone)}`,
+  );
+  await fake(() => {
+    window.__fake.plug("Fake Audio Input 2");
+    window.__fake.plug("Fake Audio Input 1");
+  });
+  r = await waitResults((x) => x.voice?.state === "running" && x.voice?.mic?.standIn === false && x.voice?.mic?.how === "saved-id", 5000);
+  check(r.voice?.state === "running" && r.voice.mic?.how === "saved-id", "the microphones are back: the headset's is used again", json(r.voice?.mic));
+  await press("btnMic", /^(?!Checking the microphone)/);
+  r = await results();
+  check(
+    (await status()) === "Microphone checked." && (await statusKind()) === "ok" && r.microphone?.ok === true,
+    "and Check the microphone is ok again",
+    `${await status()} | ${json(r.microphone)}`,
+  );
 }
 
 // ---- 13 · overlapping operations ----
@@ -1050,7 +1205,11 @@ async function longTone(app) {
   });
   const t0 = Date.now();
   await press("btnLongStart", /Long check running/);
-  check(/test tone/.test(await text("#voiceStatus")), "step 2 says the meeting hears a test tone", await text("#voiceStatus"));
+  check(
+    /test tone/.test(await text("#voiceStatus")) && (await page.locator("#voiceStatus").getAttribute("data-kind")) === "warn",
+    "step 2 says, in yellow, that the meeting hears a test tone",
+    await text("#voiceStatus"),
+  );
   check(await page.locator("#btnLongStop").isEnabled(), "Stop and check is on while the check runs");
   check(await page.locator("#micSelect").isDisabled(), "the device choices wait while a check runs");
   await sleep(Math.max(0, t0 + 3000 - Date.now()));
@@ -1148,6 +1307,12 @@ async function routeChoice(app) {
   );
   let p = await peak(1500);
   check(p > 0.01, "and reaches the cable", `peak ${p}`);
+  const off = await graphOffCable(app);
+  check(
+    off.open === 1 && off.connects.length === 0,
+    "nothing is connected to the graph context's own output (the earpiece): the user does not hear their own voice",
+    json(off),
+  );
   await press("btnMeasure", /Delay measured/, "#status", 40000);
   r = await results();
   const d = r.checks.delay.at(-1) ?? {};
@@ -1226,11 +1391,10 @@ async function cableGone(app) {
 // ---- 15 · Copy results ----
 
 async function copyResults(app) {
-  const { page, press, text } = app;
-  await press("btnCopy", /\S/, "#copyInfo");
+  const { page, press, text, results } = app;
+  const { copied } = await leakCheck(app, "after every scenario");
   const copyInfo = await text("#copyInfo");
   check(/^Copied/.test(copyInfo), "Copy results copies by itself (not the fallback)", copyInfo);
-  const copied = await page.evaluate(() => navigator.clipboard.readText().catch(() => ""));
   const parsed = JSON.parse(copied || "{}");
   check(
     parsed.schema === 2 &&
@@ -1247,35 +1411,65 @@ async function copyResults(app) {
     "the copied results hold the build, the key's check, Connect only, the voice, the checks and the checklist",
     copied.slice(0, 600),
   );
-  const listed = await page.evaluate(async () =>
-    (await navigator.mediaDevices.enumerateDevices()).flatMap((d) => [d.deviceId, d.groupId]).filter((id) => id && !["default", "communications"].includes(id)),
-  );
-  // Chromium's own ids of the fake devices too (the page sees only the fake's).
-  const native = await page.evaluate(() => Object.values(window.__fake.realIds));
-  const shared = copied || (await text("#results")); // what would be copied by hand if the clipboard failed
-  const secrets = [
-    ...new Set([...listed, ...native, ...Object.values(app.ids), "fake-cable-output", "fake-cable-2", "fake-headset", "fake-laptop", "fake-cable"]),
-    "Fake Audio Input",
-    "Fake Default",
-    "Fake Headset",
-    ...Object.values(KEYS),
-    TOKEN,
-    USER_ID,
-    GROUP_ID,
-  ];
-  const leaks = secrets.filter((secret) => shared.includes(secret));
+  check(copied.includes(CABLE_IN_LABEL), "they keep VB-CABLE's own names");
   check(
-    listed.length > 0 && leaks.length === 0 && !/sk_live|access_token|deviceId/.test(shared),
-    "the copied results hold no key, token, Sanas ids, device ids, group ids or device names",
-    leaks.join("\n") || `${listed.length} ids to look for`,
+    (parsed.errors ?? []).some((e) => /HTTP 500/.test(e.message) && e.message.includes("[redacted]")),
+    "the portal's failure is among the errors, its id hidden",
+    json(parsed.errors),
   );
-  check(shared.includes("CABLE Input (VB-Audio Virtual Cable)"), "they keep VB-CABLE's own names");
   const gate = await page.$$eval("#gateList li", (lis) => lis.map((li) => [li.dataset.kind, li.textContent]));
   check(
     gate.length === 9 && gate.every(([kind, t]) => ["ok", "error", "info", "warn"].includes(kind) && /^[✓✗…!] · /.test(t)),
     "step 3 shows the Session B checklist",
     json(gate),
   );
+
+  // Copied by hand: a selection of the results stays (they used to be redrawn every second while the voice runs).
+  const selected = () => page.evaluate(() => getSelection().toString());
+  await page.click("details:not(.advanced) summary"); // Show the results
+  const before = await page.evaluate(() => {
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector("#results"));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    return getSelection().toString();
+  });
+  await sleep(1500);
+  check(before.length > 1000 && (await selected()) === before, "a selection of the results stays while it is copied by hand", `${before.length} → ${(await selected()).length}`);
+
+  // The clipboard refuses: the results alone are selected (never the whole page, whose step 2 shows the
+  // devices' real names), and the page asks for Ctrl+C only.
+  await page.evaluate(() => {
+    getSelection().removeAllRanges();
+    Object.defineProperty(navigator.clipboard, "writeText", {
+      configurable: true,
+      value: () => Promise.reject(new DOMException("Write permission denied.", "NotAllowedError")),
+    });
+    document.querySelector("#copyInfo").textContent = "";
+  });
+  await press("btnCopy", /\S/, "#copyInfo");
+  const info = await text("#copyInfo");
+  let sel = await selected();
+  const pre = await text("#results");
+  check(
+    /Ctrl\+C/.test(info) && !/Ctrl\+A/.test(info) && sel === pre && sel.length > 1000,
+    "when the clipboard refuses, the results alone are selected, for Ctrl+C",
+    `${info} | selected ${sel.length} of ${pre.length} characters`,
+  );
+  check(!/Fake Audio|Fake Headset|[0-9a-f]{64}/i.test(sel), "and the selection holds no device names or ids");
+  await sleep(1500);
+  sel = await selected();
+  check(sel === pre, "and it stays selected", `${sel.length} characters selected`);
+
+  // Back to normal: once nothing is selected and the results are closed, they are drawn again.
+  await page.evaluate(() => {
+    delete navigator.clipboard.writeText; // the browser's own again
+    getSelection().removeAllRanges();
+    document.querySelector("#results").closest("details").open = false;
+  });
+  const at = (await results()).at;
+  const later = await app.waitResults((x) => x.at !== at, 3000);
+  check(later.at !== at, "the results are drawn again once nothing is selected", `${at} → ${later.at}`);
 }
 
 // ---- 4 · settings ----
@@ -1326,15 +1520,49 @@ async function settings(app) {
   await choose("#micSelect", ids.in1, /^Microphone switched\.$/);
   r = await results();
   check(r.voice?.mic?.how === "saved-id" && (await app.settingsFile())?.micLabel === IN1, "back to the headset's microphone, saved", r.voice?.mic?.how);
+
+  // The output: CABLE Input picked in the list is saved (its id and name) and used by its id after a
+  // relaunch; Automatic saves no output.
+  const lastSaved = async () => JSON.parse((await fake(() => window.__fake.settingsSaved.at(-1))) ?? "{}");
+  await choose("#outSelect", ids.cableIn, /^(?!Switching where your voice goes)/);
+  let out = await lastSaved();
+  check(
+    out.cableDeviceId === ids.cableIn && out.cableLabel === CABLE_IN_LABEL && (await app.status()) === "Switched where your voice goes.",
+    "choosing CABLE Input saves its id and name (settings_save)",
+    `${await app.status()} | ${json(out)}`,
+  );
+  await reload();
+  r = await waitResults((x) => x.voice?.state === "running" && x.voice?.output?.how === "saved-id", 5000);
+  check(
+    r.voice?.output?.how === "saved-id" && (await page.$eval("#outSelect", (s) => s.value)) === ids.cableIn,
+    "after a relaunch the saved output is used by its id, and the list shows it",
+    json(r.voice?.output?.how),
+  );
+  await choose("#outSelect", "", /^(?!Switching where your voice goes)/);
+  out = await lastSaved();
+  r = await waitResults((x) => x.voice?.state === "running" && x.voice?.output?.how === "auto", 5000);
+  check(
+    out.cableDeviceId === "" && out.cableLabel === "" && r.voice?.output?.how === "auto",
+    "choosing Automatic saves no output, and CABLE Input is found by itself",
+    `${json(out)} ${r.voice?.output?.how}`,
+  );
 }
 
 // ---- 9 · sink fallbacks ----
 
 async function sinkFallbacks(app) {
-  const { fake, waitResults, peak, reload, setFlags, press, text, lastRecovery } = app;
+  const { ids, fake, waitResults, peak, reload, setFlags, press, text, status, statusKind, choose, lastRecovery, VOICE_TEXTS } = app;
   const methods = (r) => (r.voice?.output?.tried ?? []).map((t) => t.method);
   const oks = (r) => (r.voice?.output?.tried ?? []).map((t) => t.ok);
   const permissionCalls = () => fake(() => window.__fake.permissionCalls);
+  const nothingOnTheEarpiece = async (what) => {
+    const off = await graphOffCable(app);
+    check(
+      off.open === 1 && off.connects.length === 0,
+      `${what} nothing is connected to the graph context's own output (the earpiece), so the user does not hear their own voice`,
+      json(off),
+    );
+  };
 
   // (a) the context route refused: the audio element
   await setFlags({ refuseContextSink: true });
@@ -1351,7 +1579,14 @@ async function sinkFallbacks(app) {
   check(p > 0.01, "(a) the voice reaches the cable", `peak ${p}`);
   check((await permissionCalls()) === 0, "(a) the permission fix is not needed");
   check(r.voice?.output?.contextSink === "mic-sibling", "(a) the graph's context runs on the headset's earpiece", r.voice?.output?.contextSink);
+  await nothingOnTheEarpiece("(a)");
   check(/an audio element \(fallback\)/.test(await text("#voiceInfo")), "(a) step 2 says so", await text("#voiceInfo"));
+  // Chromium names the device in the refusal ("access to the device <64-hex id> is not permitted."): kept, id hidden.
+  check(
+    tried[0]?.errorMessage === "access to the device [redacted] is not permitted." && !/[0-9a-f]{64}/i.test(await text("#results")),
+    "(a) the refusal's text is kept in the results without the device id",
+    json(tried[0]),
+  );
 
   // (f) the element route lost: rebuilt on the same route only
   const n = r.voice.recoveries.length;
@@ -1362,6 +1597,7 @@ async function sinkFallbacks(app) {
   check((r.voice?.output?.routeChanges ?? []).length === 0, "(f) no route change", json(r.voice?.output?.routeChanges));
   p = await peak(1500);
   check(p > 0.01, "(f) the voice is back", `peak ${p}`);
+  await nothingOnTheEarpiece("(f)");
 
   // (b) both refused, the permission fix helps
   await setFlags({ refuseContextSink: true, refuseElementSink: true, permissionFixes: true });
@@ -1394,6 +1630,13 @@ async function sinkFallbacks(app) {
   p = await peak(1000);
   check(p < 1e-4, "(c) nothing reaches the cable", `peak ${p}`);
   check(r.gate.find((g) => g.row === "Voice into CABLE Input")?.status === "fail", "(c) the checklist's row fails");
+  // An output picked meanwhile is taken (saved, and used by every try), though nothing reaches the meeting yet.
+  await choose("#outSelect", ids.cableIn, /^(?!Switching where your voice goes)/);
+  check(
+    (await status()) === `Switched where your voice goes.${VOICE_TEXTS.notReaching}` && (await statusKind()) === "warn",
+    "(c) an output picked while nothing can be sent: switched, and the voice is not reaching the meeting yet",
+    `${await statusKind()}: ${await status()}`,
+  );
 
   // (e) the user fixed it: Check the microphone tries again (no second permission fix on this page)
   await setFlags({});
@@ -1404,6 +1647,14 @@ async function sinkFallbacks(app) {
   await press("btnMic", /Microphone checked/);
   r = await waitResults((x) => x.voice?.state === "running", 5000);
   check(r.voice?.state === "running" && (await permissionCalls()) === 1, "(e) Check the microphone starts the voice again, without a second permission fix", `${r.voice?.state}`);
+  check(r.voice?.output?.how === "saved-id", "(e) on the output picked in (c)", r.voice?.output?.how);
+  await choose("#outSelect", "", /^(?!Switching where your voice goes)/);
+  r = await waitResults((x) => x.voice?.state === "running" && x.voice?.output?.how === "auto", 5000);
+  check(
+    (await status()) === "Switched where your voice goes." && (await statusKind()) === "ok" && r.voice?.output?.how === "auto",
+    "(e) back to Automatic while the voice runs: switched",
+    `${await statusKind()}: ${await status()}`,
+  );
 
   // (d) both refused, the permission fix fails
   await setFlags({ refuseContextSink: true, refuseElementSink: true, permissionFails: true });
@@ -1451,6 +1702,7 @@ async function main() {
   const { encodeWav } = await load("src/core/wav.js");
   const { WARNINGS } = await load("src/core/device-choice.js");
   const { CHECK_TEXTS } = await load("src/audio/measure.js");
+  const { VOICE_TEXTS } = await load("src/ui/voice.js");
   const { startSpikeServer } = await load("spike/serve.mjs");
 
   // Fake microphone: ~10 s of speech-like audio (Chromium loops the file) with −70 dBFS noise, so its pauses
@@ -1467,9 +1719,9 @@ async function main() {
   const t0 = Date.now();
   const only = new Set((process.env.ONLY || "dev,gesture,app").split(",").map((x) => x.trim()));
   try {
-    if (only.has("dev")) await devMode(browser, base, CHECK_TEXTS);
+    if (only.has("dev")) await devMode(browser, base, CHECK_TEXTS, VOICE_TEXTS);
     if (only.has("gesture")) await gesture(noAutoplay, base, BUILD);
-    if (only.has("app")) await appMode(browser, base, WARNINGS);
+    if (only.has("app")) await appMode(browser, base, WARNINGS, VOICE_TEXTS);
   } finally {
     await browser.close();
     await noAutoplay.close();
