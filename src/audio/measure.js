@@ -117,9 +117,15 @@ export const CHECK_TEXTS = Object.freeze({
   voiceStopped: "The voice was stopped, so the check ended early.",
   notBack: "The recording stopped before the end of the check, so the check ended early.",
   defaultOutput: "Windows switched its default playback device",
-  // After an early end: what to do next (the check with your voice is Session B step 8, the tone check step 7).
-  runAgain: (mode) =>
-    mode === "mic" ? "Start the check with your voice again (Session B step 8)." : "Start the long check again (Session B step 7).",
+  // After an early end: what to do next, by the Session B step the check belongs to (ui/checks.js againText's
+  // rule): the check with your voice is step 8, the hour-long tone check step 7; a shorter tone check (step 7.6's
+  // 30 minutes) is run again as it was, not the whole of step 7.
+  runAgain: (mode, minutes = null) =>
+    mode === "mic"
+      ? "Start the check with your voice again (Session B step 8)."
+      : typeof minutes === "number" && minutes < 60
+        ? "Run this check again."
+        : "Start the long check again (Session B step 7).",
   analysing: (sec) => `Analysing (about ${sec} s)…`,
   runsFull: (sec) => `There were too many short silences to keep them all: drop-outs were checked for the first ${formatClock(sec)} only.`,
   defaultOutputGap: (atSec) => `The sound stopped at ${formatClock(atSec)} when Windows switched its default playback device.`,
@@ -1207,7 +1213,7 @@ class LongCheck {
     if (!this.finishing) {
       if (note) {
         // What happened, then what to do next: the page shows it, and the Gate 1 gaps row starts with it.
-        this.earlyEnd = { note: `${note} ${CHECK_TEXTS.runAgain(this.mode)}`, why };
+        this.earlyEnd = { note: `${note} ${CHECK_TEXTS.runAgain(this.mode, this.minutes)}`, why };
         this.log("warn", `check long ended early ${why}`);
       }
       if (!this.builtOnce) this.firstBuild.reject(named("AbortError", note ?? CHECK_TEXTS.longNoStart));

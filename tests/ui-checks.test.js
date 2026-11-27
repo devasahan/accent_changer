@@ -143,6 +143,20 @@ test("ChecksView.longDone: only the verdict line takes the verdict's colour; the
   assert.equal(info.dataset.kind, "error");
 });
 
+test("an early end: the page says the runtime's next step once, and it names the step againText would (65 and 30 minutes, the voice)", async () => {
+  const { CHECK_TEXTS } = await import("../src/audio/measure.js");
+  const stepOf = (text) => text?.match(/step (\d+(?:\.\d+)?)/)?.[1] ?? null;
+  for (const [mode, minutes] of [["tone", 65], ["tone", 30], ["mic", 5]]) {
+    const next = CHECK_TEXTS.runAgain(mode, minutes);
+    const note = `${CHECK_TEXTS.cableLost} ${next}`;
+    const result = { mode, minutesAsked: minutes, verdict: "fail", reasons: [note], endedEarly: { why: "cable-ended", note } };
+    const head = longDone(result).head;
+    assert.ok(head.endsWith(next), head);
+    assert.equal(head.match(/again/g).length, 1, head);
+    assert.equal(stepOf(next), stepOf(againText(result)), `${mode} ${minutes} min: ${next} / ${againText(result)}`);
+  }
+});
+
 test("U13: a check that measured nothing or ended early says what to do next, once", () => {
   const toneLost = "The test tone stopped (Windows' default playback device went away or failed), so the check ended early.";
   // The hour-long tone check is Session B step 7; the check with your voice is step 8.

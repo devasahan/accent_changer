@@ -850,8 +850,8 @@ async function answerStop(node, start, sec, extra = {}) {
   node.port.emit({ type: "done", frame });
 }
 
-/** An early end's reason as the result gives it: what happened, then what to do next. */
-const early = (text, mode = "tone") => `${text} ${CHECK_TEXTS.runAgain(mode)}`;
+/** An early end's reason as the result gives it: what happened, then what to do next (these checks ask 10 minutes). */
+const early = (text, mode = "tone", minutes = 10) => `${text} ${CHECK_TEXTS.runAgain(mode, minutes)}`;
 
 test("ending early for a reason nobody chose fails the check, with that reason first", async () => {
   // Four clean seconds of a 10-minute check, then the end comes from outside. Each must not pass.
@@ -872,7 +872,7 @@ test("ending early for a reason nobody chose fails the check, with that reason f
     assert.equal(r.verdict, "fail", why);
     assert.deepEqual(r.reasons, [early(text)], why);
     assert.deepEqual(r.endedEarly, { why, note: early(text) }, why);
-    assert.ok(r.reasons[0].endsWith("Start the long check again (Session B step 7)."), why);
+    assert.ok(r.reasons[0].endsWith("Run this check again."), why);
     assert.equal(r.recordedSec, 4.4, why);
     assert.equal(r.minutesAsked, 10, why);
     assert.ok(!r.notes.includes(text), `${why}: the reason is not repeated in the notes`);
@@ -905,6 +905,23 @@ test("ending early: the reason goes before what the check found; a check that fo
   assert.equal(r.reasons[0], early(CHECK_TEXTS.cableLost));
   assert.deepEqual(r.endedEarly, { why: "cable-ended", note: early(CHECK_TEXTS.cableLost) });
   assert.ok(r.reasons.slice(1).some((x) => /never reached/.test(x)), JSON.stringify(r.reasons));
+});
+
+test("ending early: the next step is the Session B step the check belongs to (the hour's tone check is step 7; a shorter one, such as step 7.6's 30 minutes, is run again)", async () => {
+  for (const [minutes, next] of [
+    [65, "Start the long check again (Session B step 7)."],
+    [60, "Start the long check again (Session B step 7)."],
+    [30, "Run this check again."],
+  ]) {
+    const s = setup();
+    const t = await startTone(s, minutes);
+    seconds(t.node, t.start, 1, 4);
+    cableTracks[cableTracks.length - 1].dispatchEvent(new Event("ended"));
+    await answerStop(t.node, t.start, 4.4);
+    const r = await t.handle.done;
+    assert.equal(r.endedEarly?.note, `${CHECK_TEXTS.cableLost} ${next}`, `${minutes} min`);
+    assert.equal(r.reasons[0], r.endedEarly.note, `${minutes} min`);
+  }
 });
 
 test("ending early: the check with your voice says to start it again (Session B step 8)", async () => {
