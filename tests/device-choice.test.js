@@ -212,6 +212,29 @@ test("chooseMic: nothing saved → Windows' default, else the first usable one",
   assert.equal(comms.how, "first");
 });
 
+test("chooseMic: an empty microphone from before is no target", () => {
+  for (const wanted of [{ deviceId: "", label: "" }, { deviceId: "", label: "   " }, {}]) {
+    const r = chooseMic(INPUTS, { wanted });
+    assert.deepEqual([r.entry.deviceId, r.how, r.standIn, r.wantedMissing], [ID.headsetMic, "default", false, false], JSON.stringify(wanted));
+  }
+});
+
+test("chooseMic and chooseOutput: two identical headsets are told apart by the exact label", () => {
+  // Windows numbers the second headset of the same model "(2- …)"; normalizeLabel() drops the number, so with a
+  // stale id only the exact label tells them apart.
+  const twins = [mic("id-first", "Headset Microphone (Jabra EVOLVE 20 MS)"), mic("id-second", "Headset Microphone (2- Jabra EVOLVE 20 MS)")];
+  for (const [label, id] of [
+    ["Headset Microphone (2- Jabra EVOLVE 20 MS)", "id-second"],
+    ["Headset Microphone (Jabra EVOLVE 20 MS)", "id-first"],
+  ]) {
+    const r = chooseMic(twins, { saved: { deviceId: "stale", label } });
+    assert.deepEqual([r.entry.deviceId, r.how], [id, "saved-label"], label);
+  }
+  const outs = [out("o-first", "Headset Earphone (Jabra EVOLVE 20 MS)"), out("o-second", "Headset Earphone (2- Jabra EVOLVE 20 MS)")];
+  const o = chooseOutput(outs, { saved: { deviceId: "stale", label: "Headset Earphone (2- Jabra EVOLVE 20 MS)" } });
+  assert.deepEqual([o.entry.deviceId, o.how], ["o-second", "saved-label"]);
+});
+
 test("chooseMic: the saved microphone is missing → a stand-in", () => {
   const gone = INPUTS.filter((d) => d.deviceId !== ID.arrayMic);
   const r = chooseMic(gone, { saved: { deviceId: ID.arrayMic, label: "Microphone Array (Realtek(R) Audio)" } });
@@ -275,6 +298,8 @@ test("chooseOutput: automatic, a saved override by id or label, a missing overri
   assert.deepEqual(noneMissing, { entry: null, how: "none", savedMissing: true });
   const pseudo = chooseOutput(OUTPUTS, { saved: { deviceId: "default", label: "Default - Headset Earphone (2- USB Audio Device)" } });
   assert.equal(pseudo.entry.deviceId, ID.earphone, "never the pseudo-device itself");
+  const german = chooseOutput(OUTPUTS, { saved: { deviceId: "default", label: "Standard - Headset Earphone (2- USB Audio Device)" } });
+  assert.deepEqual([german.entry.deviceId, german.how], [ID.earphone, "saved-label"], "a label saved from a pseudo-device, in German");
 });
 
 // ---------- names in results ----------

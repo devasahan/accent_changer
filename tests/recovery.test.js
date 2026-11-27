@@ -323,6 +323,17 @@ test("fault: the microphone missing from the device list counts as gone while it
   assert.equal(r.outage.devicesBackAtMs, 300);
 });
 
+test("fault: devicesBackAtMs is the first time both are back; later device lists do not move it", () => {
+  const r = running();
+  r.event(ev.closed, 0);
+  r.event(ev.devices(false, true), 10);
+  r.event(ev.fail("rebuild", sinkError("missing")), 50);
+  r.event(ev.devices(true, true), 300);
+  r.event(ev.fail("rebuild", sinkError("transient")), 340);
+  r.event(ev.devices(true, true), 500);
+  assert.equal(r.outage.devicesBackAtMs, 300);
+});
+
 test("fault: a busy microphone during a fault is retried in 250 ms, not 5 s", () => {
   const r = running();
   r.event(ev.micEnded, 0);
@@ -375,6 +386,27 @@ test("duplicate events while an op is pending produce nothing", () => {
   assert.deepEqual(r.event(ev.verify, 6), [], "a stale timer");
   assert.deepEqual(r.event(ev.ok("resume"), 7), [], "the result of an op that is not in flight");
   assert.equal(r.outage.attempts, 1);
+});
+
+test("no heartbeat after an op: the context is rebuilt, also when a microphone was asked for meanwhile", () => {
+  const r = running();
+  r.event(ev.closed, 0);
+  r.event(ev.ok("rebuild"), 300);
+  assert.deepEqual(r.event({ type: "mic-request", reason: "user" }, 320), []);
+  assert.deepEqual(r.event(ev.verify, 900), [retryIn(250)]);
+  assert.deepEqual(r.event(ev.retry, 1150), [rebuild(true)], "not a reopen alone: the context did not render");
+});
+
+test("only a heartbeat that says routed: true proves the voice flows", () => {
+  const r = running();
+  r.event(ev.closed, 0);
+  r.event(ev.ok("rebuild"), 300);
+  assert.equal(r.phase, "verifying");
+  for (const hb of [{ type: "heartbeat" }, { type: "heartbeat", routed: "yes" }, { type: "heartbeat", routed: 1 }, ev.unrouted]) {
+    assert.deepEqual(r.event(hb, 350), [], JSON.stringify(hb));
+  }
+  assert.equal(r.phase, "verifying");
+  assert.equal(r.event(ev.heartbeat, 400)[1].kind, "back");
 });
 
 test("stale timers are ignored in the other phases", () => {
@@ -658,6 +690,116 @@ test("change: a fault during it that also loses the microphone is micToo", () =>
   const record = r.event(ev.heartbeat, 760)[1].record;
   assert.equal(record.micToo, true);
   assert.equal(record.cause, "render-error");
+});
+
+test("change: a microphone that fails while the old one stays live, after a fault came in: the fault is rebuilt with the live microphone", () => {
+  // The user picks microphone B, which another app holds. While its reopen runs, the context reports an error.
+  // The reopen fails, but microphone A is still live: the rebuild for the fault keeps A (reopenMic false)
+  // instead of trying the busy B again and again, and the page hears the switch failed once the voice is back.
+  const r = running();
+  assert.deepEqual(r.event({ type: "mic-request", reason: "user" }, 10000), [{ do: "reopen-mic", mode: "full" }]);
+  assert.deepEqual(brief(r.event(ev.error, 10050)), [{ do: "report", kind: "lost" }]);
+  const busy = micError("busy", "NotReadableError");
+  assert.deepEqual(r.event(ev.fail("reopen-mic", busy, { kept: true }), 10100), [rebuild(false)]);
+  assert.equal(r.outage.needMic, false);
+  assert.deepEqual(r.event(ev.ok("rebuild"), 10400), [SET_VERIFY]);
+  const back = r.event(ev.heartbeat, 10450);
+  assert.deepEqual(brief(back), [CLEAR_VERIFY, { do: "report", kind: "back" }, { do: "report", kind: "change-failed" }]);
+  assert.equal(back[2].error, busy, "after back: the page shows the voice as running on change-failed");
+  assert.equal(back[1].record.cause, "render-error");
+  assert.deepEqual(back[1].record.steps, ["reopen-mic", "rebuild"]);
+  assert.equal(back[1].record.micToo, false);
+  assert.equal(back[1].record.serviceBackAtMs, 10100);
+  assert.equal(back[1].record.waitMs, 50, "from the loss to the rebuild: the failed switch was in the way");
+});
+
+test("change: a blocked microphone that kept the old one never holds up the fault's recovery", () => {
+  const r = running();
+  r.event({ type: "mic-request", reason: "user" }, 0);
+  r.event(ev.closed, 30);
+  const blocked = micError("blocked", "NotAllowedError");
+  assert.deepEqual(r.event(ev.fail("reopen-mic", blocked, { kept: true }), 60), [rebuild(false)]);
+  assert.equal(r.phase, "recovering", "not blocked: the old microphone works");
+  r.event(ev.ok("rebuild"), 300);
+  const back = r.event(ev.heartbeat, 350);
+  assert.deepEqual(brief(back), [CLEAR_VERIFY, { do: "report", kind: "back" }, { do: "report", kind: "change-failed" }]);
+  assert.equal(back[2].error, blocked);
+});
+
+test("a microphone opened after a failed switch makes the switch old news: no change-failed when back", () => {
+  const r = running();
+  r.event({ type: "mic-request", reason: "user" }, 0);
+  r.event(ev.error, 20);
+  assert.deepEqual(r.event(ev.fail("reopen-mic", micError("busy"), { kept: true }), 40), [rebuild(false)]);
+  // The user picks microphone C while the rebuild runs; it opens.
+  assert.deepEqual(r.event({ type: "mic-request", reason: "user" }, 60), []);
+  assert.deepEqual(r.event(ev.ok("rebuild"), 300), [{ do: "reopen-mic", mode: "recover" }]);
+  assert.deepEqual(r.event(ev.ok("reopen-mic"), 400), [SET_VERIFY]);
+  assert.deepEqual(brief(r.event(ev.heartbeat, 450)), [CLEAR_VERIFY, { do: "report", kind: "back" }]);
+  // The same when C is asked for while B's reopen runs: the fault's rebuild then opens C itself.
+  const q = running();
+  q.event({ type: "mic-request", reason: "user" }, 0);
+  q.event(ev.error, 20);
+  assert.deepEqual(q.event({ type: "mic-request", reason: "user" }, 30), []);
+  assert.deepEqual(q.event(ev.fail("reopen-mic", micError("busy"), { kept: true }), 40), [rebuild(true)]);
+  assert.deepEqual(q.event(ev.ok("rebuild"), 300), [SET_VERIFY]);
+  assert.deepEqual(brief(q.event(ev.heartbeat, 350)), [CLEAR_VERIFY, { do: "report", kind: "back" }]);
+});
+
+test("a microphone request served during the first start or a fault, failing with the old microphone live: verified, not retried", () => {
+  // The first start: the user picks a microphone while it runs.
+  let r = new OutputRecovery();
+  r.start(0);
+  assert.deepEqual(r.event({ type: "mic-request", reason: "user" }, 100), []);
+  assert.deepEqual(r.event(ev.ok("rebuild"), 300), [{ do: "reopen-mic", mode: "full" }]);
+  const busy = micError("busy");
+  assert.deepEqual(r.event(ev.fail("reopen-mic", busy, { kept: true }), 350), [SET_VERIFY]);
+  const started = r.event(ev.heartbeat, 400);
+  assert.deepEqual(brief(started), [CLEAR_VERIFY, { do: "report", kind: "started" }, { do: "report", kind: "change-failed" }]);
+  assert.equal(started[2].error, busy);
+  assert.deepEqual(r.startRecord.steps, ["rebuild", "reopen-mic"]);
+  // A fault: the wanted microphone came back while a stand-in fed the cable, but another app holds it.
+  r = running();
+  r.event(ev.suspended, 0);
+  assert.deepEqual(r.event({ type: "mic-request", reason: "wanted-back" }, 20), []);
+  assert.deepEqual(r.event(ev.ok("resume"), 50), [{ do: "reopen-mic", mode: "recover" }]);
+  assert.deepEqual(r.event(ev.fail("reopen-mic", busy, { kept: true }), 90), [SET_VERIFY]);
+  const back = r.event(ev.heartbeat, 120);
+  assert.deepEqual(brief(back), [CLEAR_VERIFY, { do: "report", kind: "back" }, { do: "report", kind: "change-failed" }]);
+  assert.deepEqual(back[1].record.steps, ["resume", "reopen-mic"]);
+  // A failed reopen-mic without kept during a fault still reopens the microphone.
+  r = running();
+  r.event(ev.micEnded, 0);
+  assert.deepEqual(r.event(ev.fail("reopen-mic", busy, { kept: false }), 40), [retryIn(250)]);
+  assert.deepEqual(r.event(ev.retry, 290), [{ do: "reopen-mic", mode: "recover" }]);
+});
+
+test("change: only a reopen can keep the old microphone: a failed rebuild is a failure whatever it says", () => {
+  // A rebuild tears the old context down first, so nothing it leaves can still feed the cable.
+  const r = running();
+  r.event({ type: "rebuild-request", reason: "output" }, 0);
+  const acts = r.event(ev.fail("rebuild", sinkError("transient"), { kept: true }), 100);
+  assert.deepEqual(brief(acts), [{ do: "report", kind: "lost" }, retryIn(250)]);
+  assert.equal(acts[0].outage.cause, "change-failed");
+});
+
+test("change: one that turns into a fault keeps none of its own timings in the fault's record", () => {
+  // A route change whose rebuild works but plays nothing: a fault ("change-failed") from the missing heartbeat.
+  const r = running();
+  r.event({ type: "rebuild-request", reason: "route" }, 0);
+  r.event(ev.devices(false, true), 100);
+  r.event(ev.devices(true, true), 200);
+  r.event(ev.ok("rebuild"), 300);
+  assert.equal(brief(r.event(ev.verify, 900))[0].kind, "lost");
+  assert.deepEqual(r.event(ev.retry, 1150), [rebuild(false)]);
+  r.event(ev.ok("rebuild"), 1400);
+  const record = r.event(ev.heartbeat, 1450)[1].record;
+  assert.equal(record.lostAtMs, 900);
+  assert.equal(record.serviceBackAtMs, 1150, "the fault's own first op that worked, not the change's (at 0)");
+  assert.equal(record.appMs, 300);
+  assert.equal(record.waitMs, 250);
+  assert.equal(record.devicesGoneAtMs, null, "the cable went and came back during the change, not the fault");
+  assert.equal(record.devicesBackAtMs, null);
 });
 
 test("change: a rebuild request while a fault's rebuild is pending → one more rebuild after it", () => {

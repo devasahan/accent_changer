@@ -253,7 +253,7 @@ test("EnvelopeStream: the window must be a whole number of hops", () => {
 test("ToneCheck 1: a clean 120 s tone gives no events, its level and no drift", () => {
   const { t, events } = check(cableTone(120));
   assert.deepEqual(events, []);
-  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 0, levels: 0, steps: 0 });
+  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 0, levels: 0, steps: 0, noises: 0 });
   assert.equal(t.ticks, 0);
   assert.equal(t.locked, true);
   near(t.levelDb, -12, 0.1, "levelDb");
@@ -317,6 +317,10 @@ test("ToneCheck 5: 300 ms of zeros is one gap; 40 ms is one dropout; neither is 
   assert.equal(t.ticks, 0);
   assert.equal(events[0].kind, "dropout");
   near(events[0].holeMs, 40, 0.5, "dropout length");
+  // 95 ms of zeros touch 10 blocks: still a drop-out (blocks with zeros are not "other sound").
+  ({ t, events } = check(zeroFill(cableTone(30, 50), 10 * SR, 0.095 * SR)));
+  assert.deepEqual(events.map((e) => e.kind), ["dropout"]);
+  near(events[0].holeMs, 95, 0.5, "dropout length");
 });
 
 test("ToneCheck 5b: a lost tone (no zeros) for 300 ms is a gap too", () => {
@@ -368,7 +372,9 @@ test("ToneCheck 6b: a level that comes back before it settles is no level event"
 });
 
 test("ToneCheck 6c: a tone that drops 26 dB at once and stays there is a step and a new level, not a gap", () => {
-  for (const at of [10 * SR, 938 * B]) {
+  // Half-way through a block, on a block edge, and 10 samples into a block (that block is lost and not clean
+  // tone; the 9 quiet blocks after it must not count as lost with it, or 10 blocks would make a gap).
+  for (const at of [10 * SR, 938 * B, 938 * B + 10]) {
     const x = realistic(gainStep(tone({ seconds: 30 }), at, -26), 20);
     const { t, events } = check(x);
     assert.equal(t.counts.gaps, 0, `at ${at}: ${JSON.stringify(events)}`);
@@ -430,13 +436,14 @@ test("ToneCheck: finish() counts the disturbance still going on when the check e
   x.set(cableTone(30, 26));
   const t = new ToneCheck();
   pushAll(t, x);
-  assert.equal(t.counts.gaps, 0, "nothing ends it before the check does");
+  assert.deepEqual(t.takeEvents(), [], "no event yet: nothing has ended it");
+  assert.equal(t.counts.gaps, 1, "the counts have it as it stands: a worklet's last counts are right without finish()");
   assert.equal(t.open.kind, "gap", "it shows while it goes on");
   near(t.open.holeMs, 10000, 1, "open gap so far");
   assert.equal(t.levelDb, null, "the tone is lost: no level");
   near(t.lockDb, -12, 0.1, "lockDb");
   t.finish();
-  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 1, levels: 0, steps: 0 });
+  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 1, levels: 0, steps: 0, noises: 0 });
   const events = t.takeEvents();
   assert.equal(events.length, 1);
   assert.equal(events[0].kind, "gap");
@@ -463,9 +470,10 @@ test("ToneCheck: finish() at the end of a lost tone without zeros, a drop, a lev
   x = dropFrames(cableTone(30, 29), 2000 * B, 480).subarray(0, 2001 * B);
   t = new ToneCheck();
   pushAll(t, x);
-  assert.equal(t.counts.skips, 0);
+  assert.deepEqual(t.takeEvents(), []);
+  assert.equal(t.counts.skips, 1, "counted as it stands");
   t.finish();
-  assert.equal(t.counts.skips, 1);
+  assert.equal(t.counts.skips, 1, "and once only");
   near(t.takeEvents()[0].phaseStepDeg, 112.5, 5, "phase step");
   // Zeros from 500 frames before the last whole block to the end, 500 frames into the next: measured to the end,
   // 1000 frames (20.8 ms) are a drop-out, not a 10 ms hole.
@@ -567,6 +575,186 @@ test("ToneCheck 9: silence, then the tone: locked only after it starts, nothing 
   assert.equal(events[0].kind, "skip");
   assert.ok(events[0].atFrame > 32 * SR + 4 * SR, "the later drop, on the global frame count");
   assert.equal(t.counts.skips, 1);
+});
+
+/** The tone with white noise of `dbfs` added from `fromSec` for `seconds` (another app playing into the cable). */
+function noisyTone(totalSec, fromSec, seconds, dbfs = -20, seed = 40) {
+  const x = cableTone(totalSec, seed);
+  const noise = whiteNoise(Math.round(seconds * SR), seed + 1, dbfs);
+  const from = Math.round(fromSec * SR);
+  for (let i = 0; i < noise.length && from + i < x.length; i++) x[from + i] += noise[i];
+  return x;
+}
+
+test("ToneCheck: other sound mixed into the tone for 100 ms or more is noise, not one click", () => {
+  // 5 s of noise at −20 dBFS over the tone: it never drops 20 dB and has no zeros.
+  let { t, events } = check(noisyTone(16, 10, 5));
+  assert.deepEqual(events.map((e) => e.kind), ["noise"]);
+  assert.equal(t.counts.noises, 1);
+  assert.equal(t.ticks, 0, "not a tick");
+  assert.equal(t.counts.gaps, 0, "the tone was there all along");
+  near(events[0].holeMs, 5000, 25, "how long the tone was drowned out");
+  near(events[0].atFrame, 10 * SR, B, "where it began");
+  // Quieter noise too: −40 dBFS is still 28 dB under the tone, and well above the −40 dB residual limit.
+  ({ t } = check(noisyTone(16, 10, 5, -40)));
+  assert.equal(t.counts.noises, 1);
+  // A burst of 50 ms is a click: the tone's own short disturbances stay ticks.
+  ({ t, events } = check(noisyTone(11, 10, 0.05)));
+  assert.deepEqual(events.map((e) => e.kind), ["click"]);
+  // 100 ms is noise.
+  assert.equal(check(noisyTone(11, 10, 0.1)).t.counts.noises, 1);
+});
+
+test("ToneCheck: crackling for 300 ms (a short zero run in every block) is noise, not one hole", () => {
+  const x = cableTone(22, 51);
+  for (let k = 0; k < 30; k++) x.fill(0, (2000 + k) * B, (2000 + k) * B + 100);
+  const { t, events } = check(x);
+  assert.deepEqual(events.map((e) => e.kind), ["noise"]);
+  near(events[0].holeMs, 320, 0.01, "30 blocks");
+  assert.equal(t.ticks, 0);
+});
+
+test("ToneCheck: noise going on when the check ends is counted, and finish() makes it an event", () => {
+  const x = noisyTone(12, 7, 5);
+  const t = new ToneCheck();
+  pushAll(t, x);
+  assert.deepEqual(t.takeEvents(), []);
+  assert.equal(t.counts.noises, 1, "counted as it stands");
+  assert.equal(t.open.kind, "noise");
+  t.finish();
+  const events = t.takeEvents();
+  assert.deepEqual(events.map((e) => e.kind), ["noise"]);
+  near(events[0].holeMs, 5000, 25, "to the end");
+  assert.equal(t.counts.noises, 1, "once");
+});
+
+test("ToneCheck: a quick fade disturbs blocks too, but ends at a new level: a step, not noise", () => {
+  for (const [db, ms] of [
+    [-14, 50],
+    [-14, 100],
+    [-14, 300],
+    [-20, 300],
+  ]) {
+    const { t, events } = check(realistic(gainStep(tone({ seconds: 13 }), 10 * SR, db, Math.round(ms * 48)), 41));
+    assert.equal(t.counts.noises, 0, `${db} dB over ${ms} ms: ${JSON.stringify(events)}`);
+    assert.equal(t.counts.steps, 1, `${db} dB over ${ms} ms`);
+    assert.equal(t.counts.levels, 1);
+    assert.equal(t.ticks + t.counts.gaps, 0);
+  }
+});
+
+test("ToneCheck: the counts follow a disturbance while it goes on: a hole that grows into a gap", () => {
+  const x = cableTone(12, 42);
+  x.fill(0, 10 * SR, 10 * SR + 0.3 * SR);
+  const t = new ToneCheck();
+  pushAll(t, x.subarray(0, 10 * SR + 720)); // 15 ms of zeros so far
+  assert.equal(t.counts.holes, 1);
+  assert.equal(t.ticks, 1);
+  pushAll(t, x.subarray(10 * SR + 720, 10 * SR + 0.2 * SR));
+  assert.equal(t.counts.holes, 0);
+  assert.equal(t.counts.gaps, 1);
+  assert.equal(t.ticks, 0);
+  pushAll(t, x.subarray(10 * SR + 0.2 * SR));
+  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 1, levels: 0, steps: 0, noises: 0 });
+  assert.deepEqual(t.takeEvents().map((e) => e.kind), ["gap"]);
+});
+
+test("ToneCheck: finish() measures a zero run that ended in the block still being filled", () => {
+  // Zeros from 100 frames into block 1800 to 300 frames into block 1802 (1224 frames, 25.5 ms); the check
+  // ends 400 frames into block 1802. The completed blocks saw only 924 of them (19.25 ms: a hole, not a drop-out).
+  const x = cableTone(20, 43);
+  x.fill(0, 1800 * B + 100, 1802 * B + 300);
+  const t = new ToneCheck();
+  pushAll(t, x.subarray(0, 1802 * B + 400));
+  assert.equal(t.open.kind, "dropout");
+  near(t.open.holeMs, 25.5, 0.01, "open");
+  t.finish();
+  const events = t.takeEvents();
+  assert.deepEqual(events.map((e) => e.kind), ["dropout"]);
+  near(events[0].holeMs, 1224 / 48, 0.01, "the whole run");
+  assert.equal(t.counts.holes, 0);
+});
+
+/** The tone 26 dB quieter, on block edges, for `blocks` blocks from block 2000. */
+function dip(blocks, seed) {
+  const x = tone({ seconds: 23 });
+  for (let i = 2000 * B; i < (2000 + blocks) * B; i++) x[i] *= 10 ** (-26 / 20);
+  return realistic(x, seed);
+}
+
+test("ToneCheck: a tone 26 dB quieter for 9 blocks is a click; for 10 blocks it has a new level (a step)", () => {
+  let { t, events } = check(dip(9, 44));
+  assert.deepEqual(events.map((e) => e.kind), ["click"], "a short dip");
+  ({ t, events } = check(dip(10, 45)));
+  assert.equal(t.counts.steps, 1, JSON.stringify(events));
+  assert.equal(t.counts.clicks + t.counts.gaps, 0);
+  near(events.find((e) => e.kind === "step").stepDb, -26, 0.2, "stepDb");
+  // The block that makes it the new level is not a lost tone: levelDb shows the new level at once.
+  t = new ToneCheck();
+  pushAll(t, dip(10, 45).subarray(0, 2010 * B));
+  near(t.levelDb, -38, 0.2, "levelDb right after the 10th block");
+});
+
+test("ToneCheck: a far quieter tone whose phase jumps every block is a lost tone (a gap), not a new level", () => {
+  // Clean tone in every block (11 whole cycles), 26 dB quieter, 112.5° later than the block before: what a
+  // broken crossing could give. Only a tone with a steady phase may become the new level.
+  const x = tone({ seconds: 23 });
+  const amp = 10 ** (-38 / 20);
+  const w = (2 * Math.PI * 11) / B;
+  for (let k = 0; k < 12; k++) {
+    for (let i = 0; i < B; i++) {
+      const n = (2000 + k) * B + i;
+      x[n] = amp * Math.sin(w * n + 0.3 + ((k + 1) * 112.5 * Math.PI) / 180);
+    }
+  }
+  const { t, events } = check(realistic(x, 46));
+  assert.deepEqual(events.map((e) => e.kind), ["gap"]);
+  near(events[0].holeMs, 128, 0.01, "12 blocks");
+  assert.equal(t.counts.steps, 0);
+});
+
+test("ToneCheck: finish() while priming counts nothing", () => {
+  // Locked after 10 blocks; zeros from 0.3 s, still going when the check ends at 0.45 s (inside the 500 ms).
+  const x = cableTone(1, 47);
+  x.fill(0, 0.3 * SR, 0.45 * SR);
+  const t = new ToneCheck();
+  pushAll(t, x.subarray(0, 0.45 * SR));
+  assert.equal(t.locked, true);
+  assert.equal(t.open, null);
+  t.finish();
+  assert.deepEqual(t.takeEvents(), []);
+  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 0, levels: 0, steps: 0, noises: 0 });
+});
+
+test("ToneCheck: reset() drops a disturbance going on: the tone is looked for again from there", () => {
+  const x = cableTone(12, 52);
+  x.fill(0, 10 * SR, 11 * SR);
+  const t = new ToneCheck();
+  pushAll(t, x.subarray(0, 10.5 * SR));
+  assert.equal(t.counts.gaps, 1, "as it stands");
+  t.reset();
+  assert.equal(t.counts.gaps, 0, "dropped");
+  pushAll(t, x.subarray(10.5 * SR));
+  assert.equal(t.locked, true);
+  assert.deepEqual(t.takeEvents(), []);
+  assert.equal(t.counts.gaps + t.ticks, 0);
+});
+
+test("ToneCheck: reset() after finish() works again; a new lock keeps the lowest steady level", () => {
+  const t = new ToneCheck();
+  // −12 dBFS, then 8 dB quieter from 5 s: a level event to −20 dBFS.
+  pushAll(t, realistic(gainStep(tone({ seconds: 20 }), 5 * SR, -8, SR), 48));
+  near(t.minStableDb, -20, 0.2, "minStableDb");
+  t.finish();
+  t.reset();
+  const frame = t.frame;
+  // Back at −12 dBFS, with a drop at 5 s.
+  pushAll(t, dropFrames(cableTone(10, 49), 5 * SR, 480));
+  assert.equal(t.frame, frame + 10 * SR - 480, "push() works again after finish() and reset()");
+  assert.equal(t.locked, true);
+  near(t.lockDb, -12, 0.1, "the new lock");
+  near(t.minStableDb, -20, 0.2, "the lowest steady level so far, not the new lock's");
+  assert.deepEqual(t.takeEvents().filter((e) => e.kind !== "level").map((e) => e.kind), ["skip"]);
 });
 
 test("ToneCheck 10: 600 s pushed in 128-sample blocks takes less than 1.5 s", () => {

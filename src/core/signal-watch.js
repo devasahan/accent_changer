@@ -34,6 +34,17 @@ const round = (x, digits) => {
   return Math.round(x * k) / k;
 };
 
+/** Where ToneCheck.counts counts each kind of disturbance. */
+const COUNT_OF = Object.freeze({
+  hole: "holes",
+  skip: "skips",
+  click: "clicks",
+  dropout: "dropouts",
+  gap: "gaps",
+  step: "steps",
+  noise: "noises",
+});
+
 /** RMS and peak level over consecutive windows (100 ms at 48 kHz by default). */
 export class LevelWindow {
   /** @param {{frames?: number}} [options] window length in samples */
@@ -282,6 +293,8 @@ export class EnvelopeStream {
  *  - "click": any other short disturbance (a spike);
  *  - "dropout": zeros for 20–100 ms; "gap": 100 ms or more of zeros, or of a
  *    lost tone;
+ *  - "noise": the tone still there, but other sound mixed into it (another
+ *    app playing into the cable), or crackling, for 100 ms or more;
  *  - "step": an abrupt change of volume (not a tick);
  *  - "level": the volume settled at another level (Windows' ducking, a
  *    volume slider), reported once it is steady.
@@ -299,8 +312,10 @@ export class EnvelopeStream {
  * clean blocks in a row, at least −60 dBFS). A disturbance that begins and
  * ends in the first 500 ms after the start or a reset() is ignored (the
  * sound settling); one that is still going after them counts, from its
- * start. When the check ends, finish() counts the disturbance still going
- * on: a tone lost for the last minutes is a gap.
+ * start. The counts include the disturbance going on now, as it stands, so
+ * the last counts of a check are right even when it ends during one. When
+ * the check ends, finish() also closes it as an event: a tone lost for the
+ * last minutes is a gap.
  */
 export class ToneCheck {
   constructor({
@@ -385,6 +400,7 @@ export class ToneCheck {
     this._evBeforeA = 0;
     this._evZeroMax = 0;
     this._evLostBlocks = 0;
+    this._evNoisyBlocks = 0; // disturbed blocks with the tone still at its level: something else is in them
     this._evQuiet = 0; // trailing blocks of clean tone, only far quieter than before
     this._evPrime = false; // it began while priming: ignored unless it is still going after it
     // Slow level tracker: windows of 10 clean blocks.
@@ -406,6 +422,7 @@ export class ToneCheck {
     this._gaps = 0;
     this._levels = 0;
     this._steps = 0;
+    this._noises = 0;
   }
 
   /** @param {ArrayLike<number>} samples ignored after finish() */
@@ -502,6 +519,7 @@ export class ToneCheck {
         this._evBeforeA = this._lastA;
         this._evZeroMax = 0;
         this._evLostBlocks = 0;
+        this._evNoisyBlocks = 0;
         this._evQuiet = 0;
         this._evPrime = k - this._armBlock < this._primeBlocks;
       } else if (this._evPrime && k - this._armBlock >= this._primeBlocks) {
@@ -511,6 +529,7 @@ export class ToneCheck {
       }
       if (zeroHere > this._evZeroMax) this._evZeroMax = zeroHere;
       if (lost && !quiet) this._evLostBlocks++;
+      else if (!lost) this._evNoisyBlocks++;
       this._evQuiet = quiet ? this._evQuiet + 1 : 0;
       this._prevClean = false;
       return;
@@ -554,8 +573,13 @@ export class ToneCheck {
    * The event in progress as it stands when it ends at `endFrame`, with
    * `zero` its longest zero run. after: the block that ends it ({k, phi, A}),
    * which gives its phase step and its change of level; null when there is
-   * none, so only its zeros and the lost tone tell what it was (a short
-   * disturbance of no known kind is a click).
+   * none, so only its zeros, the lost tone and the other sound in it tell
+   * what it was (a short disturbance of no known kind is a click).
+   * Classification, first match wins: gap (zeros, or a lost tone, for gapMs
+   * or more), noise (disturbed blocks with the tone still at its level for
+   * gapMs or more, unless the event ends at a new level: a quick fade
+   * disturbs blocks too), dropout, hole, skip, step, click. A gap's or
+   * noise's holeMs is how long the tone was missing or drowned out.
    */
   _describe(endFrame, zero, after) {
     const sr = this._sampleRate;
@@ -569,9 +593,13 @@ export class ToneCheck {
       ev.phaseStepDeg = round(stepDeg, 1);
       ev.stepDb = round(stepDb, 2);
     }
+    const newLevel = stepDb !== null && Math.abs(stepDb) >= this._stepEventDb;
     if (zero >= this._gapFrames || this._evLostBlocks * this._B >= this._gapFrames) {
       ev.kind = "gap";
       ev.holeMs = round(((zero >= this._gapFrames ? zero : frames) / sr) * 1000, 2);
+    } else if (this._evNoisyBlocks * this._B >= this._gapFrames && !newLevel) {
+      ev.kind = "noise";
+      ev.holeMs = round((frames / sr) * 1000, 2);
     } else if (zero >= this._dropoutFrames) {
       ev.kind = "dropout";
       ev.holeMs = round((zero / sr) * 1000, 2);
@@ -580,7 +608,7 @@ export class ToneCheck {
       ev.holeMs = round((zero / sr) * 1000, 2);
     } else if (stepDeg !== null && Math.abs(stepDeg) >= this._phaseLimitDeg) {
       ev.kind = "skip";
-    } else if (stepDb !== null && Math.abs(stepDb) >= this._stepEventDb) {
+    } else if (newLevel) {
       ev.kind = "step";
     }
     return ev;
@@ -589,6 +617,7 @@ export class ToneCheck {
   /** Count an event, and keep it for takeEvents() while there is room. */
   _record(ev) {
     if (ev.kind === "gap") this._gaps++;
+    else if (ev.kind === "noise") this._noises++;
     else if (ev.kind === "dropout") this._dropouts++;
     else if (ev.kind === "hole") this._holes++;
     else if (ev.kind === "skip") this._skips++;
@@ -659,12 +688,13 @@ export class ToneCheck {
 
   /**
    * The check ends here. A disturbance still going on is closed at the
-   * current frame and counted, so a tone lost for the last minutes of a
-   * check is a gap (its zeros and its lost blocks say what it was; when its
-   * last block is clean tone, its phase and level too). A change of level
-   * still settling is counted at the level it got to. Later push() calls are
-   * ignored until reset(). Calling it again does nothing. Call it before the
-   * tone is taken off the cable, or that would count as a gap too.
+   * current frame and kept as an event (the counts had it already), so a
+   * tone lost for the last minutes of a check is a gap event (its zeros and
+   * its lost blocks say what it was; when its last block is clean tone, its
+   * phase and level too). A change of level still settling is counted at the
+   * level it got to. Later push() calls are ignored until reset(). Calling it
+   * again does nothing. Call it before the tone is taken off the cable, or
+   * that would count as a gap too.
    */
   finish() {
     if (this._finished) return;
@@ -699,9 +729,16 @@ export class ToneCheck {
     return out;
   }
 
-  /** Events of each kind so far (never capped). */
+  /**
+   * Events of each kind so far (never capped): { holes, skips, clicks,
+   * dropouts, gaps, levels, steps, noises }. The disturbance going on now
+   * is in them too, as it stands (as finish() would count it): the counts a
+   * worklet sends last are right even when the check ends during a gap.
+   * While it goes on it can move from one kind to another (a hole that grows
+   * into a gap).
+   */
   get counts() {
-    return {
+    const c = {
       holes: this._holes,
       skips: this._skips,
       clicks: this._clicks,
@@ -709,12 +746,17 @@ export class ToneCheck {
       gaps: this._gaps,
       levels: this._levels,
       steps: this._steps,
+      noises: this._noises,
     };
+    const open = this._openEvent();
+    if (open) c[COUNT_OF[open.kind]]++;
+    return c;
   }
 
-  /** Audible ticks so far: holes + skips + clicks. */
+  /** Audible ticks so far: holes + skips + clicks, the disturbance going on now included. */
   get ticks() {
-    return this._holes + this._skips + this._clicks;
+    const c = this.counts;
+    return c.holes + c.skips + c.clicks;
   }
 
   /** True once the tone has been found. */
@@ -756,7 +798,8 @@ export class ToneCheck {
 
   /**
    * Look for the tone again (lock and priming start over, and push() works
-   * again after finish()); counts and events are kept.
+   * again after finish()); counts and events are kept. A disturbance going
+   * on is dropped: it is not counted, and the counts no longer have it.
    */
   reset() {
     this._locked = false;

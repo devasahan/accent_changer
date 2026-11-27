@@ -193,7 +193,7 @@ export class OutputRecovery {
     this.options = mergeOptions(options);
     this._phase = "idle";
     this._o = null; // the outage in progress
-    this._op = null; // the op in flight: { name, startedAtMs, failBaseMs }
+    this._op = null; // the op in flight: { name, startedAtMs, failBaseMs, mic (it opens a microphone) }
     this._log = [];
     this._startRecord = null;
     this._presence = null; // the last `devices` event: { cablePresent, micPresent }
@@ -302,6 +302,7 @@ export class OutputRecovery {
       firstOkOpStartedAtMs: null,
       waitBaseMs: null, // the last failure before the first op that worked
       nextCause: null, // the reason of the latest request that came in while an op ran
+      keptError: null, // a microphone switch that failed with the old microphone live: reported when back
       devicesGoneAtMs: null,
       devicesBackAtMs: null,
       everContext: false,
@@ -390,6 +391,7 @@ export class OutputRecovery {
     this._op = null;
     const o = this._o;
     if (ev.ok) {
+      if (op.mic) o.keptError = null; // a microphone was opened since: the failed switch is old news
       // The first op of this outage that worked: Windows Audio was running when it started.
       if (o.firstOkOpStartedAtMs === null && op.startedAtMs >= o.lostAtMs) {
         o.firstOkOpStartedAtMs = op.startedAtMs;
@@ -400,7 +402,7 @@ export class OutputRecovery {
       return [{ do: "set-timer", id: "verify", ms: this.options.verifyMs }];
     }
     const error = ev.error;
-    if (o.kind === "change" && ev.kept === true) return this._changeFailed(o, error, nowMs);
+    if (ev.kept === true && op.name === "reopen-mic") return this._kept(o, error, nowMs);
     // A failed op needs its work done again. A rebuild that failed after its mic step
     // (a SinkError, a context error) keeps the live mic it opened.
     if (op.name === "resume") this._need(o, { context: true });
@@ -408,6 +410,29 @@ export class OutputRecovery {
     else this._need(o, { context: true, mic: isMicError(error) });
     const acts = o.kind === "change" ? [this._toFault("change-failed", nowMs)] : [];
     return acts.concat(this._fail(classifyError(error), error, nowMs));
+  }
+
+  /**
+   * A reopen-mic failed with kept: true: the microphone in use before is
+   * still live and feeds micBus, so the failed op broke nothing, and its
+   * microphone is not tried again (needMic stays as it was), whatever the
+   * outage is by now. Only a request for another microphone makes a
+   * reopen-mic that can keep the old one, so the page is told the switch
+   * failed ("change-failed"). A change outage ends there (_changeFailed).
+   * Any other outage goes on: a fault that came in while the op ran
+   * (needContext) is rebuilt at once, keeping the live microphone; with
+   * nothing left to do, the last op that worked is verified by a heartbeat.
+   * Its "change-failed" comes right after its "back" or "started": the page
+   * shows the voice as running on a "change-failed", and it is not running
+   * yet. The failed microphone's error is not the outage's: a busy or
+   * blocked microphone the user picked never holds up the voice's recovery.
+   */
+  _kept(o, error, nowMs) {
+    if (o.kind === "change") return this._changeFailed(o, error, nowMs);
+    o.keptError = error;
+    if (o.needContext || o.needMic) return this._attempt(nowMs);
+    this._phase = "verifying";
+    return [{ do: "set-timer", id: "verify", ms: this.options.verifyMs }];
   }
 
   /**
@@ -544,7 +569,8 @@ export class OutputRecovery {
       o.needMic = false;
     }
     o.steps.push(action.do);
-    this._op = { name: action.do, startedAtMs: nowMs, failBaseMs: o.lastFailAtMs };
+    const mic = action.do === "reopen-mic" || (action.do === "rebuild" && action.reopenMic === true);
+    this._op = { name: action.do, startedAtMs: nowMs, failBaseMs: o.lastFailAtMs, mic };
     this._phase = "recovering";
     const acts = [action];
     const every = this.options.stillTryingEvery;
@@ -607,6 +633,7 @@ export class OutputRecovery {
       while (this._log.length > this.options.maxLog) this._log.shift();
       acts.push(report("back", { record: copyRecord(record) }));
     }
+    if (o.keptError !== null) acts.push(report("change-failed", { error: o.keptError }));
     return acts;
   }
 }
