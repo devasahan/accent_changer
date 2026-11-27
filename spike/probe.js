@@ -190,7 +190,7 @@ const usingExampleScript = () => $("script").value.trim() === DEFAULT_SCRIPT.tri
 async function ensureCtx() {
   if (!state.ctx || state.ctx.state === "closed") {
     state.ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
-    await state.ctx.audioWorklet.addModule("./recorder.worklet.js");
+    await state.ctx.audioWorklet.addModule("../src/audio/worklets/recorder.worklet.js");
     await applySink();
   }
   if (state.ctx.state !== "running") await state.ctx.resume();
@@ -271,7 +271,7 @@ function concat(list) {
 
 /** A recorder worklet with `inputs` inputs, recorded side by side. */
 function makeRecorder(ctx, inputs) {
-  const node = new AudioWorkletNode(ctx, "spike-recorder", {
+  const node = new AudioWorkletNode(ctx, "ac-recorder", {
     numberOfInputs: inputs,
     numberOfOutputs: 1,
     outputChannelCount: [1],
