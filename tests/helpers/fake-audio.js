@@ -67,7 +67,11 @@ class FakePort extends EventTarget {
  *  answerLate(kind): answer the hung "enumerate" or "gum" calls now (→ the
  *    streams handed out late);
  *  calls, contexts (graphContexts(): the ones with an explicit sampleRate),
- *    meters, tracks, liveTracks(), endMic(), devicechange(), uninstall().
+ *    meters, sources (every MediaStream source node, with the context frame
+ *    it was made at), tracks, liveTracks(), endMic(), devicechange(),
+ *    uninstall().
+ * Each context lists its nodes (context.nodes); each node lists the nodes it
+ * is connected to (node.links). connect() refuses what Chromium refuses.
  */
 export function installFakeAudio({ cableRateHz = 48000, defaultRateHz = 48000 } = {}) {
   const fake = {
@@ -81,6 +85,7 @@ export function installFakeAudio({ cableRateHz = 48000, defaultRateHz = 48000 } 
     calls: { enumerate: 0, gum: 0 },
     contexts: [],
     meters: [],
+    sources: [],
     tracks: [],
   };
 
@@ -132,18 +137,36 @@ export function installFakeAudio({ cableRateHz = 48000, defaultRateHz = 48000 } 
   };
 
   class FakeNode {
-    constructor(context, kind, numberOfInputs = 1) {
+    constructor(context, kind, numberOfInputs = 1, numberOfOutputs = 1) {
       this.context = context;
       this.kind = kind;
       this.numberOfInputs = numberOfInputs;
-      this.links = [];
+      this.numberOfOutputs = numberOfOutputs;
+      this.links = []; // the nodes this one is connected to
       this.channelCount = 2;
       this.channelCountMode = "max";
       this.channelInterpretation = "speakers";
+      context.nodes.push(this);
     }
 
-    connect(dest) {
-      this.links.push(dest);
+    /**
+     * Refuses what Chromium refuses, in its order: no audio node, an output or
+     * input that does not exist, another context's node.
+     */
+    connect(dest, output = 0, input = 0) {
+      if (!(dest instanceof FakeNode)) {
+        throw new TypeError("Failed to execute 'connect' on 'AudioNode': parameter 1 is not of type 'AudioNode'.");
+      }
+      if (output >= this.numberOfOutputs) {
+        throw named("IndexSizeError", `Output index (${output}) exceeds number of outputs (${this.numberOfOutputs}).`);
+      }
+      if (input >= dest.numberOfInputs) {
+        throw named("IndexSizeError", `Input index (${input}) exceeds number of inputs (${dest.numberOfInputs}).`);
+      }
+      if (dest.context !== this.context) {
+        throw named("InvalidAccessError", "Cannot connect to an AudioNode belonging to a different audio context.");
+      }
+      if (!this.links.includes(dest)) this.links.push(dest); // connecting twice changes nothing
       return dest;
     }
 
@@ -171,7 +194,8 @@ export function installFakeAudio({ cableRateHz = 48000, defaultRateHz = 48000 } 
       this._since = null;
       this.baseLatency = 0.01;
       this.outputLatency = 0.02;
-      this.destination = new FakeNode(this, "destination");
+      this.nodes = []; // every node made in this context
+      this.destination = new FakeNode(this, "destination", 1, 0);
       this.audioWorklet = { addModule: () => Promise.resolve() };
       fake.contexts.push(this);
       queueMicrotask(() => this._set("running")); // the app may play without a click
@@ -230,13 +254,15 @@ export function installFakeAudio({ cableRateHz = 48000, defaultRateHz = 48000 } 
     }
 
     createMediaStreamSource(stream) {
-      const node = new FakeNode(this, "source", 0);
+      const node = new FakeNode(this, "source", 0, 1);
       node.mediaStream = stream;
+      node.startFrame = this.frameNow(); // the context frame it was made at
+      fake.sources.push(node);
       return node;
     }
 
     createMediaStreamDestination() {
-      const node = new FakeNode(this, "stream-destination");
+      const node = new FakeNode(this, "stream-destination", 1, 0);
       node.stream = streamOf(new FakeTrack("destination"));
       return node;
     }
@@ -244,7 +270,7 @@ export function installFakeAudio({ cableRateHz = 48000, defaultRateHz = 48000 } 
 
   class FakeAudioWorkletNode extends FakeNode {
     constructor(context, name, options = {}) {
-      super(context, name, options.numberOfInputs ?? 1);
+      super(context, name, options.numberOfInputs ?? 1, options.numberOfOutputs ?? 1);
       this.name = name;
       this.port = new FakePort();
       if (name === "ac-meter") {

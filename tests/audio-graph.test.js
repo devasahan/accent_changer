@@ -1,5 +1,6 @@
 // src/audio/graph.js on the fakes in tests/helpers/fake-audio.js, with node:test's mock clock:
-// browser calls that never answer, rates read again after a fix in Windows, and the micBus hole count.
+// browser calls that never answer, rates read again after a fix in Windows, the micBus hole count,
+// once-taps that fail, and processor nodes that cannot be wired.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { advance, flush, useFakeAudio, watch } from "./helpers/fake-audio.js";
@@ -19,6 +20,48 @@ async function runningGraph() {
 }
 
 const codes = (graph) => graph.warnings.map((w) => w.code);
+
+/** The nodes that feed outBus (the node the route connects to the destination): the processor slot. */
+function slotNodes(graph) {
+  const ctx = graph.context;
+  const outBus = ctx.nodes.find((n) => n.links.includes(ctx.destination));
+  return outBus ? ctx.nodes.filter((n) => n.links.includes(outBus)) : [];
+}
+
+const slotKinds = (graph) => slotNodes(graph).map((n) => n.kind);
+
+/** The way from the microphone's newest source to the context's destination, as node kinds ("" when there is none). */
+function voicePath(fake, graph) {
+  const ctx = graph.context;
+  const from = fake.sources.findLast((s) => s.context === ctx && s.mediaStream === graph.micStream);
+  if (!from) return "";
+  const before = new Map([[from, null]]);
+  const queue = [from];
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (node === ctx.destination) {
+      const kinds = [];
+      for (let n = node; n; n = before.get(n)) kinds.unshift(n.kind);
+      return kinds.join(">");
+    }
+    for (const next of node.links) {
+      if (!before.has(next)) {
+        before.set(next, node);
+        queue.push(next);
+      }
+    }
+  }
+  return "";
+}
+
+const PASSTHROUGH_PATH = "source>gain>gain>ac-passthrough>gain>destination";
+
+/** Processor nodes that cannot sit in the slot: the browser refuses to connect them. */
+const UNWIRABLE = {
+  "no output": (ctx) => new AudioWorkletNode(ctx, "ac-test-sink", { numberOfInputs: 2, numberOfOutputs: 0 }),
+  "another context's node": () => new AudioContext({ sampleRate: 48000 }).createGain(),
+  "not an audio node": (ctx) => ({ context: ctx, numberOfInputs: 2, numberOfOutputs: 1, connect() {}, disconnect() {} }),
+};
 
 /** stop() must finish without any more time passing; → whether it did. */
 async function stopsAtOnce(graph) {
@@ -196,44 +239,173 @@ test("Check the microphone during a rates read waits for one more read, made aft
 test("micBus holes in the first 10 s of a new microphone source are not counted", async (t) => {
   const fake = useFakeAudio(t);
   const graph = await runningGraph();
-  const meter = () => fake.meters.at(-1);
-  const now = () => graph.context.frameNow();
+  const RATE = 48000;
+  // The microphone's newest source, and how long ago (in seconds) it started.
+  const source = () => fake.sources.findLast((s) => s.mediaStream === graph.micStream);
+  const sinceSource = () => (graph.context.frameNow() - source().startFrame) / RATE;
+  /** A micBus hole `sec` seconds after the newest source started; the meter sends it in its first message after it. */
+  const holeAt = (sec, frames = 480) => fake.meters.at(-1).queueHole(source().startFrame + Math.round(sec * RATE), frames);
+  /** Let the clock run on until `sec` seconds after the newest source started. */
+  const runTo = (sec) => advance(Math.ceil((sec - sinceSource()) * 1000));
 
-  // The first start: a 10 ms hole 0.5 s after the source started is the source's own.
-  meter().queueHole(24000);
-  await advance(200);
-  assert.equal(graph.levels.micHolesTotal, 0);
-  // Later holes count (a clock-crossing event), the 8-11 ms ones only.
-  await advance(10000);
-  meter().queueHole(now() - 4800);
-  meter().queueHole(now() - 2400, 2400); // 50 ms: not a crossing hole
-  await advance(200);
+  /**
+   * A new source's own start-up holes are left out: 10 ms holes 0.5 s and 9.5 s after it (in Chromium
+   * they came up to about 7 s after it). A hole 10.5 s after it is a clock-crossing hole and counts.
+   */
+  async function newSourceHoles(total, when) {
+    holeAt(0.5);
+    holeAt(9.5);
+    holeAt(10.5);
+    await runTo(10.4);
+    assert.equal(graph.levels.micHolesTotal, total, `${when}: a hole in the first 10 s of the source was counted`);
+    await runTo(10.7);
+    assert.equal(graph.levels.micHolesTotal, total + 1, `${when}: a hole 10.5 s after the source was not counted`);
+  }
+
+  // The first start.
+  await newSourceHoles(0, "first start");
+  holeAt(11, 2400); // 50 ms: not a clock-crossing hole
+  await runTo(11.3);
   assert.equal(graph.levels.micHolesTotal, 1);
 
-  // A microphone swap (the microphone ended and came back): a new source.
+  // A microphone swap (the microphone ended and came back): a new source in the same context.
   fake.endMic();
   await advance(800);
   assert.equal(graph.state, "running");
   assert.equal(graph.recoveries.length, 1);
-  meter().queueHole(now() - 1200);
-  await advance(200);
-  assert.equal(graph.levels.micHolesTotal, 1, "a hole right after the swap was counted");
-  await advance(10000);
-  meter().queueHole(now() - 1200);
-  await advance(200);
-  assert.equal(graph.levels.micHolesTotal, 2);
+  assert.ok(sinceSource() < 1, "no new source after the swap");
+  await newSourceHoles(1, "swap");
 
   // A rebuild: a new context and a new source.
   graph.context.close();
   await advance(800);
   assert.equal(graph.state, "running");
   assert.equal(graph.recoveries.length, 2);
-  meter().queueHole(now() - 1200);
-  await advance(200);
-  assert.equal(graph.levels.micHolesTotal, 2, "a hole right after the rebuild was counted");
-  await advance(10000);
-  meter().queueHole(now() - 1200);
-  await advance(200);
-  assert.equal(graph.levels.micHolesTotal, 3);
+  assert.ok(sinceSource() < 1, "no new source after the rebuild");
+  await newSourceHoles(2, "rebuild");
+  assert.equal(await stopsAtOnce(graph), true);
+});
+
+test("a once-tap whose build fails is gone: later recoveries do not build it again", async (t) => {
+  useFakeAudio(t);
+  const graph = await runningGraph();
+  const tapErrors = [];
+  graph.addEventListener("tap-error", (ev) => tapErrors.push(ev.detail.message));
+  const builds = { rejects: 0, throws: 0, kept: 0 };
+  graph.addTap(
+    async () => {
+      builds.rejects++;
+      throw new Error("The delay recorder could not start.");
+    },
+    { once: true },
+  );
+  graph.addTap(
+    () => {
+      builds.throws++;
+      throw new Error("The mic-path recorder could not start.");
+    },
+    { once: true },
+  );
+  // A tap that is not once is built again after every rebuild, also after a build that failed.
+  graph.addTap(async () => {
+    builds.kept++;
+    if (builds.kept === 1) throw new Error("The long check's recorder could not start.");
+    return { dispose() {} };
+  });
+  await advance(100);
+  assert.deepEqual(builds, { rejects: 1, throws: 1, kept: 1 });
+  assert.equal(tapErrors.length, 3);
+  assert.equal(graph.debugCounts().taps, 0);
+
+  graph.context.close(); // a fault: a new context
+  await advance(800);
+  assert.equal(graph.state, "running");
+  graph.context.dispatchEvent(new Event("error")); // another fault: the context is resumed
+  await advance(1000);
+  assert.equal(graph.state, "running");
+  assert.equal(graph.recoveries.length, 2);
+  assert.deepEqual(builds, { rejects: 1, throws: 1, kept: 2 }, "a once-tap that failed was built again");
+  assert.equal(tapErrors.length, 3);
+  assert.equal(graph.debugCounts().taps, 1);
+  assert.equal(await stopsAtOnce(graph), true);
+});
+
+for (const [what, makeNode] of Object.entries(UNWIRABLE)) {
+  test(`a processor factory whose node cannot be wired (${what}): the voice starts through ac-passthrough`, async (t) => {
+    const fake = useFakeAudio(t);
+    const causes = [];
+    const graph = new VoiceGraph({
+      getSaved: () => NOTHING_SAVED,
+      processor: async (ctx, info) => {
+        causes.push(info.cause);
+        return { node: makeNode(ctx) };
+      },
+    });
+    graph.start();
+    await advance(1000);
+    assert.equal(graph.state, "running", graph.stateInfo.text);
+    assert.equal(graph.startRecord?.attempts, 1);
+    assert.ok(codes(graph).includes("PROCESSOR_FAILED"), `warnings: ${codes(graph)}`);
+    assert.equal(graph.output.processor, "worklet");
+    assert.deepEqual(slotKinds(graph), ["ac-passthrough"]);
+    assert.equal(voicePath(fake, graph), PASSTHROUGH_PATH);
+    assert.equal(graph.context.sinkId, "cable-in");
+
+    // A rebuild asks the factory again, and falls back again.
+    graph.context.close();
+    await advance(800);
+    assert.equal(graph.state, "running");
+    assert.deepEqual(causes, ["start", "context-closed"]);
+    assert.ok(codes(graph).includes("PROCESSOR_FAILED"));
+    assert.equal(voicePath(fake, graph), PASSTHROUGH_PATH);
+    assert.equal(await stopsAtOnce(graph), true);
+  });
+}
+
+test("setProcessor with a node that cannot be wired keeps the voice going", async (t) => {
+  const fake = useFakeAudio(t);
+  const graph = await runningGraph();
+  const converted = graph.context.createMediaStreamDestination().stream; // Step 7's converted voice
+  await graph.setConvertedSource(converted);
+  /** The converted voice goes to the processor in the slot (its input 1), and nowhere else. */
+  const convertedToSlot = () => {
+    const targets = fake.sources.filter((s) => s.mediaStream === converted).flatMap((s) => s.links);
+    const slot = slotNodes(graph);
+    return targets.length === 1 && slot.length === 1 && targets[0] === slot[0];
+  };
+  const swap = async (factory) => {
+    const swapping = watch(graph.setProcessor(factory));
+    await advance(100);
+    assert.equal(swapping.done, true, "setProcessor did not finish");
+    assert.equal(swapping.error, undefined, `setProcessor rejected: ${swapping.error?.name}`);
+  };
+  assert.equal(voicePath(fake, graph), PASSTHROUGH_PATH);
+  assert.ok(convertedToSlot());
+
+  for (const [what, makeNode] of Object.entries(UNWIRABLE)) {
+    await swap(async (ctx) => ({ node: makeNode(ctx) }));
+    assert.equal(graph.state, "running", what);
+    assert.ok(codes(graph).includes("PROCESSOR_FAILED"), `${what}: warnings ${codes(graph)}`);
+    assert.deepEqual(slotKinds(graph), ["ac-passthrough"], `${what}: one processor in the slot`);
+    assert.equal(voicePath(fake, graph), PASSTHROUGH_PATH, `${what}: the voice does not reach the cable`);
+    assert.ok(convertedToSlot(), `${what}: the converted voice does not go to the new processor only`);
+  }
+
+  // A factory whose node works takes the slot, and the warning goes.
+  await swap(async (ctx) => ({ node: new AudioWorkletNode(ctx, "ac-test-mixer", { numberOfInputs: 2, numberOfOutputs: 1 }) }));
+  assert.ok(!codes(graph).includes("PROCESSOR_FAILED"), `warnings: ${codes(graph)}`);
+  assert.equal(voicePath(fake, graph), "source>gain>gain>ac-test-mixer>gain>destination");
+  assert.ok(convertedToSlot());
+  // A failed factory, then no factory: ac-passthrough was asked for, so nothing failed.
+  await swap(async () => {
+    throw new Error("The mixer could not start.");
+  });
+  assert.ok(codes(graph).includes("PROCESSOR_FAILED"));
+  await swap(null);
+  assert.ok(!codes(graph).includes("PROCESSOR_FAILED"), `warnings: ${codes(graph)}`);
+  assert.equal(voicePath(fake, graph), PASSTHROUGH_PATH);
+  assert.equal(graph.state, "running");
+  assert.equal(graph.generation, 1, "a processor swap rebuilt the context");
+  assert.equal(graph.recoveries.length, 0);
   assert.equal(await stopsAtOnce(graph), true);
 });

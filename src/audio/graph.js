@@ -141,6 +141,21 @@ function settledHoles(holes, m, from) {
   return holes.filter((h) => Number.isFinite(h?.startFrame) && h.startFrame + offset >= from);
 }
 
+/**
+ * Why `node` cannot sit in the processor slot of `ctx`, or null when it can:
+ * the slot needs a node of that context with an input (from inBus) and an
+ * output (to outBus).
+ */
+function slotProblem(node, ctx) {
+  const problem = (name, message) => Object.assign(new Error(message), { name });
+  if (!node || typeof node !== "object") return problem("TypeError", "The processor factory returned no node.");
+  if (node.context !== ctx) return problem("InvalidAccessError", "The processor's node belongs to another audio context.");
+  if (!(node.numberOfInputs >= 1 && node.numberOfOutputs >= 1)) {
+    return problem("IndexSizeError", "The processor's node needs an input and an output.");
+  }
+  return null;
+}
+
 /** A GainNode at unity gain that keeps the signal mono. */
 function monoGain(ctx) {
   const g = ctx.createGain();
@@ -247,7 +262,8 @@ export class VoiceGraph extends EventTarget {
    * @param {"app"|"browser"} [options.where] wording of microphone errors
    * @param {"app"|"browser"} [options.shell] only "browser" can end in "needs-gesture"
    * @param {null|((ctx: AudioContext, info: object) => Promise<{node: AudioNode, snapshot?: () => any}>)} [options.processor]
-   *   Step 4's processor factory; null uses ac-passthrough
+   *   Step 4's processor factory; null uses ac-passthrough. Its node must be made in ctx, with an input (0: inBus;
+   *   1: the converted voice) and an output (to outBus); a factory that fails gives ac-passthrough (PROCESSOR_FAILED)
    */
   constructor({ getSaved, allowPermission = null, log = () => {}, where = "app", shell = "app", processor = null } = {}) {
     super();
@@ -469,6 +485,8 @@ export class VoiceGraph extends EventTarget {
   /**
    * Step 4's processor factory. Before start(): stored. After: swapped in
    * place under the lock (one possible click); null goes back to ac-passthrough.
+   * A factory that fails gives ac-passthrough and PROCESSOR_FAILED, as in a
+   * rebuild; the voice never stops for it. Never rejects.
    */
   setProcessor(factory) {
     this._processorFactory = typeof factory === "function" ? factory : null;
@@ -488,12 +506,8 @@ export class VoiceGraph extends EventTarget {
         safeDisconnect(built.node);
         return;
       }
-      safeDisconnect(gen.inBus, gen.processor);
-      safeDisconnect(gen.processor);
-      gen.processor = built.node;
-      gen.processorHandle = built.handle;
-      gen.processorKind = built.kind;
-      this._wireProcessor(gen);
+      // The old processor comes out only once a new one is connected.
+      this._installProcessor(gen, built);
       if (this._output) this._output = { ...this._output, processor: gen.processorKind };
       this._recomputeWarnings();
     });
@@ -524,7 +538,8 @@ export class VoiceGraph extends EventTarget {
    * under the lock now when the voice runs, and (unless once) again after
    * every verified rebuild. dispose({generationEnded: true}) is called when
    * its generation ends (a once-tap is then gone), dispose({generationEnded:
-   * false}) by removeTap(). → removeTap() (a promise).
+   * false}) by removeTap(). A once-tap is built at most once: one whose build
+   * fails or takes too long is gone too (tap-error). → removeTap() (a promise).
    */
   addTap(build, { once = false } = {}) {
     const tap = { build, once: Boolean(once), handle: null, handleGen: null, built: false, removed: false };
@@ -1349,10 +1364,10 @@ export class VoiceGraph extends EventTarget {
       await this._disposeGeneration(gen);
       return null;
     }
-    gen.processor = built.node;
-    gen.processorHandle = built.handle;
-    gen.processorKind = built.kind;
-    this._wireProcessor(gen);
+    if (!this._installProcessor(gen, built)) {
+      // Not even a plain gain could be connected: this context cannot carry the voice. The op fails and is tried again.
+      throw Object.assign(new Error("The voice processor could not be connected."), { name: "InvalidStateError" });
+    }
 
     if (meter.status === "fulfilled") {
       try {
@@ -1381,30 +1396,39 @@ export class VoiceGraph extends EventTarget {
     return gen;
   }
 
-  /** The processor for the slot: Step 4's factory, else ac-passthrough, else a plain gain (direct). */
+  /**
+   * The processor for the slot: Step 4's factory, else ac-passthrough, else
+   * a plain gain (direct). A factory that throws, takes too long, or gives a
+   * node that cannot sit in the slot has failed: ac-passthrough takes its
+   * place. → { node, handle, kind, fromFactory, failed }
+   */
   async _makeProcessor(gen, cause, previousState) {
     const { ctx } = gen;
-    if (this._processorFactory) {
-      try {
-        const making = Promise.resolve(this._processorFactory(ctx, { generation: gen.n, cause, previousState }));
-        const handle = await orTimeout(making, STEP_BACKSTOP_MS);
-        if (handle === TIMED_OUT) {
-          making.then((h) => safeDisconnect(h?.node), () => {});
-          throw Object.assign(new Error("The processor factory took too long."), { name: "TimeoutError" });
-        }
-        if (handle && handle.node) {
-          this._processorFailed = false;
-          return { node: handle.node, handle, kind: "worklet" };
-        }
-        throw new Error("The processor factory returned no node.");
-      } catch (err) {
-        this._processorFailed = true;
-        this._log("warn", `processor factory failed ${nameOf(err)}`);
+    if (!this._processorFactory) return { ...this._fallbackProcessor(gen), failed: false };
+    try {
+      const making = Promise.resolve(this._processorFactory(ctx, { generation: gen.n, cause, previousState }));
+      const handle = await orTimeout(making, STEP_BACKSTOP_MS);
+      if (handle === TIMED_OUT) {
+        making.then((h) => safeDisconnect(h?.node), () => {});
+        throw Object.assign(new Error("The processor factory took too long."), { name: "TimeoutError" });
       }
+      const problem = slotProblem(handle?.node, ctx);
+      if (problem) {
+        if (handle?.node?.context === ctx) safeDisconnect(handle.node);
+        throw problem;
+      }
+      return { node: handle.node, handle, kind: "worklet", fromFactory: true, failed: false };
+    } catch (err) {
+      this._log("warn", `processor factory failed ${nameOf(err)}`);
+      return { ...this._fallbackProcessor(gen), failed: true };
     }
+  }
+
+  /** ac-passthrough when the worklets loaded, else a plain gain (direct). */
+  _fallbackProcessor(gen) {
     if (gen.workletsLoaded) {
       try {
-        const node = new AudioWorkletNode(ctx, "ac-passthrough", {
+        const node = new AudioWorkletNode(gen.ctx, "ac-passthrough", {
           numberOfInputs: 2,
           numberOfOutputs: 1,
           outputChannelCount: [1],
@@ -1412,19 +1436,71 @@ export class VoiceGraph extends EventTarget {
           channelCountMode: "explicit",
           channelInterpretation: "speakers",
         });
-        return { node, handle: null, kind: "worklet" };
+        return { node, handle: null, kind: "worklet", fromFactory: false };
       } catch (err) {
         this._log("warn", `passthrough node failed ${nameOf(err)}`);
       }
     }
-    return { node: monoGain(ctx), handle: null, kind: "direct" };
+    return { node: monoGain(gen.ctx), handle: null, kind: "direct", fromFactory: false };
   }
 
-  /** inBus → processor input 0, the converted source → input 1, processor → outBus. */
-  _wireProcessor(gen) {
-    gen.inBus.connect(gen.processor, 0, 0);
+  /**
+   * Put `built` in gen's processor slot: inBus → its input 0, its output →
+   * outBus, the converted source → its input 1. The processor that was there
+   * comes out only once the new one is connected. A node the browser refuses
+   * to connect is a failed processor: what was connected of it is undone, and
+   * ac-passthrough (then a plain gain) takes its place, so the voice always
+   * has a way through. → false when nothing could be connected (the slot is
+   * left as it was).
+   */
+  _installProcessor(gen, built) {
+    let next = built;
+    let failed = Boolean(built.failed);
+    for (;;) {
+      try {
+        this._connectProcessor(gen, next.node);
+        break;
+      } catch (err) {
+        this._log("warn", `processor wiring failed ${nameOf(err)}`);
+        if (next.fromFactory) failed = true;
+        if (next.kind === "direct") {
+          if (failed) this._processorFailed = true;
+          return false;
+        }
+        next = next.fromFactory
+          ? this._fallbackProcessor(gen)
+          : { node: monoGain(gen.ctx), handle: null, kind: "direct", fromFactory: false };
+      }
+    }
+    if (gen.processor && gen.processor !== next.node) this._disconnectProcessor(gen);
+    gen.processor = next.node;
+    gen.processorHandle = next.handle;
+    gen.processorKind = next.kind;
     this._applyConvertedSource(gen, true);
-    gen.processor.connect(gen.outBus);
+    this._processorFailed = failed;
+    return true;
+  }
+
+  /** inBus → node's input 0 and node → outBus. When the browser refuses, what was connected is undone and the error thrown. */
+  _connectProcessor(gen, node) {
+    try {
+      gen.inBus.connect(node, 0, 0);
+      node.connect(gen.outBus);
+    } catch (err) {
+      safeDisconnect(gen.inBus, node);
+      safeDisconnect(node, gen.outBus);
+      throw err;
+    }
+  }
+
+  /** Take the processor out of the slot: inBus, the converted source and its output are disconnected from it. */
+  _disconnectProcessor(gen) {
+    safeDisconnect(gen.inBus, gen.processor);
+    if (gen.convertedNode) {
+      safeDisconnect(gen.convertedNode);
+      gen.convertedNode = null;
+    }
+    safeDisconnect(gen.processor);
   }
 
   _connectMicSource(gen, stream) {
@@ -1563,13 +1639,14 @@ export class VoiceGraph extends EventTarget {
         if (handle === TIMED_OUT) {
           // Given up: the voice must not wait for a check. A late recorder is removed when it comes.
           building.then((h) => h && this._disposeTapHandle(h, { generationEnded: true, generation: gen.n }), () => {});
-          if (tap.once) {
-            tap.removed = true;
-            this._taps.delete(tap);
-          }
           throw Object.assign(new Error("A check's recorder took too long to start."), { name: "TimeoutError" });
         }
       } catch (err) {
+        // A once-tap is built at most once: one that failed is gone, and tap-error says so.
+        if (tap.once) {
+          tap.removed = true;
+          this._taps.delete(tap);
+        }
         this._log("warn", `tap failed ${nameOf(err)}`);
         this._emit("tap-error", { message: redact(messageOf(err)) || "A check's recorder could not be added." });
         return;
