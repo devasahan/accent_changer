@@ -10,8 +10,7 @@
 <body>
   <header>
     <h1>Accent Changer · Diagnostics</h1>
-    <p>This test build checks that the app works on your laptop. It uses no Sanas minutes.</p>
-    <p>Do steps 1 to 4, then press <strong>Copy results</strong> and paste them into your message <strong>before you close the app</strong>: it forgets them when it closes. After you open it again, press <strong>Check the microphone</strong> and <strong>Connect only</strong> once more, then copy the results again and paste them under the first ones.</p>
+    <p>This test build sends your microphone into VB-CABLE, so that Zoom, Teams or Meet can use “CABLE Output” as your microphone, and checks that this works on this PC. It uses no Sanas minutes. Follow “Session B” in the README. Press <strong>Copy results</strong> and paste them into your message <strong>before you close the app</strong>: it forgets them when it closes.</p>
     <p id="status" role="status" data-kind="info">Loading…</p>
   </header>
   <main>
@@ -21,14 +20,84 @@
     </section>
 
     <section>
-      <h2>2 · Microphone</h2>
+      <h2>2 · Your voice to the meeting</h2>
+      <p id="voiceStatus" role="status" data-kind="info">Starting your voice…</p>
+      <button id="btnStartVoice" type="button" hidden>Start</button>
+      <div class="row">
+        <label>Microphone
+          <select id="micSelect"></select>
+        </label>
+        <label>Send your voice to
+          <select id="outSelect"></select>
+        </label>
+      </div>
+      <div class="meters">
+        <label>Your microphone
+          <meter id="micMeter" min="-60" max="0" low="-45" high="-6" optimum="-20" value="-60"></meter>
+        </label>
+        <label>Going to the meeting
+          <meter id="outMeter" min="-60" max="0" low="-45" high="-6" optimum="-20" value="-60"></meter>
+        </label>
+      </div>
+      <ul id="voiceWarnings"></ul>
+      <dl id="voiceInfo"></dl>
       <p class="hint">The app should get the microphone without asking you. If Windows or the app asks anyway, write that in your notes.</p>
-      <p class="row"><button id="btnMic" type="button">Check the microphone</button></p>
+      <p class="row">
+        <button id="btnMic" type="button" class="quiet">Check the microphone</button>
+        <button id="btnBeep" type="button" class="quiet">Play a test beep</button>
+      </p>
       <dl id="micInfo"></dl>
+      <h3>Recoveries</h3>
+      <ul id="recoveryLog"></ul>
+      <details class="advanced">
+        <summary>Advanced (only when the README or I ask)</summary>
+        <div class="row">
+          <label>Output route
+            <select id="routeSelect">
+              <option value="auto">Automatic</option>
+              <option value="element">Through an audio element (test)</option>
+            </select>
+          </label>
+        </div>
+      </details>
     </section>
 
     <section>
-      <h2>3 · Sanas key</h2>
+      <h2>3 · Checks for the meeting (Session B)</h2>
+
+      <h3>Delay</h3>
+      <p class="hint">Press the button, then say “pa-ta-ka” over and over until it stops (12 seconds).</p>
+      <p class="row"><button id="btnMeasure" type="button">Measure the delay</button></p>
+      <p id="measureInfo"></p>
+
+      <h3>Long check: what the meeting hears</h3>
+      <p class="hint">Records CABLE Output, the microphone the meeting uses. With the test tone the meeting hears a steady tone instead of your voice until the check ends.</p>
+      <div class="row">
+        <label>Send
+          <select id="longSource">
+            <option value="tone">a test tone (the long check)</option>
+            <option value="mic">your microphone</option>
+          </select>
+        </label>
+        <label>Minutes
+          <input id="longMinutes" type="number" min="0.25" max="120" step="0.25" value="65">
+        </label>
+        <button id="btnLongStart" type="button">Start the long check</button>
+        <button id="btnLongStop" type="button" class="quiet" disabled>Stop and check</button>
+      </div>
+      <p id="longInfo"></p>
+
+      <h3>Hide the app</h3>
+      <p class="hint">The app disappears from the screen and the taskbar and comes back by itself after 30 minutes, without taking over your keyboard (look for it on the taskbar). To bring it back sooner, open Accent Changer from the Start menu. If the long check is running, it waits until 2 minutes after the app is back.</p>
+      <p class="row"><button id="btnHide" type="button">Hide the app for 30 minutes</button></p>
+      <p id="hideInfo"></p>
+
+      <h3>Session B checklist</h3>
+      <ul id="gateList"></ul>
+    </section>
+
+    <section>
+      <h2>4 · Sanas key</h2>
       <p id="keyInfo" class="hint"></p>
       <div class="row">
         <label>Sanas API key (paste it once, from your password manager)
@@ -41,14 +110,14 @@
     </section>
 
     <section>
-      <h2>4 · Connect to Sanas (free: no audio)</h2>
+      <h2>5 · Connect to Sanas (free: no audio)</h2>
       <p class="hint">Checks that Sanas accepts the saved key and this app's address. Before this, add <code>http://tauri.localhost</code> under Allowed origins in the Sanas Console.</p>
       <p class="row"><button id="btnConnect" type="button">Connect only</button></p>
       <p id="connectInfo"></p>
     </section>
 
     <section>
-      <h2>5 · Copy results</h2>
+      <h2>6 · Copy results</h2>
       <p class="hint">The app keeps the results only while it is open.</p>
       <p class="row">
         <button id="btnCopy" type="button">Copy results</button>
