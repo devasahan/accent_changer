@@ -57,3 +57,25 @@ jobs:
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           uploadWorkflowArtifacts: true
+      # Windows starts the app only with its application manifest, which asks
+      # for Common Controls v6 (src-tauri/build.rs has the linker embed it).
+      # Read it back from every app .exe the build made, so a build that
+      # would not start fails here instead of on someone's PC.
+      - name: Check the app's Windows manifest
+        shell: pwsh
+        run: |
+          $exes = @(Get-ChildItem src-tauri/target/release -Filter *.exe -File)
+          if ($exes.Count -eq 0) { throw "no app .exe in src-tauri/target/release" }
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw "mt.exe (Windows SDK) not found" }
+          foreach ($exe in $exes) {
+            $out = Join-Path $env:RUNNER_TEMP "$($exe.BaseName).manifest"
+            & $mt.FullName -nologo "-inputresource:$($exe.FullName);#1" "-out:$out"
+            if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) has no application manifest" }
+            $manifest = Get-Content $out -Raw
+            Write-Output "$($exe.Name):" $manifest
+            if ($manifest -notmatch 'Microsoft\.Windows\.Common-Controls' -or $manifest -notmatch '6\.0\.0\.0') {
+              throw "$($exe.Name)'s manifest does not ask for Common Controls 6.0"
+            }
+          }
