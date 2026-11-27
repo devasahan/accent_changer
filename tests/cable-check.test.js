@@ -1996,11 +1996,16 @@ test("gateSummary: the gaps row counts every long drop-out of a check with your 
   let row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
   assert.equal(row.status, "fail", row.text);
   assert.ok(row.text.includes("In the check with your voice: 1 drop-out."), row.text);
-  // Results made before the count was kept: the list is what there is.
+  // Results made before the count was kept: the list, else the check's own reason, tells.
   delete voice.speech.longDropoutCount;
   voice.speech.dropouts = [...short.slice(0, 49), { atSec: 70, phase: "minimized", ms: 45 }];
   row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
   assert.equal(row.status, "fail", row.text);
+  voice.speech.dropouts = short;
+  voice.reasons = ["CABLE Output dropped out 3 times (the longest for 45 ms)."];
+  row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
+  assert.equal(row.status, "fail", row.text);
+  assert.ok(row.text.includes("In the check with your voice: 3 drop-outs."), row.text);
 });
 
 test("gateSummary: a check with your voice forced onto the audio element is a comparison, not counted in the gaps row", () => {
@@ -2020,7 +2025,7 @@ test("gateSummary: the user's own route switches under Advanced are no note; the
   ];
   let row = gateSummary(voice(yours))[2];
   assert.equal(row.status, "pass", row.text);
-  assert.equal(row.text, "Sent through the app's audio engine. You switched the route twice under Advanced (your comparison run).");
+  assert.equal(row.text, "Sent through the normal route. You switched the route twice under Advanced (your comparison run).");
   // The app moved the voice onto the audio element by itself (a recovery): to discuss.
   row = gateSummary(voice([{ at: "t1", from: "context", to: "element", cause: "render-error" }], { method: "element" }))[2];
   assert.equal(row.status, "note");

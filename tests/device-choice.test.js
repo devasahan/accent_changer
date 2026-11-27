@@ -605,9 +605,9 @@ test("WARNINGS: Windows paths work on Windows 10 and 11, and no text assumes a l
 });
 
 test("routeWords and causeText: one wording for the page, the warnings and the checklist", () => {
-  assert.equal(routeWords("context"), "the app's audio engine");
+  assert.equal(routeWords("context"), "the normal route");
   assert.equal(routeWords("element"), "a slower backup route");
-  assert.equal(routeWords("context-after-permission"), "the app's audio engine, after a permission fix");
+  assert.equal(routeWords("context-after-permission"), "the normal route, after a permission fix");
   assert.equal(routeWords("element-after-permission"), "a slower backup route, after a permission fix");
   assert.equal(routeWords(null), "not yet");
   assert.equal(routeWords("", "none"), "none");

@@ -89,6 +89,15 @@ const MIC_STOPPED = "Your microphone sent only digital silence";
 /** How the reason for a microphone that dropped out for 20 to 100 ms begins: gateSummary looks for it too. */
 const MIC_DROPPED = "The microphone itself dropped out";
 
+/** How the reason for long drop-outs in CABLE Output (a check with your voice) begins: gateSummary reads it too. */
+const CABLE_DROPPED = "CABLE Output dropped out";
+
+/** "once" → 1, "twice" → 2, "5 times" → 5, at the start of `text`; 0 when it says no number. */
+const timesIn = (text) => {
+  const m = /^\s*(once|twice|(\d+) times)\b/.exec(text);
+  return !m ? 0 : m[1] === "once" ? 1 : m[1] === "twice" ? 2 : Number(m[2]);
+};
+
 /** How the reason for other sound in the test tone begins: gateSummary looks for it too. */
 const OTHER_SOUND = "Other sound was mixed into the test tone";
 
@@ -1149,7 +1158,7 @@ export function longVerdict(input) {
     const short = drops.filter((d) => d.ms < LIMITS.DROPOUT_MS);
     if (long.length) {
       const longest = long.reduce((m, d) => Math.max(m, d.ms), 0);
-      fails.push(`CABLE Output dropped out ${times(long.length)} (the longest for ${lengthOfMs(longest)}).`);
+      fails.push(`${CABLE_DROPPED} ${times(long.length)} (the longest for ${lengthOfMs(longest)}).`);
     }
     if (rate(short.length) > LIMITS.TICKS_PER_30_MIN) {
       fails.push(`Too many short drop-outs in CABLE Output: about ${per30(rate(short.length))} per 30 minutes (6 at most).`);
@@ -1475,13 +1484,16 @@ const minutesOf = (sec) => Math.round((isNum(sec) ? sec : 0) / 60);
 
 /**
  * The long drop-outs (DROPOUT_MS or more) of a check with your voice: its
- * speech.longDropoutCount (every one), else those in its list of the first 50
- * (results made before the count was kept).
+ * speech.longDropoutCount (every one). Results made before the count was
+ * kept list only their first 50 drop-outs, short and long mixed: those in
+ * the list, or the number its own reason gives, whichever is more.
  */
 function longDropouts(run) {
   const n = run.speech?.longDropoutCount;
   if (isNum(n)) return n;
-  return list(run.speech?.dropouts).filter((d) => (d.ms ?? 0) >= LIMITS.DROPOUT_MS).length;
+  const listed = list(run.speech?.dropouts).filter((d) => (d.ms ?? 0) >= LIMITS.DROPOUT_MS).length;
+  const said = Array.isArray(run.reasons) ? run.reasons.find((t) => typeof t === "string" && t.startsWith(CABLE_DROPPED)) : null;
+  return Math.max(listed, said ? timesIn(said.slice(CABLE_DROPPED.length)) : 0);
 }
 
 function gapsRow(results) {

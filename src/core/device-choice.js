@@ -555,14 +555,15 @@ const CAUSE_WORDS = Object.freeze({
 export const causeText = (cause) => CAUSE_WORDS[cause] ?? "a problem with the sound";
 
 /**
- * The output route in plain words: "the app's audio engine" or "a slower
- * backup route" (the audio element, which resamples and adds delay), with
- * ", after a permission fix" when the route needed one. `none` when there is
- * no route (yet). The page, the warnings and the checklist all use this.
+ * The output route in plain words: "the normal route" (the app's own audio
+ * engine plays into the cable) or "a slower backup route" (an audio
+ * element, which resamples and adds delay), with ", after a permission fix"
+ * when the route needed one. `none` when there is no route (yet). Step 2 of
+ * the page, the warnings and the checklist all use this.
  */
 export function routeWords(method, none = "not yet") {
   if (typeof method !== "string" || !method) return none;
-  const base = method.startsWith("element") ? "a slower backup route" : "the app's audio engine";
+  const base = method.startsWith("element") ? "a slower backup route" : "the normal route";
   return method.endsWith("-after-permission") ? `${base}, after a permission fix` : base;
 }
 

@@ -1235,7 +1235,7 @@ export class VoiceGraph extends EventTarget {
    * Step 8: the generation is routed; the route method is recorded. Every
    * change of method is listed (routeChanges, with its cause). One the app
    * made by itself onto the audio element route is a warning (ROUTE_CHANGED)
-   * until the voice is back on the app's audio engine or on the session's
+   * until the voice is back on the normal route or on the session's
    * first route; the user's own choice under Advanced ("route", Session B
    * step 7.6) never is.
    */
