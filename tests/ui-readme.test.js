@@ -125,7 +125,7 @@ test("U05: step 7.5 says what to do for every result of the long check", () => {
     [/\*\*Ended early\*\*, or \*\*nothing measured\*\*/, /do step 7 again once, from 7\.1/],
     [/\*\*Passed\*\*/, /go on/],
     [/\*\*Needs a setting change\*\*/, /do what it says[^.]*\. Tell me in your message before you run the hour again/],
-    [/\*\*Not passed\*\* for another reason/, /If they start with "Too many clicks", do step 7\.6/],
+    [/\*\*Not passed\*\* for another reason/, /If one of them says "Too many clicks", do step 7\.6/],
   ]) {
     const line = s.split("\n").find((l) => outcome.test(l));
     assert.ok(line, String(outcome));

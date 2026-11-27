@@ -1677,6 +1677,9 @@ async function routeChoice(app) {
   const row = r.gate.find((g) => g.row === "Delay at most 120 ms");
   check(row && row.text.includes("not counted"), "the checklist lists it without counting it", row?.text);
   check(/a slower backup route/.test(await text("#voiceInfo")), "step 2 says how the voice is sent, in plain words", await text("#voiceInfo"));
+  // Read while still on the element route: back on Automatic, the move back to the normal route clears the warning anyway.
+  const onElement = (r.voice?.warnings ?? []).map((w) => w.code);
+  check(!onElement.includes("ROUTE_CHANGED"), "on the route the user chose, step 2 shows no ROUTE_CHANGED warning", json(onElement));
   await choose("#routeSelect", "auto", /Output route switched/);
   r = await waitResults((x) => x.voice?.state === "running" && x.voice.output?.method === "context", 5000);
   check(r.voice?.output?.method === "context" && r.voice.output.routePreference === "auto", "back to the app's audio engine", json(r.voice?.output?.method));

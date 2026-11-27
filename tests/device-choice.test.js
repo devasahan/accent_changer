@@ -584,6 +584,14 @@ test("deviceWarnings: a microphone that records at 16 kHz or less is called out 
     assert.deepEqual(list.map((w) => w.code), ["NARROW_MIC"], `${hz}`);
     assert.ok(list[0].text.includes(`${hz / 1000} kHz`), list[0].text);
   }
+  // 8 kHz sounds poor whatever the headset; 16 kHz is normal for many wired and USB headsets, so the owner of one
+  // is not told to get one: only a Bluetooth headset is to be changed, and a wired or USB one goes on.
+  const at8 = deviceWarnings({ ...usb, micRateHz: 8000 })[0].text;
+  assert.match(at8, /sounds poor: use a wired or USB headset/, at8);
+  const at16 = deviceWarnings({ ...usb, micRateHz: 16000 })[0].text;
+  assert.match(at16, /If it is a Bluetooth headset, use a wired or USB one/, at16);
+  assert.match(at16, /If it is already wired or USB, this is fine: go on\./, at16);
+  assert.doesNotMatch(at16, /very basic|sounds poor/, at16);
   assert.deepEqual(deviceWarnings({ ...usb, micRateHz: 44100 }), []);
   assert.deepEqual(deviceWarnings({ ...usb, micRateHz: null }), []);
   // A Bluetooth name gives one warning, not two.

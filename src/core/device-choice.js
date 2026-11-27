@@ -306,8 +306,10 @@ export function toneOutput(snapshot) {
 const BLUETOOTH = /hands-free|bluetooth|\bbt\b|airpods|buds\d*\b|airdopes/i;
 
 /**
- * A microphone that records at this rate or less is a Bluetooth headset in
- * call mode (16 or 8 kHz), or a very basic one: either way it sounds poor.
+ * A microphone that records at this rate or less may be a Bluetooth headset
+ * in call mode (16 or 8 kHz) whose name has no Bluetooth word. Below 16 kHz
+ * it sounds poor whatever it is; 16 kHz is also normal for many wired and USB
+ * headsets, so the warning's text says what to do in each case.
  */
 const NARROW_MIC_HZ = 16000;
 
@@ -512,8 +514,12 @@ export const WARNINGS = Object.freeze({
     `CABLE Input runs at ${hz / 1000} kHz. Set it to 48000 Hz: press Windows key + R, type mmsys.cpl and press Enter → Playback → right-click “CABLE Input” → Properties → Advanced → 48000 Hz → OK. Then press “Check the microphone”.`,
   BLUETOOTH_MIC:
     "Your microphone looks like a Bluetooth headset. Bluetooth adds delay and cut-outs: use a wired or USB headset.",
+  // Below 16 kHz the voice sounds poor whatever the headset. 16 kHz is also the normal rate of many wired and USB
+  // office headsets, so there the text only asks the owner of a Bluetooth one to change.
   NARROW_MIC: (hz) =>
-    `Your microphone records only at ${hz / 1000} kHz: a Bluetooth headset in call mode, or a very basic headset. Use a wired or USB headset.`,
+    hz < 16000
+      ? `Your microphone records only at ${hz / 1000} kHz: a Bluetooth headset in call mode, or a very basic headset. It sounds poor: use a wired or USB headset.`
+      : `Your microphone records at ${hz / 1000} kHz. If it is a Bluetooth headset, use a wired or USB one: Bluetooth adds delay and cut-outs. If it is already wired or USB, this is fine: go on.`,
   // from, to: routeWords() of the two methods (the graph warns only for a move onto the audio element route).
   ROUTE_CHANGED: (from, to) =>
     `The app now sends your voice through ${to} instead of ${from}. This can add delay or clicks: copy the results and send them to me.`,
