@@ -58,6 +58,11 @@ const CLOSE_BACKSTOP_MS = 1000;
 const NONE_SINK_MS = 5000;
 const METERLESS_CHECK_MS = 300; // without a meter: when ctx.currentTime is checked for the heartbeat
 const STEP_BACKSTOP_MS = 5000; // a worklet load, a processor factory or a tap build that takes longer is given up
+// A new microphone source (first start, rebuild, microphone swap) starts with an almost empty buffer, so
+// its first hiccups insert 10 ms holes that are not the two clocks drifting apart. Holes that start this
+// soon after it are left out of micHolesTotal. Measured in headless Chromium: such holes came 26 ms to
+// about 7 s after the source started, most of them within 0.3 s.
+const MIC_SETTLE_MS = 10000;
 
 /** Worklet files, next to this module (the same path in Edge dev mode and in the app). */
 const workletUrl = (file) => new URL(`./worklets/${file}`, import.meta.url).href;
@@ -123,6 +128,18 @@ const secondsToMs = (s) => (typeof s === "number" && Number.isFinite(s) ? round1
 
 /** The context's frame count now (the latest rendered quantum). */
 const frameOf = (ctx) => Math.floor(ctx.currentTime * ctx.sampleRate);
+
+/**
+ * The micBus holes of one meter message that start at context frame `from`
+ * or later. The meter counts its own frames; its message's contextFrame −
+ * frame puts them on the context's clock. A message without both numbers
+ * gives none.
+ */
+function settledHoles(holes, m, from) {
+  if (!Number.isFinite(m.contextFrame) || !Number.isFinite(m.frame)) return [];
+  const offset = m.contextFrame - m.frame;
+  return holes.filter((h) => Number.isFinite(h?.startFrame) && h.startFrame + offset >= from);
+}
 
 /** A GainNode at unity gain that keeps the signal mono. */
 function monoGain(ctx) {
@@ -244,6 +261,7 @@ export class VoiceGraph extends EventTarget {
     this._recovery = new OutputRecovery();
     this._lock = new GraphLock();
     this._epoch = 0;
+    this._epochAbort = null; // aborted by stop(): a browser call of an op that is under way is given up at once
     this._running = false;
     this._startPromise = null;
     this._firstOpFed = null;
@@ -266,6 +284,7 @@ export class VoiceGraph extends EventTarget {
     this._rates = { defaultOutputHz: null, cableInputHz: null };
     this._ratesBusy = false;
     this._ratesAgain = null;
+    this._ratesRun = Promise.resolve();
 
     this._testSource = null;
     this._convertedSource = null;
@@ -315,6 +334,7 @@ export class VoiceGraph extends EventTarget {
   start() {
     if (this._startPromise) return this._startPromise;
     this._epoch++;
+    this._epochAbort = new AbortController();
     this._running = true;
     this._micHolesTotal = 0;
     this._unlockMs = null;
@@ -338,9 +358,16 @@ export class VoiceGraph extends EventTarget {
     return this._startPromise;
   }
 
-  /** Stop: the context is closed, the microphone released, routes and taps disposed. */
+  /**
+   * Stop: the context is closed, the microphone released, routes and taps
+   * disposed. An op that waits for the browser (a device list, a microphone)
+   * gives up at once, so the teardown never waits behind a call that does
+   * not answer.
+   */
   async stop() {
     this._epoch++;
+    this._epochAbort?.abort();
+    this._epochAbort = null;
     this._running = false;
     this._startPromise = null;
     if (this._firstOpFed) this._firstOpFed();
@@ -388,8 +415,10 @@ export class VoiceGraph extends EventTarget {
   }
 
   /**
-   * "Check the microphone". Running: the device list is read again (no new
-   * getUserMedia). Waiting or blocked: try again now. Stopped: start().
+   * "Check the microphone". Running: the device list and the native rates
+   * (Windows' default output, CABLE Input, the routed device) are read again
+   * (no new getUserMedia), so a setting the user just fixed in Windows shows
+   * at once. Waiting or blocked: try again now. Stopped: start().
    * Resolves when that is over: { ok, state }.
    */
   async retry() {
@@ -399,12 +428,15 @@ export class VoiceGraph extends EventTarget {
     }
     const phase = this._recovery.phase;
     if (phase === "running") {
+      const epoch = this._epoch;
+      let rates = null;
       try {
-        this._onDevices(await readDevices({ where: this._where }));
+        rates = this._onDevices(await readDevices({ where: this._where, signal: this._epochAbort?.signal ?? null }));
       } catch (err) {
-        this._log("warn", `devices read failed ${nameOf(err)}`);
+        if (epoch === this._epoch) this._log("warn", `devices read failed ${nameOf(err)}`);
       }
-      return { ok: true, state: this.state };
+      if (epoch === this._epoch) await (rates ?? this._readRates({ cable: true }));
+      return { ok: epoch === this._epoch && this._recovery.phase === "running", state: this.state };
     }
     if (phase === "waiting" || phase === "blocked") this._feed({ type: "user-retry" });
     return this._waitSettled();
@@ -630,7 +662,12 @@ export class VoiceGraph extends EventTarget {
     return this._recovery.startRecord;
   }
 
-  /** The last meter message, plus micHolesTotal (micBus 8–11 ms zero holes since start). */
+  /**
+   * The last meter message, plus micHolesTotal: micBus 8–11 ms zero holes
+   * since start, except those in the first 10 s of each new microphone
+   * source (start, rebuild, microphone swap), which come from the source's
+   * own start rather than from the clocks. micHoles is the meter's own list.
+   */
   get levels() {
     return { ...this._levels, micHoles: this._levels.micHoles.slice(), micHolesTotal: this._micHolesTotal };
   }
@@ -968,6 +1005,8 @@ export class VoiceGraph extends EventTarget {
    */
   async _opRebuild({ reopenMic = false, mode = "full", initial = false }, epoch) {
     const alive = () => epoch === this._epoch;
+    // Browser calls (a device list, a microphone) are given up after 15 s (devices.js), or at once by stop().
+    const signal = this._epochAbort?.signal ?? null;
     const cause = this._cause(initial);
     const old = this._gen;
 
@@ -982,7 +1021,7 @@ export class VoiceGraph extends EventTarget {
     if (old && !keepMeters) await this._disposeGeneration(old);
     if (!alive()) return STALE;
 
-    const snap = await readDevices({ unlockLabels: initial, where: this._where });
+    const snap = await readDevices({ unlockLabels: initial, where: this._where, signal });
     if (!alive()) return STALE;
     if (initial && snap.unlockMs !== null) this._unlockMs = snap.unlockMs;
     this._takeSnapshot(snap);
@@ -992,7 +1031,7 @@ export class VoiceGraph extends EventTarget {
     if (reopenMic || !this._micLive()) {
       const choice = chooseMic(snap.inputs, { saved: saved.mic, wanted: this._wantedMic });
       if (!choice.entry) return { ok: false, error: snap.unlockError ?? noMicError(this._where) };
-      const opened = await openMic(choice.entry, { where: this._where });
+      const opened = await openMic(choice.entry, { where: this._where, signal });
       if (!alive()) {
         stopStream(opened.stream);
         return STALE;
@@ -1036,7 +1075,7 @@ export class VoiceGraph extends EventTarget {
   /** Edge: Start resumed the kept context; route it if the output is still the same. null → rebuild instead. */
   async _retryWaitingGeneration(gen, epoch, { initial, cause }) {
     const alive = () => epoch === this._epoch;
-    const snap = await readDevices({ where: this._where });
+    const snap = await readDevices({ where: this._where, signal: this._epochAbort?.signal ?? null });
     if (!alive()) return STALE;
     this._takeSnapshot(snap);
     const outChoice = chooseOutput(snap.outputs, { saved: this._saved().output });
@@ -1160,7 +1199,15 @@ export class VoiceGraph extends EventTarget {
   /** reopen-mic: open the microphone again and swap it into micBus; taps and engine inputs stay. */
   async _opReopenMic(epoch) {
     const alive = () => epoch === this._epoch;
-    const snap = await readDevices({ where: this._where });
+    const signal = this._epochAbort?.signal ?? null;
+    let snap;
+    try {
+      snap = await readDevices({ where: this._where, signal });
+    } catch (err) {
+      // No device list (it did not come in time): a user's change fails, and the live microphone stays.
+      if (!alive()) return STALE;
+      return { ok: false, error: err, kept: this._micLive() };
+    }
     if (!alive()) return STALE;
     this._takeSnapshot(snap);
     const saved = this._saved();
@@ -1168,7 +1215,7 @@ export class VoiceGraph extends EventTarget {
     if (!choice.entry) return { ok: false, error: noMicError(this._where), kept: this._micLive() };
     let opened;
     try {
-      opened = await openMic(choice.entry, { where: this._where });
+      opened = await openMic(choice.entry, { where: this._where, signal });
     } catch (err) {
       if (!alive()) return STALE;
       return { ok: false, error: err, kept: this._micLive() };
@@ -1245,6 +1292,7 @@ export class VoiceGraph extends EventTarget {
       outBus: null,
       micSource: null,
       micSources: new Set(),
+      micHolesFrom: 0, // context frame from which micBus holes count (see MIC_SETTLE_MS)
       testNode: null,
       convertedNode: null,
       processor: null,
@@ -1382,6 +1430,7 @@ export class VoiceGraph extends EventTarget {
   _connectMicSource(gen, stream) {
     const source = gen.ctx.createMediaStreamSource(stream);
     source.connect(gen.micBus);
+    gen.micHolesFrom = frameOf(gen.ctx) + Math.round((MIC_SETTLE_MS * gen.ctx.sampleRate) / 1000);
     const old = gen.micSource;
     gen.micSource = source;
     gen.micSources.add(source);
@@ -1657,7 +1706,7 @@ export class VoiceGraph extends EventTarget {
     const m = ev.data;
     if (!m || m.type !== "levels") return;
     const holes = Array.isArray(m.micHoles) ? m.micHoles : [];
-    this._micHolesTotal += micHoleCount(holes);
+    this._micHolesTotal += micHoleCount(settledHoles(holes, m, gen.micHolesFrom));
     this._levels = {
       micRmsDb: m.micRmsDb,
       micPeakDb: m.micPeakDb,
@@ -1745,12 +1794,18 @@ export class VoiceGraph extends EventTarget {
     return true;
   }
 
-  /** devicechange (no lock: it only reads and feeds the reducer). */
+  /**
+   * devicechange (no lock: it only reads and feeds the reducer). The native
+   * rates are read again too, CABLE Input's included: the user may just have
+   * changed its format in Windows. → the rates read (a promise), or null
+   * when the snapshot was not taken.
+   */
   _onDevices(snap) {
-    if (!this._running || !snap) return;
-    if (!this._takeSnapshot(snap)) return;
-    this._readRates({ cable: false });
+    if (!this._running || !snap) return null;
+    if (!this._takeSnapshot(snap)) return null;
+    const rates = this._readRates({ cable: true });
     this._checkMoves(snap);
+    return rates;
   }
 
   /**
@@ -1788,14 +1843,22 @@ export class VoiceGraph extends EventTarget {
 
   /**
    * Native rates (each a short-lived context): Windows' default playback
-   * device, and with cable: CABLE Input and the routed device. Coalesced.
+   * device, and with cable: CABLE Input and the routed device. Coalesced: a
+   * request while a read runs makes exactly one more read after it. The
+   * promise resolves once the rates (and warnings) are up to date, never
+   * rejects, and never waits for good (readOutputRate gives up by itself).
    */
-  async _readRates({ cable = true } = {}) {
+  _readRates({ cable = true } = {}) {
     if (this._ratesBusy) {
       this._ratesAgain = { cable: Boolean(this._ratesAgain?.cable) || cable };
-      return;
+      return this._ratesRun;
     }
     this._ratesBusy = true;
+    this._ratesRun = this._ratesLoop({ cable }).catch(() => {});
+    return this._ratesRun;
+  }
+
+  async _ratesLoop({ cable }) {
     let want = { cable };
     try {
       while (want) {
@@ -1942,7 +2005,10 @@ export class VoiceGraph extends EventTarget {
 
   /** One log line per distinct failure in an outage (a long outage would otherwise log every 250 ms). */
   _logFailure(op, err) {
-    const parts = [nameOf(err), err?.code, err?.kind, err?.errorName].filter((x) => typeof x === "string" && x);
+    // A MicError's cause is the browser's error name ("TimeoutError" for a getUserMedia that never answered).
+    const parts = [nameOf(err), err?.code, err?.kind, err?.errorName, err?.cause?.name].filter(
+      (x) => typeof x === "string" && x,
+    );
     const key = `${op} ${parts.join(" ")}`;
     if (key === this._lastFailureKey) return;
     this._lastFailureKey = key;

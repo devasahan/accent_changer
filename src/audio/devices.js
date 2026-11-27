@@ -15,12 +15,29 @@
  * MicErrors: a code the recovery reducer understands, the browser's own error
  * name, and a plain-English text for the page.
  *
+ * Every call to the browser here (enumerateDevices, getUserMedia, closing a
+ * probe context) is given up when it does not answer in time, so nothing
+ * that waits for one can wait for good. A stream that arrives after that is
+ * stopped at once.
+ *
  * Nothing here touches the page when it is imported: navigator and
  * AudioContext are only used inside the functions.
  */
 import { VIRTUAL_MIC, isCableOutput, usableMics, findCableInput } from "../core/devices-match.js";
 import { WARNINGS, findCableOutput, micSettingsReport } from "../core/device-choice.js";
+import { abortError } from "../core/async.js";
 import { redact } from "../core/redact.js";
+
+/**
+ * How long enumerateDevices() or getUserMedia() may take before it is given
+ * up (a "TimeoutError"). Generous, so that the permission question of a first
+ * launch in Edge still fits. The recovery treats it as a passing failure and
+ * tries again.
+ */
+export const NO_ANSWER_MS = 15000;
+
+/** How long closing a probe context may take (readOutputRate). */
+const PROBE_CLOSE_MS = 2000;
 
 /** Chromium's pseudo-devices that follow Windows' default and default communications device. */
 const PSEUDO_IDS = ["default", "communications"];
@@ -39,6 +56,7 @@ const TEXTS = Object.freeze({
   browserRefused:
     "The browser blocked the microphone for this page: click the icon left of the address bar → Permissions for this site → Microphone → Allow, then reload the page.",
   busy: "The microphone could not be opened: another app may be holding it. Close apps that use it and try again.",
+  noAnswer: "The microphone did not answer in time. Try again in a moment.",
   notFound: "No microphone was found. Plug in your headset and try again.",
   gone: "That microphone is not connected any more (unplugged?). Plug it in, or pick another one in the list.",
   noMediaDevices: "This page cannot use microphones (it is not a secure page). Open the app itself, or http://localhost:8080/src/ in Edge.",
@@ -62,6 +80,67 @@ export function stopStream(stream) {
   } catch {
     // Nothing to stop.
   }
+}
+
+/** The error of a browser call that did not answer in time (name "TimeoutError"). */
+function noAnswer(what, ms) {
+  const e = new Error(`${what} did not answer within ${Math.round(ms / 1000)} s.`);
+  e.name = "TimeoutError";
+  return e;
+}
+
+/**
+ * The outcome of a browser call that is already under way: its value or its
+ * error; a TimeoutError after `ms`; an AbortError as soon as `signal` aborts
+ * (the caller gave up). A value that comes after that goes to `onLate` (a
+ * late stream is stopped there); a late error is ignored.
+ * @template T
+ * @param {Promise<T>} call
+ * @param {{ms: number, what: string, signal?: AbortSignal|null, onLate?: ((value: T) => void)|null}} options
+ * @returns {Promise<T>}
+ */
+function bounded(call, { ms, what, signal = null, onLate = null }) {
+  const limit = Number.isFinite(ms) && ms > 0 ? ms : NO_ANSWER_MS;
+  return new Promise((resolve, reject) => {
+    let over = false;
+    let timer = null;
+    const onAbort = () => {
+      if (over) return;
+      end();
+      reject(abortError());
+    };
+    const end = () => {
+      over = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+    };
+    timer = setTimeout(() => {
+      if (over) return;
+      end();
+      reject(noAnswer(what, limit));
+    }, limit);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener?.("abort", onAbort, { once: true });
+    Promise.resolve(call).then(
+      (value) => {
+        if (!over) {
+          end();
+          resolve(value);
+          return;
+        }
+        try {
+          onLate?.(value);
+        } catch {
+          // Nothing more to clean up.
+        }
+      },
+      (err) => {
+        if (over) return;
+        end();
+        reject(err);
+      },
+    );
+  });
 }
 
 /**
@@ -119,6 +198,7 @@ export function micErrorText(err, where = "app") {
     return browser ? TEXTS.browserRefused : TEXTS.appRefused;
   }
   if (name === "NotReadableError" || name === "AbortError") return TEXTS.busy;
+  if (name === "TimeoutError") return TEXTS.noAnswer;
   if (name === "NotFoundError") return TEXTS.notFound;
   if (name === "OverconstrainedError") return TEXTS.gone;
   if (name === "NoMediaDevices") return TEXTS.noMediaDevices;
@@ -154,8 +234,9 @@ function mediaDevices(where) {
 }
 
 /** Plain copies of the audio entries of enumerateDevices() (never instanceof MediaDeviceInfo). */
-async function enumerate(md) {
-  const list = await md.enumerateDevices();
+async function enumerate(md, { timeoutMs, signal }) {
+  if (signal?.aborted) throw abortError();
+  const list = await bounded(md.enumerateDevices(), { ms: timeoutMs, what: "enumerateDevices", signal });
   const out = [];
   for (const d of list ?? []) {
     if (!d || (d.kind !== "audioinput" && d.kind !== "audiooutput")) continue;
@@ -191,27 +272,32 @@ const pseudoLabel = (list, id) => list.find((d) => d.deviceId === id)?.label ?? 
  *    recorded) so that Chromium shows the names, and the list is read again.
  *    unlockMs is how long that took (a permission question would appear
  *    there); null when it was not needed. unlockError is the MicError when it
- *    failed (the names then stay hidden), else null.
- * Throws a MicError only when the page has no media devices at all.
- * @param {{unlockLabels?: boolean, where?: "app"|"browser"}} [options]
+ *    failed or did not answer within timeoutMs (the names then stay hidden),
+ *    else null.
+ * Throws a MicError when the page has no media devices at all, a
+ * TimeoutError when enumerateDevices() does not answer within timeoutMs, and
+ * an AbortError as soon as `signal` aborts.
+ * @param {{unlockLabels?: boolean, where?: "app"|"browser", timeoutMs?: number, signal?: AbortSignal|null}} [options]
  */
-export async function readDevices({ unlockLabels = false, where = "app" } = {}) {
+export async function readDevices({ unlockLabels = false, where = "app", timeoutMs = NO_ANSWER_MS, signal = null } = {}) {
   const md = mediaDevices(where);
-  let list = await enumerate(md);
+  const limits = { timeoutMs, signal };
+  let list = await enumerate(md, limits);
   let unlockMs = null;
   let unlockError = null;
   if (unlockLabels && !list.some((d) => d.kind === "audioinput" && d.label)) {
     const t0 = performance.now();
     try {
-      const stream = await md.getUserMedia({
+      const asking = md.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       });
-      stopStream(stream);
+      stopStream(await bounded(asking, { ms: timeoutMs, what: "getUserMedia", signal, onLate: stopStream }));
     } catch (err) {
+      if (signal?.aborted) throw abortError();
       unlockError = toMicError(err, where);
     }
     unlockMs = Math.round(performance.now() - t0);
-    list = await enumerate(md);
+    list = await enumerate(md, limits);
   }
   const inputs = list.filter((d) => d.kind === "audioinput");
   const outputs = list.filter((d) => d.kind === "audiooutput");
@@ -237,12 +323,14 @@ export async function readDevices({ unlockLabels = false, where = "app" } = {}) 
 /**
  * Call `callback(snapshot)` after each "devicechange". Coalesced without
  * timers: while one read runs, further events only mark it dirty, and
- * exactly one more read follows when it ends. A failed read is skipped.
+ * exactly one more read follows when it ends. A failed read is skipped, and
+ * so is a read that gets no answer within timeoutMs, so later changes are
+ * still read.
  * @param {(snapshot: object) => void} callback
- * @param {{where?: "app"|"browser"}} [options]
+ * @param {{where?: "app"|"browser", timeoutMs?: number}} [options]
  * @returns {() => void} unsubscribe
  */
-export function onDeviceChange(callback, { where = "app" } = {}) {
+export function onDeviceChange(callback, { where = "app", timeoutMs = NO_ANSWER_MS } = {}) {
   const md = globalThis.navigator?.mediaDevices;
   if (!md || typeof md.addEventListener !== "function") return () => {};
   let active = true;
@@ -255,7 +343,7 @@ export function onDeviceChange(callback, { where = "app" } = {}) {
         dirty = false;
         let snapshot = null;
         try {
-          snapshot = await readDevices({ where });
+          snapshot = await readDevices({ where, timeoutMs });
         } catch {
           snapshot = null;
         }
@@ -309,11 +397,14 @@ export function micConstraints(deviceId) {
  * Refused before Windows is asked: CABLE Output (MicError "is-cable", text
  * WARNINGS.MIC_IS_CABLE) and any other virtual microphone (Krisp,
  * Voicemeeter, Stereo Mix, …: "is-virtual", WARNINGS.MIC_IS_VIRTUAL).
- * Every other failure is a MicError (toMicError).
+ * Every other failure is a MicError (toMicError), including a getUserMedia
+ * that does not answer within timeoutMs (code "other", cause TimeoutError: a
+ * passing failure that the recovery retries; the stream, if it comes later,
+ * is stopped). An AbortError as soon as `signal` aborts (the caller gave up).
  * @param {{deviceId: string, label?: string}} entry
- * @param {{where?: "app"|"browser"}} [options]
+ * @param {{where?: "app"|"browser", timeoutMs?: number, signal?: AbortSignal|null}} [options]
  */
-export async function openMic(entry, { where = "app" } = {}) {
+export async function openMic(entry, { where = "app", timeoutMs = NO_ANSWER_MS, signal = null } = {}) {
   const label = typeof entry?.label === "string" ? entry.label : "";
   if (isCableOutput(label)) {
     throw new MicError("is-cable", WARNINGS.MIC_IS_CABLE, { name: "VirtualMicrophone", message: "" });
@@ -324,11 +415,14 @@ export async function openMic(entry, { where = "app" } = {}) {
   const id = typeof entry?.deviceId === "string" ? entry.deviceId : "";
   if (!id || PSEUDO_IDS.includes(id)) throw noMicError(where);
   const md = mediaDevices(where);
+  if (signal?.aborted) throw abortError();
   const t0 = performance.now();
   let stream;
   try {
-    stream = await md.getUserMedia(micConstraints(id));
+    const asking = md.getUserMedia(micConstraints(id));
+    stream = await bounded(asking, { ms: timeoutMs, what: "getUserMedia", signal, onLate: stopStream });
   } catch (err) {
+    if (signal?.aborted) throw abortError();
     throw toMicError(err, where);
   }
   const openedInMs = Math.round(performance.now() - t0);
@@ -349,23 +443,29 @@ export async function openMic(entry, { where = "app" } = {}) {
 /**
  * Open VB-CABLE's "CABLE Output" (the microphone the meeting app uses) to
  * record what the meeting hears: the exact id from the snapshot, mono,
- * processing off. → { stream, track, settings }.
+ * processing off. → { stream, track, settings }. A getUserMedia that does
+ * not answer within timeoutMs is given up (its stream, if it comes later, is
+ * stopped).
  * @param {object|null} snapshot a DeviceSnapshot
+ * @param {{timeoutMs?: number}} [options]
  */
-export async function openCableOutput(snapshot) {
+export async function openCableOutput(snapshot, { timeoutMs = NO_ANSWER_MS } = {}) {
   const id = snapshot?.cableOut?.deviceId;
   if (typeof id !== "string" || !id) throw new Error("“CABLE Output” is not among the microphones: is VB-CABLE installed?");
   const md = mediaDevices("app");
   let stream;
   try {
-    stream = await md.getUserMedia(micConstraints(id));
+    const asking = md.getUserMedia(micConstraints(id));
+    stream = await bounded(asking, { ms: timeoutMs, what: "getUserMedia", onLate: stopStream });
   } catch (err) {
     const name = nameOf(err);
     const busy = name === "NotReadableError" || name === "AbortError";
     const e = new Error(
-      busy
-        ? "“CABLE Output” could not be opened: another app may hold it. Close that app and try again."
-        : `“CABLE Output” could not be opened (${name}). Try again; if it keeps failing, restart the app.`,
+      name === "TimeoutError"
+        ? "“CABLE Output” did not answer in time. Try again; if it keeps happening, restart the app."
+        : busy
+          ? "“CABLE Output” could not be opened: another app may hold it. Close that app and try again."
+          : `“CABLE Output” could not be opened (${name}). Try again; if it keeps failing, restart the app.`,
     );
     e.cause = { name, message: redact(messageOf(err)) };
     throw e;
@@ -395,14 +495,18 @@ export async function openCableOutput(snapshot) {
  * device's rate), so the id is looked up in a fresh device list first. The
  * context is closed at once, before that check, so a device that vanished
  * in between costs a wrong number in the results, never an error.
+ * A device list that does not come within timeoutMs gives null; a close()
+ * that does not finish within 2 s is not waited for.
  * @param {string} [deviceId]
+ * @param {{timeoutMs?: number}} [options]
  * @returns {Promise<number|null>}
  */
-export async function readOutputRate(deviceId = "") {
+export async function readOutputRate(deviceId = "", { timeoutMs = NO_ANSWER_MS } = {}) {
   let ctx = null;
   try {
     if (deviceId) {
-      const list = await globalThis.navigator.mediaDevices.enumerateDevices();
+      const asking = globalThis.navigator.mediaDevices.enumerateDevices();
+      const list = await bounded(asking, { ms: timeoutMs, what: "enumerateDevices" });
       if (!list.some((d) => d.kind === "audiooutput" && d.deviceId === deviceId)) return null;
     }
     ctx = deviceId ? new AudioContext({ sinkId: deviceId }) : new AudioContext();
@@ -414,9 +518,9 @@ export async function readOutputRate(deviceId = "") {
   } finally {
     if (ctx) {
       try {
-        await ctx.close();
+        await bounded(ctx.close(), { ms: PROBE_CLOSE_MS, what: "close()" });
       } catch {
-        // Already closed.
+        // Already closed, or it does not answer: the rate is known either way.
       }
     }
   }
