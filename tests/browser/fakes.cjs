@@ -152,8 +152,9 @@ function fakeTauri({ build, tokenResponse, refusedKey, refusedSavedKey }) {
  *
  * Switches (window.__fake): noCable, cableAlias(id), defaultOutputIsCable,
  * hideLabels, unplug(label) / plug(label) (a fake input, or "Fake Audio
- * Output 2", the earpiece), refuseContextSink,
- * refuseElementSink, resumeHangsOnce, pauseElement(), endMic(),
+ * Output 2", the earpiece), refuseMic (every getUserMedia is refused with
+ * NotAllowedError, as when Windows' microphone privacy switch is off),
+ * refuseContextSink, refuseElementSink, resumeHangsOnce, pauseElement(), endMic(),
  * setMicGain(v), gumDelayMs, sinkDelayMs, cutCable(ms), devicechange(),
  * synthMic (set before the load: microphones are a steady 220 Hz tone made
  * in the fake's own context instead of a capture; Chromium lets a page
@@ -197,6 +198,7 @@ function fakeAudio() {
     noCable: false,
     defaultOutputIsCable: false,
     hideLabels: false,
+    refuseMic: false,
     refuseContextSink: false,
     refuseElementSink: false,
     resumeHangsOnce: false,
@@ -513,6 +515,8 @@ function fakeAudio() {
   }
   md.getUserMedia = async function getUserMedia(constraints) {
     if (fake.gumDelayMs > 0) await sleep(fake.gumDelayMs);
+    // Windows' privacy switch refuses every capture device, VB-CABLE's own included.
+    if (fake.refuseMic) throw refusal("NotAllowedError", "Permission denied by system");
     const want = constraints?.audio?.deviceId;
     const exact = typeof want === "string" ? want : want?.exact;
     if (exact === CABLE_OUT_ID) {

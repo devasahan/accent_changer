@@ -20,7 +20,7 @@ import { gateSummary } from "./core/cable-check.js";
 import { VoiceGraph } from "./audio/graph.js";
 import { Monitor } from "./audio/monitor.js";
 import { Checks } from "./audio/measure.js";
-import { VoiceView, changeOutcome, fillList } from "./ui/voice.js";
+import { CHOICE_TEXTS, VoiceView, changeOutcome, fillList } from "./ui/voice.js";
 import { ChecksView, delayKind } from "./ui/checks.js";
 
 const $ = (id) => document.getElementById(id);
@@ -59,12 +59,15 @@ const checksView = new ChecksView({ $ });
 /** The long check that runs (its handle), or null. */
 let longHandle = null;
 let lastRenderMs = 0;
+/** Counts the status lines shown: an outcome that comes late never replaces a newer line. */
+let statusCount = 0;
 
 function recordError(message) {
   results.errors.push({ at: new Date().toISOString(), message });
 }
 
 function setStatus(message, kind = "info") {
+  statusCount += 1;
   const el = $("status");
   el.textContent = message;
   el.dataset.kind = kind;
@@ -225,6 +228,38 @@ function changeStatus(taken, done, failed, notSaved = null) {
   setStatus(text, kind);
 }
 
+/**
+ * A choice of microphone ("mic"), output ("output") or route ("route"):
+ * `save()` saves it (→ why it could not be saved, or null), then `ask()`
+ * asks the voice graph for it. The graph answers within 10 s, but a switch
+ * can take longer (opening a microphone may take 15 s, and a change can
+ * wait behind another one). While the graph is still on it, the status line
+ * says so, and the outcome follows once the graph has settled the choice.
+ * A newer status line (another choice, a button) is never replaced by it.
+ */
+async function makeChoice(kind, value, { save = async () => null, ask }) {
+  const texts = CHOICE_TEXTS[kind];
+  const choice = voiceView.follow(kind, value);
+  setStatus(texts.switching);
+  let mine = statusCount;
+  let notSaved = null;
+  let now = null;
+  try {
+    notSaved = await save();
+    await ask();
+  } finally {
+    now = choice.answered();
+  }
+  if (now === "pending") {
+    if (statusCount !== mine) return;
+    setStatus(texts.still);
+    mine = statusCount;
+    now = await choice.settled;
+  }
+  if (now === null || statusCount !== mine) return;
+  changeStatus(now === "taken", texts.done, texts.failed, notSaved);
+}
+
 /** The user's choices as the graph reads them before every operation. */
 const getSaved = () => ({
   mic: { deviceId: settings.micDeviceId, label: settings.micLabel },
@@ -275,17 +310,11 @@ onSelect("micSelect", async (select) => {
   const id = select.value;
   const entry = (graph.snapshot?.usable ?? []).find((d) => d.deviceId === id);
   if (!entry) return;
-  voiceView.pendingMic = id;
-  setStatus("Switching the microphone…");
   platform.log("info", "user mic");
-  try {
-    const notSaved = await saveSettings({ micDeviceId: id, micLabel: entry.label });
-    await graph.setMic(id);
-    changeStatus(voiceView.usesMic(id), "Microphone switched.", "The microphone could not be switched: see step 2.", notSaved);
-  } finally {
-    if (voiceView.pendingMic === id) voiceView.pendingMic = null;
-    voiceView.renderSelects();
-  }
+  await makeChoice("mic", id, {
+    save: () => saveSettings({ micDeviceId: id, micLabel: entry.label }),
+    ask: () => graph.setMic(id),
+  });
 });
 
 onSelect("outSelect", async (select) => {
@@ -293,21 +322,19 @@ onSelect("outSelect", async (select) => {
   const id = select.value;
   const entry = id ? (graph.snapshot?.outputs ?? []).find((d) => d.deviceId === id) : null;
   if (id && !entry) return;
-  setStatus("Switching where your voice goes…");
   platform.log("info", `user output ${id ? "chosen" : "auto"}`);
-  const notSaved = await saveSettings({ cableDeviceId: id, cableLabel: entry?.label ?? "" });
-  await graph.setOutput(id || null);
-  changeStatus(voiceView.usesOutput(id), "Switched where your voice goes.", "That device could not be used: see step 2.", notSaved);
+  await makeChoice("output", id, {
+    save: () => saveSettings({ cableDeviceId: id, cableLabel: entry?.label ?? "" }),
+    ask: () => graph.setOutput(id || null),
+  });
 });
 
 // Advanced (diagnostics only, not saved): the audio element route.
 onSelect("routeSelect", async (select) => {
   if (!graph) return;
   const value = select.value === "element" ? "element" : "auto";
-  setStatus("Switching the output route…");
   platform.log("info", `user route ${value}`);
-  await graph.setRoutePreference(value);
-  changeStatus(voiceView.usesRoute(value), "Output route switched.", "The output route could not be switched: see step 2.");
+  await makeChoice("route", value, { ask: () => graph.setRoutePreference(value) });
 });
 
 // "Check the microphone": a fresh look at the devices; no new microphone request when one is open.

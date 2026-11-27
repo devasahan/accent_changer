@@ -462,7 +462,35 @@ const PORTAL_REQUEST_ID = "3c9a5e1f".repeat(8);
 const IN1 = "Fake Audio Input 1";
 const IN2 = "Fake Audio Input 2";
 const CABLE_IN_LABEL = "CABLE Input (VB-Audio Virtual Cable)";
+const CABLE_OUT_LABEL = "CABLE Output (VB-Audio Virtual Cable)";
 const TONE_HZ = 1031.25;
+const ISO_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+// The checklist row of the microphone (Gate 1: no prompt, processing off).
+const MIC_ROW = "Microphone: no prompt, processing off";
+
+/**
+ * Step 2's two level meters (dB, −60 at the bottom), read in the page every
+ * 50 ms until both went above `above` or `ms` passed. → { mic: [...], out: [...] }
+ */
+const sampleMeters = (page, { ms, above = -40 }) =>
+  page.evaluate(
+    async ([limit, top]) => {
+      const seen = { mic: [], out: [] };
+      const end = performance.now() + limit;
+      while (performance.now() < end) {
+        seen.mic.push(document.querySelector("#micMeter").value);
+        seen.out.push(document.querySelector("#outMeter").value);
+        if (Math.max(...seen.mic) > top && Math.max(...seen.out) > top) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return seen;
+    },
+    [ms, above],
+  );
+
+/** Step 2's facts (#voiceInfo) as { term: value }. */
+const voiceInfoRows = (page) =>
+  page.$$eval("#voiceInfo dt", (dts) => Object.fromEntries(dts.map((dt) => [dt.textContent, dt.nextElementSibling?.textContent ?? ""])));
 
 /**
  * Sanas's portal as the SDK's initialize() uses it (src/vendor/sanas-browser-sdk:
@@ -560,7 +588,7 @@ const graphOffCable = (app) =>
   });
 
 /** The app's page with everything faked, and the scenarios that run in it (one page, reloaded where they say). */
-async function appMode(browser, base, WARNINGS, VOICE_TEXTS) {
+async function appMode(browser, base, { WARNINGS, VOICE_TEXTS, CHOICE_TEXTS }) {
   console.log("\nThe installed app's page (src/platform/tauri.js; Rust side, Sanas portal and VB-CABLE faked):");
   const context = await browser.newContext();
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: base });
@@ -590,6 +618,7 @@ async function appMode(browser, base, WARNINGS, VOICE_TEXTS) {
     portal,
     WARNINGS,
     VOICE_TEXTS,
+    CHOICE_TEXTS,
     ids: null,
     ...tools,
     /** Flags for the next loads (fakeFlags reads them before the page's scripts). */
@@ -606,6 +635,36 @@ async function appMode(browser, base, WARNINGS, VOICE_TEXTS) {
     },
     settingsFile: () => page.evaluate(() => JSON.parse(sessionStorage.getItem("fake-settings") || "null")),
     lastRecovery: (r) => r.voice?.recoveries?.[r.voice.recoveries.length - 1] ?? null,
+    /** The lines under Recoveries in step 2. */
+    recoveryLines: () => page.$$eval("#recoveryLog li", (lis) => lis.map((li) => li.textContent)),
+    /** A row of the Session B checklist in the results. */
+    gateRow: (r, name) => (r.gate ?? []).find((g) => g.row === name) ?? null,
+    /**
+     * From now on, record every status line in window.__statusSeen, with step
+     * 2's status and the microphone the list shows at that moment.
+     */
+    watchStatus: () =>
+      page.evaluate(() => {
+        window.__statusSeen = [];
+        if (window.__statusObserver) return;
+        const status = document.querySelector("#status");
+        window.__statusObserver = new MutationObserver(() =>
+          window.__statusSeen.push({
+            status: status.textContent,
+            kind: status.dataset.kind,
+            voice: document.querySelector("#voiceStatus").textContent,
+            mic: document.querySelector("#micSelect").value,
+          }),
+        );
+        window.__statusObserver.observe(status, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ["data-kind"] });
+      }),
+    statusSeen: () => page.evaluate(() => window.__statusSeen ?? []),
+    /** Wait until the status line is exactly `wanted`. → whether it was within `timeout` */
+    statusIs: (wanted, timeout) =>
+      page.waitForFunction((t) => document.querySelector("#status").textContent === t, wanted, { timeout }).then(
+        () => true,
+        () => false,
+      ),
   };
 
   try {
@@ -691,10 +750,23 @@ async function passthrough(app) {
   check(r.settings?.source === "none", "no settings saved yet", json(r.settings));
   const loud = await peak(1500);
   check(loud > 0.01, "the microphone reaches CABLE Output", `peak ${loud}`);
+  // README Session B step 4: speak, and the bars "Your microphone" and "Going to the meeting" move. The fake
+  // microphone's speech has pauses of up to 1 s, so the meters are read for up to 3 s.
+  const meters = await sampleMeters(page, { ms: 3000 });
+  check(
+    Math.max(...meters.mic) > -40 && Math.max(...meters.out) > -40,
+    "while the microphone plays, step 2's two level meters move",
+    `microphone ${json([...new Set(meters.mic.map(Math.round))])}, to the meeting ${json([...new Set(meters.out.map(Math.round))])}`,
+  );
   await fake(() => window.__fake.setMicGain(0));
   let quiet = 1;
   for (let i = 0; i < 2 && quiet >= 1e-4; i++) quiet = await peak(1000);
   check(quiet < 1e-4, "with the microphone silent, CABLE Output is silent within 2 s (it is the app's path)", `peak ${quiet}`);
+  const bottom = await app.waitPage(() => {
+    const m = [document.querySelector("#micMeter").value, document.querySelector("#outMeter").value];
+    return m[0] === -60 && m[1] === -60 ? m : null;
+  }, null, 2000);
+  check(Boolean(bottom), "and both meters fall to the bottom (−60 dB) within 2 s", json(await fake(() => [document.querySelector("#micMeter").value, document.querySelector("#outMeter").value])));
   await fake(() => window.__fake.setMicGain(1));
 
   const mics = await page.$$eval("#micSelect option", (os) => os.map((o) => o.textContent));
@@ -707,6 +779,50 @@ async function passthrough(app) {
   check(/Your voice goes into “CABLE Input”/.test(await text("#voiceStatus")), "step 2 says where the voice goes", await text("#voiceStatus"));
   check((await page.locator("#voiceStatus").getAttribute("data-kind")) === "ok", "and is green while the voice runs");
   check(/the app's audio engine/.test(await text("#voiceInfo")), "and how it is sent", await text("#voiceInfo"));
+
+  // What Gate 1 reads from voice (spec §6.5, §10, §12): the open times (no mic prompt), VB-CABLE's endpoint names
+  // and rates, the route's latencies, and the microphone's holes.
+  r = await waitResults(
+    (x) => x.voice?.state === "running" && x.voice.output?.sinkRateHz > 0 && x.voice.devices?.defaultOutputRateHz > 0,
+    3000,
+  );
+  const v = r.voice ?? {};
+  check(v.processor === "worklet", "the voice goes through the app's worklet", json(v.processor));
+  check(
+    Number.isFinite(v.mic?.openedInMs) && v.mic.openedInMs >= 0 && v.mic.openedInMs < 1500 && (v.mic.unlockMs === null || Number.isFinite(v.mic.unlockMs)),
+    "the results keep how long the microphone took to open (no prompt: well under 1.5 s)",
+    json({ openedInMs: v.mic?.openedInMs, unlockMs: v.mic?.unlockMs }),
+  );
+  check(app.gateRow(r, MIC_ROW)?.status === "pass", "so the checklist's microphone row passes", json(app.gateRow(r, MIC_ROW)));
+  check(
+    same([...(v.devices?.cableEndpoints ?? [])].sort(), [CABLE_IN_LABEL, CABLE_OUT_LABEL].sort()),
+    "the results name VB-CABLE's two endpoints",
+    json(v.devices?.cableEndpoints),
+  );
+  check(
+    v.devices.defaultOutputRateHz > 0 && v.output?.sinkRateHz > 0 && v.output.contextRateHz === 48000,
+    "and the rates: Windows' default playback device, CABLE Input, the app's audio engine (48 kHz)",
+    json({ defaultOutputRateHz: v.devices.defaultOutputRateHz, sinkRateHz: v.output?.sinkRateHz, contextRateHz: v.output?.contextRateHz }),
+  );
+  check(
+    Number.isFinite(v.output?.outputLatencyMs) && v.output.outputLatencyMs >= 0 && Number.isFinite(v.output?.baseLatencyMs),
+    "and the delay on the way out",
+    json({ baseLatencyMs: v.output?.baseLatencyMs, outputLatencyMs: v.output?.outputLatencyMs }),
+  );
+  check(v.devices.defaultOutputIsCable === false, "Windows' default playback device is not CABLE Input", json(v.devices));
+  check(
+    ISO_TIME.test(v.since ?? "") && Date.parse(v.since) <= Date.now() && Number.isInteger(v.micHoles?.total) && v.micHoles.total >= 0 &&
+      Number.isFinite(v.micHoles?.per30Min) && v.micHoles.per30Min >= 0,
+    "the results say since when the voice is in its state, and count the microphone's holes",
+    json({ since: v.since, micHoles: v.micHoles }),
+  );
+  const rows = await voiceInfoRows(page);
+  const kHz = (hz) => `${hz / 1000} kHz`;
+  check(
+    rows["CABLE Input runs at"] === kHz(v.output.sinkRateHz) && rows["Default playback device runs at"] === kHz(v.devices.defaultOutputRateHz),
+    "step 2 shows the rates of CABLE Input and of the default playback device",
+    json(rows),
+  );
   // Gate 1's tick row: the headset's microphone and its earpiece, which is also Windows' default playback device.
   check(
     r.voice.devices?.micHasSiblingOutput === true && r.voice.devices?.defaultOutputIsMicSibling === true,
@@ -858,8 +974,13 @@ async function keyFlows(app) {
 
 // ---- 5 · Measure the delay ----
 
+// The colour of a delay's verdict (spec §6.3, §6.4): typed here, not taken from the page's code.
+const DELAY_KIND = { good: "ok", borderline: "warn", slow: "error", unclear: "warn", "silent-mic": "warn", "silent-cable": "error" };
+// The colour of a long check's verdict (spec §6.3: "Long check done." takes the verdict's kind).
+const LONG_KIND = { pass: "ok", "fix-setting": "warn", fail: "error", "no-signal": "error" };
+
 async function measureDelay(app) {
-  const { results, text, press } = app;
+  const { page, results, text, press, status, statusKind } = app;
   await press("btnMeasure", /Delay measured/, "#status", 40000);
   const r = await results();
   const d = r.checks.delay[0] ?? {};
@@ -877,6 +998,12 @@ async function measureDelay(app) {
   check(d.route === "context" && d.site === "graph", "on the app's own route, recorded in the graph's context", `${d.route} ${d.site}`);
   const shown = await text("#measureInfo");
   check(/ms/.test(shown) && shown.includes(d.text), "step 3 shows the delay", shown);
+  const kinds = [await statusKind(), await page.locator("#measureInfo").getAttribute("data-kind")];
+  check(
+    (await status()) === "Delay measured." && same(kinds, [DELAY_KIND[d.verdict], DELAY_KIND[d.verdict]]),
+    "the status line and step 3 take the verdict's colour",
+    `${d.verdict}: ${json(kinds)}`,
+  );
   const row = r.gate.find((g) => g.row === "Delay at most 120 ms");
   check(row && row.status !== "todo", "the checklist's delay row uses it", json(row));
   note(`delay: passthrough ${d.passthroughMs} ms, estimate ${d.estimateMs} ms, micFifo ${d.micFifoMs} ms (${d.verdict})`);
@@ -915,6 +1042,8 @@ async function monitorSounds(app) {
     window.__fake.devicechange();
   });
   check(await waitText("#voiceWarnings", WARNINGS.OUTPUT_IS_CABLE), "step 2 warns that Windows' default playback device is CABLE Input");
+  r = await waitResults((x) => x.voice?.devices?.defaultOutputIsCable === true, 3000);
+  check(r.voice?.devices?.defaultOutputIsCable === true, "and the results say so", json(r.voice?.devices));
   before = (await oscillators()).length;
   during = page.evaluate(() => window.__fake.cablePeak(900));
   await press("btnBeep", /Beep played/);
@@ -938,6 +1067,8 @@ async function monitorSounds(app) {
     window.__fake.devicechange();
   });
   check(await waitText("#voiceWarnings", WARNINGS.OUTPUT_IS_CABLE, { present: false }), "the warning goes when the default device is back");
+  r = await waitResults((x) => x.voice?.devices?.defaultOutputIsCable === false, 3000);
+  check(r.voice?.devices?.defaultOutputIsCable === false, "and the results say it is not CABLE Input any more", json(r.voice?.devices));
 
   // (c) a stand-in microphone (the headset unplugged): no sounds at all
   await choose("#micSelect", ids.in1, /Microphone switched/);
@@ -1008,7 +1139,7 @@ async function monitorSounds(app) {
 // ---- 7 · recovery ----
 
 async function recovery(app) {
-  const { results, waitResults, fake, peak, lastRecovery } = app;
+  const { results, waitResults, fake, peak, press, lastRecovery, recoveryLines, gateRow, VOICE_TEXTS } = app;
   const backAfter = async (n, timeout = 3000) =>
     waitResults((x) => (x.voice?.recoveries?.length ?? 0) > n && x.voice?.state === "running", timeout);
   let n = (await results()).voice.recoveries.length;
@@ -1059,6 +1190,85 @@ async function recovery(app) {
   check(p > 0.01, "and the voice is back", `peak ${p}`);
   check(rec?.micToo === false && rec?.restart === undefined, "a microphone alone is no Windows Audio restart", json(rec));
 
+  // Windows refuses the microphone (its privacy switch turned off): the app stops trying until the user acts, and
+  // the open line under Recoveries says it waits for the user, not that it brings the voice back.
+  n = r.voice.recoveries.length;
+  await fake(() => {
+    window.__fake.refuseMic = true;
+    window.__fake.endMic();
+  });
+  r = await waitResults((x) => x.voice?.state === "mic-blocked", 3000);
+  check(r.voice?.state === "mic-blocked", "a refused microphone: the voice waits for the user", r.voice?.state);
+  await sleep(1000); // nothing changes meanwhile: the app does not try by itself
+  let lines = await recoveryLines();
+  check(
+    /^\d\d:\d\d:\d\d · the microphone stopped: /.test(lines.at(-1) ?? "") &&
+      lines.at(-1).endsWith(`: ${VOICE_TEXTS.waitingForYou}`) &&
+      !lines.at(-1).includes(VOICE_TEXTS.bringingBack),
+    "Recoveries says the app waits for you (see step 2), not that it brings the voice back",
+    json(lines),
+  );
+  await fake(() => {
+    window.__fake.refuseMic = false;
+  });
+  await press("btnMic", /Microphone checked/);
+  r = await backAfter(n);
+  rec = lastRecovery(r);
+  lines = await recoveryLines();
+  check(
+    r.voice?.state === "running" && rec?.cause === "mic-ended" && rec.micToo === false && /the microphone stopped: back after \d+\.\d s$/.test(lines.at(-1) ?? ""),
+    "allowed again, Check the microphone brings the voice back, and Recoveries says after how long",
+    `${json(rec)} ${json(lines)}`,
+  );
+
+  // Session B step 9, as the fakes can make it: Windows Audio restarts. The audio engine reports an error and the
+  // microphone ends at once, and neither comes back while Windows Audio is down (here 2.5 s: VB-CABLE and both
+  // microphones are gone meanwhile).
+  n = r.voice.recoveries.length;
+  await fake(() => {
+    const f = window.__fake;
+    f.noCable = true;
+    f.unplug("Fake Audio Input 1");
+    f.unplug("Fake Audio Input 2");
+    f.cableContext().dispatchEvent(new Event("error"));
+    f.endMic();
+  });
+  await sleep(2500);
+  await fake(() => {
+    const f = window.__fake;
+    f.noCable = false;
+    f.plug("Fake Audio Input 1");
+    f.plug("Fake Audio Input 2");
+  });
+  r = await backAfter(n, 8000);
+  rec = lastRecovery(r);
+  check(
+    rec?.micToo === true && rec.restart?.verdict === "pass" && /^pass \(Windows itself took about \d+\.\d s\)$/.test(rec.restart.text ?? ""),
+    "a Windows Audio restart: the microphone and the audio engine were both lost, and the restart passes",
+    json(rec),
+  );
+  check(
+    Number.isFinite(rec?.appMs) &&
+      Number.isFinite(rec?.waitMs) &&
+      Number.isFinite(rec?.serviceBackAfterMs) &&
+      rec.serviceBackAfterMs >= 2000 &&
+      rec.serviceBackAfterMs <= rec.outageMs &&
+      Number.isFinite(rec?.afterDevicesBackMs),
+    "the results say when Windows Audio was back, and how long the app's own part took",
+    json(rec),
+  );
+  lines = await recoveryLines();
+  check(
+    (lines.at(-1) ?? "").endsWith(`: back after ${(rec?.outageMs / 1000).toFixed(1)} s · Windows Audio restart? ${rec?.restart?.text}`) &&
+      /Windows Audio restart\? pass/.test(lines.at(-1)),
+    "Recoveries says the voice came back, after how long, and that the restart passes",
+    json(lines),
+  );
+  const restartRow = gateRow(r, "Windows Audio restart: back within 2 s");
+  check(restartRow?.status === "pass", "the checklist's Windows Audio restart row passes", json(restartRow));
+  p = await peak(1500);
+  check(p > 0.01, "and the voice is on the cable again", `peak ${p}`);
+
   r = await waitResults((x) => x.voice?.debug?.contexts === 1 && x.voice?.debug?.micSources === 1, 3000);
   check(r.voice.debug.contexts === 1 && r.voice.debug.micSources === 1, "after all that: one context and one microphone source", json(r.voice.debug));
   const closed = await fake(() => {
@@ -1066,8 +1276,12 @@ async function recovery(app) {
     return window.__fake.contexts.filter((c) => c.__everCable && c !== cur).map((c) => c.state);
   });
   check(closed.length >= 2 && closed.every((s) => s === "closed"), "every older graph context is closed", json(closed));
-  const lines = await app.text("#recoveryLog");
-  check(/\d\d:\d\d:\d\d · the audio was paused: back after \d+\.\d s/.test(lines), "the recovery log says when, why and after how long", lines);
+  lines = await recoveryLines();
+  check(
+    lines.some((l) => /^\d\d:\d\d:\d\d · the audio was paused: back after \d+\.\d s$/.test(l)),
+    "the recovery log says when, why and after how long",
+    json(lines),
+  );
 }
 
 // ---- 8 · headset lost ----
@@ -1129,7 +1343,7 @@ async function headsetLost(app) {
 // ---- 13 · overlapping operations ----
 
 async function overlapping(app) {
-  const { page, ids, fake, peak, waitResults, waitPage, choose } = app;
+  const { page, ids, fake, peak, results, waitResults, waitPage, choose, statusKind, watchStatus, statusSeen, statusIs, CHOICE_TEXTS, VOICE_TEXTS } = app;
   const openCable = () => fake(() => window.__fake.contexts.filter((c) => c.__everCable && c.state !== "closed").length);
   await fake(() => {
     window.__fake.gumDelayMs = 300;
@@ -1184,20 +1398,61 @@ async function overlapping(app) {
   const p = await peak(1500);
   check(p > 0.01, "(c) and the voice is on the cable", `peak ${p}`);
 
+  // (d) A microphone that takes longer to open (11 s) than the graph waits before it answers a choice (10 s;
+  // opening may take 15 s): the status line says the switch is still going on, never that it failed, and
+  // ends with the outcome once the graph uses the microphone.
+  const lines = (seen) => json(seen.map((x) => `${x.kind}: ${x.status} | step 2: ${x.voice}`));
+  await fake(() => {
+    window.__fake.sinkDelayMs = 0;
+    window.__fake.gumDelayMs = 11000;
+  });
+  await watchStatus();
+  await page.selectOption("#micSelect", ids.in1);
+  let ended = await statusIs(CHOICE_TEXTS.mic.done, 20000);
+  let seen = await statusSeen();
+  check(ended && (await statusKind()) === "ok", "(d) a microphone that opens after the graph answered: “Microphone switched.” once it is used", lines(seen));
+  check(seen.some((x) => x.status === CHOICE_TEXTS.mic.still && x.kind === "info"), "(d) meanwhile the status says the switch is still going on", lines(seen));
+  check(!seen.some((x) => x.status.startsWith(CHOICE_TEXTS.mic.failed)), "(d) and never that the microphone could not be switched", lines(seen));
+  check(seen.every((x) => x.mic === ids.in1), "(d) the list shows the chosen microphone all along", json(seen.map((x) => x.mic)));
+  r = await results();
+  check(r.voice?.state === "running" && r.voice.mic?.how === "saved-id" && (await page.$eval("#micSelect", (s) => s.value)) === ids.in1, "(d) and the voice runs on it", json(r.voice?.mic));
+
+  // (e) The same, with the output picked while the slow microphone opens: its change waits behind the
+  // microphone's, and the status line ends with the output's outcome.
+  await watchStatus();
+  await page.selectOption("#micSelect", ids.in2);
+  await sleep(100);
+  await page.selectOption("#outSelect", "");
+  ended = await statusIs(CHOICE_TEXTS.output.done, 20000);
+  seen = await statusSeen();
+  check(ended && (await statusKind()) === "ok", "(e) an output picked meanwhile: “Switched where your voice goes.” once both changes are done", lines(seen));
+  check(seen.some((x) => x.status === CHOICE_TEXTS.output.still && x.kind === "info"), "(e) meanwhile the status says it is still switching", lines(seen));
+  check(
+    !seen.some(
+      (x) => x.status.startsWith(CHOICE_TEXTS.mic.failed) || x.status.startsWith(CHOICE_TEXTS.output.failed) || x.status.includes(VOICE_TEXTS.notReaching.trim()),
+    ),
+    "(e) and never that a choice failed, or that the voice is not reaching the meeting",
+    lines(seen),
+  );
+  r = await waitResults((x) => x.voice?.state === "running" && x.voice.output?.how === "auto" && x.voice.mic?.how === "saved-id", 3000);
+  check(
+    r.voice?.output?.how === "auto" && same(await fake(() => window.__fake.liveMics()), [IN2]),
+    "(e) the voice runs on both choices",
+    `${json(r.voice?.output?.how)} ${json(await fake(() => window.__fake.liveMics()))}`,
+  );
+
   await fake(() => {
     window.__fake.gumDelayMs = 0;
-    window.__fake.sinkDelayMs = 0;
   });
   await choose("#micSelect", ids.in1, /Microphone switched/);
-  await choose("#outSelect", "", /Switched where your voice goes/);
-  r = await waitResults((x) => x.voice?.state === "running" && x.voice?.output?.how === "auto", 3000);
+  r = await waitResults((x) => x.voice?.state === "running" && x.voice?.output?.how === "auto" && x.voice.mic?.how === "saved-id", 3000);
   check(r.voice?.output?.how === "auto" && r.voice.mic?.how === "saved-id", "back to the headset's microphone and the automatic output", json(r.voice?.output?.how));
 }
 
 // ---- 10 · the long check with the test tone, and Hide ----
 
 async function longTone(app) {
-  const { page, fake, results, peak, press, text, waitResults, waitText } = app;
+  const { page, fake, results, peak, press, text, status, statusKind, waitResults, waitText } = app;
   await page.selectOption("#longSource", "tone");
   await page.fill("#longMinutes", "0.25");
   await fake(() => {
@@ -1212,6 +1467,10 @@ async function longTone(app) {
   );
   check(await page.locator("#btnLongStop").isEnabled(), "Stop and check is on while the check runs");
   check(await page.locator("#micSelect").isDisabled(), "the device choices wait while a check runs");
+  check(
+    (await page.locator("#longSource").isDisabled()) && (await page.locator("#longMinutes").isDisabled()),
+    "and so do the long check's Send and Minutes",
+  );
   await sleep(Math.max(0, t0 + 3000 - Date.now()));
   await press("btnHide", /hidden for 30 minutes/);
   check(/The long check now ends at \d\d:\d\d/.test(await text("#hideInfo")), "Hide during the check says when the check now ends", await text("#hideInfo"));
@@ -1242,6 +1501,12 @@ async function longTone(app) {
   note(`ticks per 30 min: tone ${L.tonePath?.ticksPer30Min}, microphone ${L.micPath?.ticksPer30Min} (not asserted: fake clocks)`);
   const done = await text("#longInfo");
   check(done.startsWith("Long check done: not passed:") && done.includes("Gaps: 1"), "step 3 says why it did not pass, with its lines", done);
+  const kinds = [await statusKind(), await page.locator("#longInfo").getAttribute("data-kind")];
+  check(
+    (await status()) === "Long check done." && same(kinds, ["error", "error"]) && LONG_KIND[L.verdict] === "error",
+    "the check that did not pass is red, in the status line and in step 3",
+    `${await status()} ${json(kinds)}`,
+  );
   const toneGone = await waitText("#voiceStatus", "test tone", { present: false, timeout: 3000 });
   const back = await waitResults((x) => x.voice?.state === "running", 3000);
   check(toneGone && back.voice?.state === "running", "the voice is back on the cable afterwards (the test source removed)", await text("#voiceStatus"));
@@ -1250,6 +1515,7 @@ async function longTone(app) {
   check(await page.locator("#btnLongStart").isEnabled(), "Start the long check is on again");
   check(await page.locator("#btnLongStop").isDisabled(), "and Stop and check is off");
   check(await page.locator("#micSelect").isEnabled(), "and the device choices are back");
+  check((await page.locator("#longSource").isEnabled()) && (await page.locator("#longMinutes").isEnabled()), "and Send and Minutes");
   await fake(() => {
     window.__fake.hiddenUntil = 0;
   });
@@ -1258,11 +1524,20 @@ async function longTone(app) {
 // ---- 11 · the long check with the microphone ----
 
 async function longMic(app) {
-  const { page, fake, results, press } = app;
+  const { page, fake, results, press, text, status, statusKind } = app;
   await page.selectOption("#longSource", "mic");
   await page.fill("#longMinutes", "0.25");
+  const t0 = Date.now();
   await press("btnLongStart", /Long check running/);
-  await sleep(6000);
+  await page.waitForFunction(() => /^Long check: /.test(document.querySelector("#longInfo").textContent), null, { timeout: 5000 });
+  const running = await text("#longInfo");
+  check(
+    /^Long check: \d+:\d\d of \d+:\d\d · now \w+ · minimized so far \d+:\d\d · hidden so far \d+:\d\d · dropouts \d+ · gaps \d+$/.test(running) &&
+      !/tone|clicks/.test(running),
+    "the check with the microphone shows its own progress (drop-outs; no tone, no clicks)",
+    running,
+  );
+  await sleep(Math.max(0, t0 + 6000 - Date.now()));
   await fake(() => window.__fake.cutCable(300));
   await page.waitForFunction(() => /Long check done/.test(document.querySelector("#longInfo").textContent), null, { timeout: 40000 });
   const r = await results();
@@ -1273,6 +1548,12 @@ async function longMic(app) {
   note(`shorter drop-outs: ${drops.filter((d) => d.ms < 200).length} (reported only)`);
   check([0, 1].includes(L.speech?.gaps?.length), "at most one gap in the speech", json(L.speech?.gaps));
   check(L.recordedSec >= 14 && L.recordedSec <= 17, "it recorded about 15 s and ended by itself", `${L.recordedSec}`);
+  const kinds = [await statusKind(), await page.locator("#longInfo").getAttribute("data-kind")];
+  check(
+    (await status()) === "Long check done." && Boolean(LONG_KIND[L.verdict]) && same(kinds, [LONG_KIND[L.verdict], LONG_KIND[L.verdict]]),
+    "its result takes its verdict's colour, in the status line and in step 3",
+    `${L.verdict}: ${json(kinds)}`,
+  );
 }
 
 // ---- 12 · Hide ----
@@ -1417,12 +1698,20 @@ async function copyResults(app) {
     "the portal's failure is among the errors, its id hidden",
     json(parsed.errors),
   );
-  const gate = await page.$$eval("#gateList li", (lis) => lis.map((li) => [li.dataset.kind, li.textContent]));
+  // Step 3's checklist and results.gate, read together (one render draws both): each item is "mark · row · text"
+  // with the mark and colour of its status (spec §6.1; typed here, not taken from the page's code).
+  const MARKS = { pass: ["✓", "ok"], fail: ["✗", "error"], todo: ["…", "info"], note: ["!", "warn"] };
+  const listed = await page.evaluate(() => ({
+    gate: JSON.parse(document.querySelector("#results").textContent).gate,
+    items: [...document.querySelectorAll("#gateList li")].map((li) => [li.dataset.kind, li.textContent]),
+  }));
+  const wanted = listed.gate.map((g) => [MARKS[g.status]?.[1], `${MARKS[g.status]?.[0]} · ${g.row} · ${g.text}`]);
   check(
-    gate.length === 9 && gate.every(([kind, t]) => ["ok", "error", "info", "warn"].includes(kind) && /^[✓✗…!] · /.test(t)),
-    "step 3 shows the Session B checklist",
-    json(gate),
+    listed.gate.length === 9 && listed.gate.some((g) => g.status === "pass") && same(listed.items, wanted),
+    "step 3's Session B checklist shows each row of the results with its status's mark and colour",
+    json({ shown: listed.items, results: listed.gate }),
   );
+  note(`checklist: ${listed.gate.map((g) => g.status).join(", ")}`);
 
   // Copied by hand: a selection of the results stays (they used to be redrawn every second while the voice runs).
   const selected = () => page.evaluate(() => getSelection().toString());
@@ -1480,10 +1769,18 @@ async function settings(app) {
   const saved = await fake(() => window.__fake.settingsSaved.at(-1));
   check(JSON.parse(saved ?? "{}").micLabel === IN2, "choosing a microphone saves it (settings_save)", saved);
   check(!/key|token/i.test(Object.keys(JSON.parse(saved ?? "{}")).join(" ").replace(/hotkey\w*|keyExpiresOn/gi, "")), "the settings hold no key");
+  // This relaunch's microphone takes 2 s to open, as one behind a permission prompt would.
+  await setFlags({ gumDelayMs: 2000 });
   await reload();
   let r = await waitResults((x) => x.voice?.state === "running", 5000);
   check(r.settings?.source === "saved" && r.voice?.mic?.how === "saved-id", "after a relaunch the saved microphone is used by its id", json(r.voice?.mic?.how));
   check((await page.$eval("#micSelect", (s) => s.value)) === ids.in2, "and the list shows it");
+  const micRow = app.gateRow(r, MIC_ROW);
+  check(
+    r.voice?.mic?.openedInMs >= 1500 && micRow?.status === "note" && /was there a prompt\?/.test(micRow.text ?? ""),
+    "a microphone that took 2 s to open: the results keep the time, and the checklist asks whether there was a prompt",
+    json({ openedInMs: r.voice?.mic?.openedInMs, unlockMs: r.voice?.mic?.unlockMs, row: micRow }),
+  );
 
   await setFlags({ settingsLoadFails: true });
   await reload();
@@ -1702,7 +1999,7 @@ async function main() {
   const { encodeWav } = await load("src/core/wav.js");
   const { WARNINGS } = await load("src/core/device-choice.js");
   const { CHECK_TEXTS } = await load("src/audio/measure.js");
-  const { VOICE_TEXTS } = await load("src/ui/voice.js");
+  const { VOICE_TEXTS, CHOICE_TEXTS } = await load("src/ui/voice.js");
   const { startSpikeServer } = await load("spike/serve.mjs");
 
   // Fake microphone: ~10 s of speech-like audio (Chromium loops the file) with −70 dBFS noise, so its pauses
@@ -1721,7 +2018,7 @@ async function main() {
   try {
     if (only.has("dev")) await devMode(browser, base, CHECK_TEXTS, VOICE_TEXTS);
     if (only.has("gesture")) await gesture(noAutoplay, base, BUILD);
-    if (only.has("app")) await appMode(browser, base, WARNINGS, VOICE_TEXTS);
+    if (only.has("app")) await appMode(browser, base, { WARNINGS, VOICE_TEXTS, CHOICE_TEXTS });
   } finally {
     await browser.close();
     await noAutoplay.close();

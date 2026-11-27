@@ -31,9 +31,38 @@ export const VOICE_TEXTS = Object.freeze({
   slowOpen: " (slow: did a question appear?)",
   permissionFix: " + the permission fix",
   bringingBack: "bringing it back…",
+  waitingForYou: "waiting for you (see step 2)",
   notReaching: " Your voice is not reaching the meeting yet: see step 2.",
   notSaved: (why) => ` Could not save the settings: ${why}`,
 });
+
+/**
+ * The status line of a device or route choice: while it is made, while the
+ * voice graph is still on it, and how it ended.
+ */
+export const CHOICE_TEXTS = Object.freeze({
+  mic: Object.freeze({
+    switching: "Switching the microphone…",
+    still: "Still switching the microphone…",
+    done: "Microphone switched.",
+    failed: "The microphone could not be switched: see step 2.",
+  }),
+  output: Object.freeze({
+    switching: "Switching where your voice goes…",
+    still: "Still switching where your voice goes…",
+    done: "Switched where your voice goes.",
+    failed: "That device could not be used: see step 2.",
+  }),
+  route: Object.freeze({
+    switching: "Switching the output route…",
+    still: "Still switching the output route…",
+    done: "Output route switched.",
+    failed: "The output route could not be switched: see step 2.",
+  }),
+});
+
+/** States in which the voice graph waits for the user (a refusal; in Edge, a click): it does not try by itself. */
+const WAITING_STATES = Object.freeze(["mic-blocked", "sink-refused", "needs-gesture"]);
 
 /** Why the voice stopped, in words (the recovery log; the same words as the status line). */
 const CAUSE_WORDS = Object.freeze({
@@ -101,10 +130,18 @@ export function recoveryLine(record) {
   return `${at} · ${causeWords(record.cause)}: ${back}${restart}`;
 }
 
-/** The line of an outage that is not over: "14:03:12 · the audio was paused: still trying (12 s)". */
-export function openRecoveryLine({ lostAtMs, cause, sinceMs = null }) {
+/**
+ * The line of an outage that is not over: "14:03:12 · the audio was paused:
+ * bringing it back…", or "… still trying (12 s)". With `waiting`, the app
+ * waits for the user (the microphone or VB-CABLE was refused: it does not try
+ * by itself until the user acts), and the line says so: "… waiting for you
+ * (see step 2)".
+ */
+export function openRecoveryLine({ lostAtMs, cause, sinceMs = null, waiting = false }) {
   const at = clockText(epochOf(lostAtMs));
-  const how = isNum(sinceMs) ? `still trying (${Math.round(sinceMs / 1000)} s)` : VOICE_TEXTS.bringingBack;
+  let how = VOICE_TEXTS.bringingBack;
+  if (waiting) how = VOICE_TEXTS.waitingForYou;
+  else if (isNum(sinceMs)) how = `still trying (${Math.round(sinceMs / 1000)} s)`;
   return `${at} · ${causeWords(cause)}: ${how}`;
 }
 
@@ -139,6 +176,25 @@ export function changeOutcome({ taken, running, done, failed, notSaved = null })
   if (!taken) return { text: failed + saveText, kind: "warn" };
   if (!running) return { text: done + VOICE_TEXTS.notReaching + saveText, kind: "warn" };
   return { text: done + saveText, kind: notSaved ? "warn" : "ok" };
+}
+
+/**
+ * Where a device or route choice stands, from what the voice graph shows
+ * now: "taken" (the graph uses it), "pending" (the graph is still on it) or
+ * "failed" (it is not used, and the graph has stopped trying it).
+ * - While a change is in progress ("switching"), the choice is pending, even
+ *   if it looks taken: the switch is not over yet.
+ * - While the voice starts or recovers, every try uses the saved choice: a
+ *   choice not in use yet is pending.
+ * The graph answers a request within 10 s, but a switch can take longer
+ * (opening a microphone may take 15 s, and a change can wait behind
+ * another one), so the answer alone does not settle a choice.
+ * @param {{ taken: boolean, state: string }} now
+ */
+export function choiceState({ taken, state }) {
+  if (state === "switching") return "pending";
+  if (taken) return "taken";
+  return state === "starting" || state === "recovering" ? "pending" : "failed";
 }
 
 /**
@@ -203,8 +259,12 @@ export class VoiceView {
     this.since = new Date().toISOString();
     this.lastState = null;
     this.startedAtMs = null;
-    /** The microphone the user just picked, until the graph has switched (the list shows it meanwhile). */
-    this.pendingMic = null;
+    /**
+     * The device and route choices the graph has not settled yet, by kind
+     * ("mic", "output", "route"). The microphone list shows a pending
+     * microphone meanwhile.
+     */
+    this.choices = new Map();
     /** The fault outage that is not over: { lostAtMs, cause, sinceMs }. */
     this.open = null;
     this.checksBusy = false;
@@ -221,11 +281,7 @@ export class VoiceView {
       }
     };
     g.addEventListener("state", (ev) => {
-      if (ev.detail?.state !== this.lastState) {
-        this.lastState = ev.detail?.state ?? null;
-        this.since = new Date().toISOString();
-      }
-      this.renderStatus();
+      this.onState(ev.detail);
       changed();
     });
     g.addEventListener("levels", (ev) => {
@@ -240,6 +296,7 @@ export class VoiceView {
       g.addEventListener(type, () => {
         this.renderSelects();
         this.renderInfo();
+        this.checkChoices();
         changed();
       });
     }
@@ -256,6 +313,21 @@ export class VoiceView {
   /** The graph is starting now (the time base of the microphone's holes per 30 minutes). */
   started() {
     this.startedAtMs = performance.now();
+  }
+
+  /**
+   * The graph's state changed: step 2's status, the open line under
+   * Recoveries (it says when the app waits for the user), and the choices
+   * the graph may have settled.
+   */
+  onState(detail) {
+    if (detail?.state !== this.lastState) {
+      this.lastState = detail?.state ?? null;
+      this.since = new Date().toISOString();
+    }
+    this.renderStatus();
+    this.renderRecoveries();
+    this.checkChoices();
   }
 
   renderAll() {
@@ -298,7 +370,8 @@ export class VoiceView {
       }),
     );
     const live = mic && mic.track?.readyState === "live" ? mic.entry?.deviceId : null;
-    const wanted = [this.pendingMic, live, settings.micDeviceId].find((id) => id && usable.some((d) => d.deviceId === id));
+    const pending = this.choices.get("mic")?.value ?? null;
+    const wanted = [pending, live, settings.micDeviceId].find((id) => id && usable.some((d) => d.deviceId === id));
     if (wanted) micSelect.value = wanted;
 
     const outs = virtualOutputs(Array.isArray(snap.outputs) ? snap.outputs : []);
@@ -331,6 +404,67 @@ export class VoiceView {
   usesRoute(value) {
     if (this.graph.state !== "running") return true;
     return (this.graph.output?.routePreference ?? "auto") === value;
+  }
+
+  /** The graph uses the choice: usesMic, usesOutput or usesRoute by its kind. */
+  uses(kind, value) {
+    if (kind === "mic") return this.usesMic(value);
+    if (kind === "output") return this.usesOutput(value);
+    return this.usesRoute(value);
+  }
+
+  /**
+   * Follow a choice of the user until the graph has settled it: a
+   * microphone ("mic" and its id), the output ("output" and its id, "" for
+   * Automatic) or the route under Advanced ("route" and "auto" or
+   * "element"). A newer choice of the same kind replaces it.
+   * Call answered() once the graph has answered the request: it says where
+   * the choice stands then ("taken", "pending" or "failed"; null when a
+   * newer choice replaced it). A pending choice is checked again on the
+   * graph's next events; `settled` resolves with "taken" or "failed" once the
+   * choice is settled, or with null when a newer one replaced it first.
+   * → { answered(), settled }
+   */
+  follow(kind, value) {
+    const older = this.choices.get(kind);
+    let resolve = () => {};
+    const choice = {
+      kind,
+      value,
+      isAnswered: false,
+      done: false,
+      settled: new Promise((r) => {
+        resolve = r;
+      }),
+      finish: (outcome) => {
+        if (choice.done) return;
+        choice.done = true;
+        if (this.choices.get(kind) === choice) this.choices.delete(kind);
+        resolve(outcome);
+        if (kind === "mic") this.renderSelects(); // the list shows the microphone in use again
+      },
+      check: () => {
+        const now = choiceState({ taken: this.uses(kind, value), state: this.graph.state });
+        if (now !== "pending") choice.finish(now);
+        return now;
+      },
+    };
+    // The new choice first: the older one's end redraws the list, which must show the new one.
+    this.choices.set(kind, choice);
+    older?.finish(null);
+    return {
+      answered: () => {
+        if (choice.done) return null;
+        choice.isAnswered = true;
+        return choice.check();
+      },
+      settled: choice.settled,
+    };
+  }
+
+  /** Check the choices the graph has answered: it may have settled them by now. */
+  checkChoices() {
+    for (const choice of [...this.choices.values()]) if (choice.isAnswered) choice.check();
   }
 
   /** A check runs: the device choices wait until it is over. */
@@ -392,12 +526,17 @@ export class VoiceView {
     this.renderRecoveries();
   }
 
-  /** The recovery log: every outage that is over (newest last), then the one that is not. */
+  /**
+   * The recovery log: every outage that is over (newest last), then the one
+   * that is not. While the graph waits for the user (a refused microphone,
+   * say), that line says so: nothing is being brought back until the user
+   * acts (step 2 says what to do).
+   */
   renderRecoveries() {
     const ul = this.$("recoveryLog");
     const doc = ul.ownerDocument;
     const lines = this.graph.recoveries.slice(-MAX_LOG_LINES).map(recoveryLine);
-    if (this.open) lines.push(openRecoveryLine(this.open));
+    if (this.open) lines.push(openRecoveryLine({ ...this.open, waiting: WAITING_STATES.includes(this.graph.state) }));
     if (!lines.length) lines.push(VOICE_TEXTS.noRecoveries);
     ul.replaceChildren(...lines.map((text) => Object.assign(doc.createElement("li"), { textContent: text })));
   }
