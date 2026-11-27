@@ -75,7 +75,13 @@ test("the page's capability grants nothing: the app's own commands need none", (
   const capability = JSON.parse(read(new URL("default.json", dir)));
   assert.deepEqual(capability.windows, ["main"]);
   assert.deepEqual(capability.permissions, []);
-  assert.equal(read(new URL("build.rs", TAURI)).trim(), "fn main() {\n    tauri_build::build()\n}", "no app ACL manifest");
+  // No app ACL manifest (tauri_build::AppManifest, set with Attributes::app_manifest): with one, Tauri would check
+  // the app's own commands against this empty capability and refuse them. (WindowsAttributes::new_without_app_manifest
+  // is about the Windows application manifest, a different thing: the build script links that one itself.)
+  const build = rustCode(read(new URL("build.rs", TAURI)));
+  assert.match(build, /tauri_build::(?:try_)?build\(/, "build.rs runs tauri-build");
+  assert.doesNotMatch(build, /AppManifest/, "no app ACL manifest");
+  assert.doesNotMatch(build, /\.app_manifest\s*\(/, "no app ACL manifest");
 });
 
 test("the page calls the app's own commands only, through invoke", () => {
