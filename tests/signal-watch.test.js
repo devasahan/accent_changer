@@ -155,6 +155,27 @@ test("ZeroRuns: at most maxRuns kept between takes, the rest counted as dropped"
   assert.equal(z.zeroFrames, 600, "dropped runs still count as zero frames");
 });
 
+test("ZeroRuns: finish() reports the run still open at the end, once; later pushes are ignored", () => {
+  const z = new ZeroRuns();
+  const noise = withRuns(500, []);
+  z.push(noise);
+  z.push(new Float32Array(4800)); // the stream ends in 100 ms of digital silence
+  assert.deepEqual(z.takeRuns(), [], "an open run is not reported before the end");
+  z.finish();
+  assert.deepEqual(z.takeRuns(), [{ startFrame: 500, frames: 4800 }]);
+  assert.equal(z.openFrames, 0);
+  assert.equal(z.zeroFrames, 4800);
+  z.finish();
+  z.push(new Float32Array(100));
+  assert.deepEqual(z.takeRuns(), [], "finish() again, and pushes after it, change nothing");
+  assert.equal(z.frame, 5300);
+  const short = new ZeroRuns();
+  short.push(noise);
+  short.push(new Float32Array(47));
+  short.finish();
+  assert.deepEqual(short.takeRuns(), [], "an open run shorter than minFrames is not a run");
+});
+
 test("ZeroRuns: the level and the minimum length can be set", () => {
   const z = new ZeroRuns({ level: 1e-3, minFrames: 10 });
   const x = new Float32Array(100).fill(0.5);
@@ -384,6 +405,139 @@ test("ToneCheck 8: two drops 62 ms apart are two skips; a drop while priming is 
   ({ t } = check(dropFrames(cableTone(30, 14), Math.round(0.3 * SR), 480)));
   assert.equal(t.ticks, 0);
   assert.deepEqual(t.takeEvents(), []);
+});
+
+test("ToneCheck 8b: a gap that begins while priming and goes on after it counts, from where it began", () => {
+  for (const [startSec, lengthSec] of [
+    [0.4, 3],
+    [0.45, 10],
+  ]) {
+    const { t, events } = check(zeroFill(cableTone(30, 24), startSec * SR, lengthSec * SR));
+    assert.equal(t.counts.gaps, 1, `from ${startSec} s: ${JSON.stringify(events)}`);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].kind, "gap");
+    near(events[0].holeMs, lengthSec * 1000, 1, "gap length");
+    near(events[0].atFrame, startSec * SR, B, "where it began, inside the priming time");
+  }
+  // One that ends while priming is still nothing.
+  const { t } = check(zeroFill(cableTone(30, 25), 0.2 * SR, 0.1 * SR));
+  assert.equal(t.counts.gaps + t.ticks, 0);
+});
+
+test("ToneCheck: finish() counts the disturbance still going on when the check ends", () => {
+  // The tone for 30 s, then digital silence for 10 s until the check ends.
+  const x = new Float32Array(40 * SR);
+  x.set(cableTone(30, 26));
+  const t = new ToneCheck();
+  pushAll(t, x);
+  assert.equal(t.counts.gaps, 0, "nothing ends it before the check does");
+  assert.equal(t.open.kind, "gap", "it shows while it goes on");
+  near(t.open.holeMs, 10000, 1, "open gap so far");
+  assert.equal(t.levelDb, null, "the tone is lost: no level");
+  near(t.lockDb, -12, 0.1, "lockDb");
+  t.finish();
+  assert.deepEqual(t.counts, { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 1, levels: 0, steps: 0 });
+  const events = t.takeEvents();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, "gap");
+  near(events[0].holeMs, 10000, 1, "gap length");
+  near(events[0].atFrame, 30 * SR, B, "gap start");
+  assert.equal(t.open, null);
+  t.finish();
+  t.push(new Float32Array(SR));
+  assert.equal(t.counts.gaps, 1, "finish() twice counts it once");
+  assert.deepEqual(t.takeEvents(), []);
+  assert.equal(t.frame, 40 * SR, "pushes after finish() are ignored");
+});
+
+test("ToneCheck: finish() at the end of a lost tone without zeros, a drop, a level still settling, or nothing", () => {
+  // The tone replaced by noise for the last 2 s: lost for 100 ms or more is a gap.
+  let x = cableTone(20, 27);
+  x.set(whiteNoise(2 * SR, 28, -70), 18 * SR);
+  let t = new ToneCheck();
+  pushAll(t, x);
+  t.finish();
+  assert.equal(t.counts.gaps, 1);
+  near(t.takeEvents()[0].holeMs, 2000, 15, "lost for 2 s");
+  // A 480-frame drop exactly on a block edge, and the check ends one block later: still a skip.
+  x = dropFrames(cableTone(30, 29), 2000 * B, 480).subarray(0, 2001 * B);
+  t = new ToneCheck();
+  pushAll(t, x);
+  assert.equal(t.counts.skips, 0);
+  t.finish();
+  assert.equal(t.counts.skips, 1);
+  near(t.takeEvents()[0].phaseStepDeg, 112.5, 5, "phase step");
+  // Zeros from 500 frames before the last whole block to the end, 500 frames into the next: measured to the end,
+  // 1000 frames (20.8 ms) are a drop-out, not a 10 ms hole.
+  x = zeroFill(cableTone(21, 37), 1875 * B - 500, 1000).subarray(0, 1875 * B + 500);
+  t = new ToneCheck();
+  pushAll(t, x);
+  assert.equal(t.open.kind, "dropout");
+  t.finish();
+  assert.equal(t.counts.dropouts, 1);
+  near(t.takeEvents()[0].holeMs, 1000 / 48, 0.01, "drop-out length");
+  // Ducked by 14 dB over the last second: the change of level still settling is counted where it got to.
+  x = realistic(gainStep(tone({ seconds: 30 }), 29 * SR, -14, SR), 30);
+  t = new ToneCheck();
+  pushAll(t, x);
+  assert.equal(t.counts.levels, 0);
+  t.finish();
+  assert.equal(t.counts.levels, 1);
+  assert.ok(t.minStableDb < -20, `minStableDb ${t.minStableDb}`);
+  assert.equal(t.ticks, 0);
+  // A clean check: finish() adds nothing.
+  t = new ToneCheck();
+  pushAll(t, cableTone(10, 31));
+  t.finish();
+  assert.equal(t.ticks + t.counts.gaps + t.counts.dropouts + t.counts.levels + t.counts.steps, 0);
+  near(t.levelDb, -12, 0.1, "levelDb");
+});
+
+test("ToneCheck: levelDb is null while the tone is lost, and back once it returns", () => {
+  const x = zeroFill(cableTone(10, 32), 5 * SR, 0.3 * SR);
+  const t = new ToneCheck();
+  pushAll(t, x.subarray(0, 5 * SR));
+  near(t.levelDb, -12, 0.1, "before");
+  pushAll(t, x.subarray(5 * SR, 5.2 * SR));
+  assert.equal(t.levelDb, null, "during the gap");
+  pushAll(t, x.subarray(5.2 * SR));
+  near(t.levelDb, -12, 0.1, "after");
+  assert.equal(t.counts.gaps, 1);
+});
+
+test("ToneCheck: an event starts at its first zero when the zeros began just before the disturbed block", () => {
+  // The tone crosses zero between the last two samples of every block. Two zeros there remove too little
+  // of the tone to disturb that block; the zero run goes on into the next block, which is disturbed.
+  const phase = (2 * Math.PI * 11 * 1.5) / B;
+  const at = 2000 * B - 2;
+  const x = insertZeros(realistic(tone({ seconds: 30, phase }), 33), at, 480);
+  const { t, events } = check(x);
+  assert.equal(t.counts.holes, 1, JSON.stringify(events));
+  assert.equal(events[0].atFrame, at, "the first zero, not the start of the disturbed block");
+  near(events[0].holeMs, 10, 0.1, "holeMs");
+});
+
+test("ToneCheck: the tone is found after exactly 10 clean blocks", () => {
+  const t = new ToneCheck();
+  const x = cableTone(1, 34);
+  t.push(x.subarray(0, 10 * B - 1));
+  assert.equal(t.locked, false);
+  assert.equal(t.levelDb, null);
+  t.push(x.subarray(10 * B - 1, 10 * B));
+  assert.equal(t.locked, true);
+});
+
+test("ToneCheck: the drift is smoothed over about 256 blocks and the level over about 16", () => {
+  // A tone 100 ppm off: 0.6 s after the lock the drift estimate is still on its way (2.7 s time constant).
+  const off = check(realistic(tone({ seconds: 0.75, hz: TONE_HZ * (1 + 100e-6) }), 35)).t;
+  assert.ok(off.phaseDriftPpm > 5 && off.phaseDriftPpm < 40, `phaseDriftPpm ${off.phaseDriftPpm}`);
+  // A −2 dB step exactly on a block edge: one block later the level has moved 1/16 of the way.
+  const x = realistic(gainStep(tone({ seconds: 30 }), 938 * B, -2), 36);
+  const t = new ToneCheck();
+  pushAll(t, x.subarray(0, 939 * B), B);
+  near(t.levelDb, -12 - 2 / 16, 0.05, "one block after the step");
+  pushAll(t, x.subarray(939 * B, 1050 * B), B);
+  near(t.levelDb, -14, 0.05, "about a second later");
 });
 
 test("ToneCheck 9: silence, then the tone: locked only after it starts, nothing before; reset() primes again", () => {

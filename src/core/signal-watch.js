@@ -82,10 +82,10 @@ export class LevelWindow {
 
 /**
  * Runs of digital silence: consecutive samples with |x| ≤ level (−140 dBFS
- * by default, so only true zeros). A run is reported once it has ended and
- * only when it lasted at least minFrames (1 ms at 48 kHz): a quiet 16-bit
- * microphone gives single zero samples all the time, a clock crossing's
- * underrun gives 10 ms of zeros at once.
+ * by default, so only true zeros). A run is reported once it has ended (or
+ * the stream has: finish()) and only when it lasted at least minFrames
+ * (1 ms at 48 kHz): a quiet 16-bit microphone gives single zero samples all
+ * the time, a clock crossing's underrun gives 10 ms of zeros at once.
  */
 export class ZeroRuns {
   /** @param {{level?: number, minFrames?: number, maxRuns?: number}} [options] */
@@ -101,10 +101,12 @@ export class ZeroRuns {
     this._runStart = 0;
     this._dropped = 0;
     this._zeroFrames = 0;
+    this._finished = false;
   }
 
-  /** @param {ArrayLike<number>} samples */
+  /** @param {ArrayLike<number>} samples ignored after finish() */
   push(samples) {
+    if (this._finished) return;
     const level = this._level;
     for (let i = 0; i < samples.length; i++) {
       const x = samples[i];
@@ -130,6 +132,18 @@ export class ZeroRuns {
     } else {
       this._dropped++;
     }
+  }
+
+  /**
+   * The stream ends here: a run still open is closed, so the next takeRuns()
+   * reports it when it lasted at least minFrames. Digital silence at the very
+   * end of a check is not lost that way. Later push() calls are ignored.
+   * Calling it again does nothing.
+   */
+  finish() {
+    if (this._finished) return;
+    this._finished = true;
+    if (this._run > 0) this._end();
   }
 
   /**
@@ -164,7 +178,8 @@ export class ZeroRuns {
    * Samples inside runs of at least minFrames so far, the open run included
    * once it is that long: the share of digital silence (a noise gate gives
    * a lot of it). Single zero samples of a quiet 16-bit microphone are not
-   * counted.
+   * counted: one in ten of its samples can be exactly 0, and counting them
+   * would make it look like a noise gate.
    */
   get zeroFrames() {
     return this._zeroFrames + (this._run >= this._min ? this._run : 0);
@@ -280,9 +295,12 @@ export class EnvelopeStream {
  * more than 20° from the block before. Consecutive disturbed blocks form one
  * event, classified when the next clean block arrives. A clean tone that
  * stays 20 dB or more quieter for 10 blocks has a new level: the event ends
- * there as a "step". Nothing is reported
- * until the tone has been found (10 clean blocks in a row, at least −60
- * dBFS) and during the first 500 ms after the start or a reset().
+ * there as a "step". Nothing is reported until the tone has been found (10
+ * clean blocks in a row, at least −60 dBFS). A disturbance that begins and
+ * ends in the first 500 ms after the start or a reset() is ignored (the
+ * sound settling); one that is still going after them counts, from its
+ * start. When the check ends, finish() counts the disturbance still going
+ * on: a tone lost for the last minutes is a gap.
  */
 export class ToneCheck {
   constructor({
@@ -352,6 +370,13 @@ export class ToneCheck {
     this._lastA = 0;
     this._prevClean = false;
     this._prevPhi = 0; // the phase of the block before, clean or not
+    // The block analysed last, clean or not: finish() may close the event with it.
+    this._blockK = -1;
+    this._blockPhi = 0;
+    this._blockA = 0;
+    this._blockSmooth = false;
+    this._lost = false; // the last block was 20 dB or more below the tone's level: the tone is lost now
+    this._finished = false;
     // The event in progress.
     this._ev = false;
     this._evStart = 0;
@@ -361,7 +386,7 @@ export class ToneCheck {
     this._evZeroMax = 0;
     this._evLostBlocks = 0;
     this._evQuiet = 0; // trailing blocks of clean tone, only far quieter than before
-    this._evPrime = false;
+    this._evPrime = false; // it began while priming: ignored unless it is still going after it
     // Slow level tracker: windows of 10 clean blocks.
     this._wSum = 0;
     this._wN = 0;
@@ -383,8 +408,9 @@ export class ToneCheck {
     this._steps = 0;
   }
 
-  /** @param {ArrayLike<number>} samples */
+  /** @param {ArrayLike<number>} samples ignored after finish() */
   push(samples) {
+    if (this._finished) return;
     const B = this._B;
     const cos = this._cos;
     const sin = this._sin;
@@ -446,6 +472,10 @@ export class ToneCheck {
 
     const lost = A < this._lostRatio * this._Aref;
     const smooth = rho <= this._residualLimit && zeroHere === 0;
+    this._blockK = k;
+    this._blockPhi = phi;
+    this._blockA = A;
+    this._blockSmooth = smooth;
     let disturbed = !smooth || lost;
     if (!disturbed && this._prevClean) {
       const d = wrap(phi - this._lastPhi - this._drift);
@@ -460,9 +490,12 @@ export class ToneCheck {
       this._Aref = A;
       disturbed = false;
     }
+    this._lost = disturbed && lost;
     if (disturbed) {
       if (!this._ev) {
         this._ev = true;
+        // It starts at this block's first sample, or at the first zero of its zero run when that run began
+        // in the block before: a few zeros where the tone crosses zero do not disturb a block.
         this._evStart = zeroStart >= 0 && zeroStart < start ? zeroStart : start;
         this._evBeforeK = this._lastK;
         this._evBeforePhi = this._lastPhi;
@@ -471,8 +504,10 @@ export class ToneCheck {
         this._evLostBlocks = 0;
         this._evQuiet = 0;
         this._evPrime = k - this._armBlock < this._primeBlocks;
-      } else if (zeroStart >= 0 && zeroStart < this._evStart) {
-        this._evStart = zeroStart;
+      } else if (this._evPrime && k - this._armBlock >= this._primeBlocks) {
+        // It began while priming and is still going after it: a real disturbance (a gap that began at
+        // 0.4 s), counted from where it began.
+        this._evPrime = false;
       }
       if (zeroHere > this._evZeroMax) this._evZeroMax = zeroHere;
       if (lost && !quiet) this._evLostBlocks++;
@@ -508,44 +543,71 @@ export class ToneCheck {
     this._chg = false;
   }
 
-  /** The event in progress ends at clean block k: classify it. */
+  /** The event in progress ends at clean block k (its first sample is `start`): classify and count it. */
   _close(k, start, phi, A) {
     this._ev = false;
-    if (this._evPrime) return; // it began while priming
-    const B = this._B;
+    if (this._evPrime) return; // it began and ended while priming
+    this._record(this._describe(start, this._evZeroMax, { k, phi, A }));
+  }
+
+  /**
+   * The event in progress as it stands when it ends at `endFrame`, with
+   * `zero` its longest zero run. after: the block that ends it ({k, phi, A}),
+   * which gives its phase step and its change of level; null when there is
+   * none, so only its zeros and the lost tone tell what it was (a short
+   * disturbance of no known kind is a click).
+   */
+  _describe(endFrame, zero, after) {
     const sr = this._sampleRate;
-    const zero = this._evZeroMax;
-    const frames = start - this._evStart;
-    const stepDeg = (wrap(phi - this._evBeforePhi - this._drift * (k - this._evBeforeK)) * 180) / Math.PI;
-    const stepDb = A > 0 && this._evBeforeA > 0 ? 20 * Math.log10(A / this._evBeforeA) : 0;
-    let kind;
-    let holeMs = null;
-    if (zero >= this._gapFrames || this._evLostBlocks * B >= this._gapFrames) {
-      kind = "gap";
-      holeMs = ((zero >= this._gapFrames ? zero : frames) / sr) * 1000;
-      this._gaps++;
-    } else if (zero >= this._dropoutFrames) {
-      kind = "dropout";
-      holeMs = (zero / sr) * 1000;
-      this._dropouts++;
-    } else if (zero >= this._minZero) {
-      kind = "hole";
-      holeMs = (zero / sr) * 1000;
-      this._holes++;
-    } else if (Math.abs(stepDeg) >= this._phaseLimitDeg) {
-      kind = "skip";
-      this._skips++;
-    } else if (Math.abs(stepDb) >= this._stepEventDb) {
-      kind = "step";
-      this._steps++;
-    } else {
-      kind = "click";
-      this._clicks++;
+    const frames = endFrame - this._evStart;
+    const ev = { kind: "click", atFrame: this._evStart, frames };
+    let stepDeg = null;
+    let stepDb = null;
+    if (after) {
+      stepDeg = (wrap(after.phi - this._evBeforePhi - this._drift * (after.k - this._evBeforeK)) * 180) / Math.PI;
+      stepDb = after.A > 0 && this._evBeforeA > 0 ? 20 * Math.log10(after.A / this._evBeforeA) : 0;
+      ev.phaseStepDeg = round(stepDeg, 1);
+      ev.stepDb = round(stepDb, 2);
     }
-    if (this._events.length >= this._maxEvents) return;
-    const ev = { kind, atFrame: this._evStart, frames, phaseStepDeg: round(stepDeg, 1), stepDb: round(stepDb, 2) };
-    if (holeMs !== null) ev.holeMs = round(holeMs, 2);
-    this._events.push(ev);
+    if (zero >= this._gapFrames || this._evLostBlocks * this._B >= this._gapFrames) {
+      ev.kind = "gap";
+      ev.holeMs = round(((zero >= this._gapFrames ? zero : frames) / sr) * 1000, 2);
+    } else if (zero >= this._dropoutFrames) {
+      ev.kind = "dropout";
+      ev.holeMs = round((zero / sr) * 1000, 2);
+    } else if (zero >= this._minZero) {
+      ev.kind = "hole";
+      ev.holeMs = round((zero / sr) * 1000, 2);
+    } else if (stepDeg !== null && Math.abs(stepDeg) >= this._phaseLimitDeg) {
+      ev.kind = "skip";
+    } else if (stepDb !== null && Math.abs(stepDb) >= this._stepEventDb) {
+      ev.kind = "step";
+    }
+    return ev;
+  }
+
+  /** Count an event, and keep it for takeEvents() while there is room. */
+  _record(ev) {
+    if (ev.kind === "gap") this._gaps++;
+    else if (ev.kind === "dropout") this._dropouts++;
+    else if (ev.kind === "hole") this._holes++;
+    else if (ev.kind === "skip") this._skips++;
+    else if (ev.kind === "step") this._steps++;
+    else this._clicks++;
+    if (this._events.length < this._maxEvents) this._events.push(ev);
+  }
+
+  /** The event in progress if it ended now (at the current frame), or null; it changes nothing. */
+  _openEvent() {
+    if (!this._ev || this._evPrime) return null;
+    // Zero runs of the block still being filled count too, and the run still open.
+    let zero = this._evZeroMax;
+    if (this._blockZeroMax > zero) zero = this._blockZeroMax;
+    if (this._zRun >= this._minZero && this._zRun > zero) zero = this._zRun;
+    // The last block of an open event is disturbed. When it is clean tone all the same (its phase jumped, or
+    // the tone is far quieter), it tells the phase step and the change of level as the next clean block would.
+    const after = this._blockSmooth ? { k: this._blockK, phi: this._blockPhi, A: this._blockA } : null;
+    return this._describe(this._n, zero, after);
   }
 
   /** The slow level tracker: the mean amplitude of every 10 clean blocks against the last steady level. */
@@ -578,16 +640,52 @@ export class ToneCheck {
     this._chg = false;
     this._stableDb = db;
     if (Math.abs(db - this._chgFrom) < this._levelChangeDb) return; // it came back: no change after all
+    this._levelEvent(db, windowEnd);
+  }
+
+  /** The level changed from the last steady level to `db`, from _chgAt until `endFrame`: count it. */
+  _levelEvent(db, endFrame) {
     this._levels++;
     this._minStableDb = this._minStableDb === null ? db : Math.min(this._minStableDb, db);
     if (this._events.length >= this._maxEvents) return;
     this._events.push({
       kind: "level",
       atFrame: this._chgAt,
-      frames: windowEnd - this._chgAt,
+      frames: endFrame - this._chgAt,
       fromDb: round(this._chgFrom, 2),
       toDb: round(db, 2),
     });
+  }
+
+  /**
+   * The check ends here. A disturbance still going on is closed at the
+   * current frame and counted, so a tone lost for the last minutes of a
+   * check is a gap (its zeros and its lost blocks say what it was; when its
+   * last block is clean tone, its phase and level too). A change of level
+   * still settling is counted at the level it got to. Later push() calls are
+   * ignored until reset(). Calling it again does nothing. Call it before the
+   * tone is taken off the cable, or that would count as a gap too.
+   */
+  finish() {
+    if (this._finished) return;
+    const open = this._openEvent();
+    this._ev = false;
+    this._finished = true;
+    if (open) this._record(open);
+    if (this._chg) {
+      this._chg = false;
+      if (Math.abs(this._chgLast - this._chgFrom) >= this._levelChangeDb) this._levelEvent(this._chgLast, this._n);
+    }
+  }
+
+  /**
+   * The disturbance going on now, as finish() would count it: { kind,
+   * atFrame, frames, holeMs?, phaseStepDeg?, stepDb? } (a gap of the tone
+   * lost for minutes shows here long before it ends), or null. One that
+   * began while priming shows only once it outlasts priming.
+   */
+  get open() {
+    return this._openEvent();
   }
 
   /**
@@ -624,9 +722,12 @@ export class ToneCheck {
     return this._locked;
   }
 
-  /** The tone's peak level now, in dBFS (null before the lock). */
+  /**
+   * The tone's peak level now, in dBFS: null before the lock, and null while
+   * the tone is lost (the last block was 20 dB or more below its level).
+   */
   get levelDb() {
-    return this._locked && this._Aref > 0 ? 20 * Math.log10(this._Aref) : null;
+    return this._locked && !this._lost && this._Aref > 0 ? 20 * Math.log10(this._Aref) : null;
   }
 
   /** The tone's level when it was found (the latest lock), in dBFS; null before. */
@@ -653,12 +754,17 @@ export class ToneCheck {
     return this._n;
   }
 
-  /** Look for the tone again (lock and priming start over); counts and events are kept. */
+  /**
+   * Look for the tone again (lock and priming start over, and push() works
+   * again after finish()); counts and events are kept.
+   */
   reset() {
     this._locked = false;
     this._lockCount = 0;
     this._armBlock = this._k;
     this._ev = false;
+    this._lost = false;
+    this._finished = false;
     this._prevClean = false;
     this._wSum = 0;
     this._wN = 0;

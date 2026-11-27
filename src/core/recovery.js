@@ -301,6 +301,7 @@ export class OutputRecovery {
       opStartedAtMs: null,
       firstOkOpStartedAtMs: null,
       waitBaseMs: null, // the last failure before the first op that worked
+      nextCause: null, // the reason of the latest request that came in while an op ran
       devicesGoneAtMs: null,
       devicesBackAtMs: null,
       everContext: false,
@@ -361,17 +362,21 @@ export class OutputRecovery {
 
   // ---------- phases ----------
 
-  _recovering(ev, nowMs) {
+  /** A user request while an op runs or is verified: the flag it needs, and one more op after this one. */
+  _request(ev) {
     const o = this._o;
+    const output = ev.type === "rebuild-request";
+    this._need(o, output ? { context: true } : { mic: true });
+    o.dirty = true;
+    o.nextCause = String(ev.reason ?? (output ? "output" : "user"));
+    return [];
+  }
+
+  _recovering(ev, nowMs) {
     switch (ev.type) {
       case "rebuild-request":
-        this._need(o, { context: true });
-        o.dirty = true;
-        return [];
       case "mic-request":
-        this._need(o, { mic: true });
-        o.dirty = true;
-        return [];
+        return this._request(ev);
       case "op-done":
         return this._opDone(ev, nowMs);
       default:
@@ -395,20 +400,33 @@ export class OutputRecovery {
       return [{ do: "set-timer", id: "verify", ms: this.options.verifyMs }];
     }
     const error = ev.error;
+    if (o.kind === "change" && ev.kept === true) return this._changeFailed(o, error, nowMs);
     // A failed op needs its work done again. A rebuild that failed after its mic step
     // (a SinkError, a context error) keeps the live mic it opened.
     if (op.name === "resume") this._need(o, { context: true });
     else if (op.name === "reopen-mic") this._need(o, { mic: true });
     else this._need(o, { context: true, mic: isMicError(error) });
-    if (o.kind === "change" && ev.kept === true) {
-      // The old microphone is still live and feeds the cable. A newer request that came in meanwhile is served.
-      if (o.dirty) return this._attempt(nowMs);
-      this._phase = "running";
-      this._o = null;
-      return [report("change-failed", { error })];
-    }
     const acts = o.kind === "change" ? [this._toFault("change-failed", nowMs)] : [];
     return acts.concat(this._fail(classifyError(error), error, nowMs));
+  }
+
+  /**
+   * A change failed, but the old microphone is still live and feeds the
+   * cable: nothing broke. The change is over (reported "change-failed") and
+   * the voice runs on. A request that came in while the op ran is served next,
+   * as a change of its own; the microphone that just failed is not tried
+   * again (a pending output change rebuilds with the live microphone), unless
+   * a newer microphone request asked for one.
+   */
+  _changeFailed(o, error, nowMs) {
+    const acts = [report("change-failed", { error })];
+    if (!o.dirty || (!o.needContext && !o.needMic)) {
+      this._phase = "running";
+      this._o = null;
+      return acts;
+    }
+    this._o = this._newOutage("change", o.nextCause ?? o.cause, nowMs, { context: o.needContext, mic: o.needMic });
+    return acts.concat(this._attempt(nowMs));
   }
 
   _verifying(ev, nowMs) {
@@ -426,13 +444,8 @@ export class OutputRecovery {
         return acts.concat(this._fail("transient", error, nowMs));
       }
       case "rebuild-request":
-        this._need(o, { context: true });
-        o.dirty = true;
-        return [];
       case "mic-request":
-        this._need(o, { mic: true });
-        o.dirty = true;
-        return [];
+        return this._request(ev);
       default:
         return [];
     }

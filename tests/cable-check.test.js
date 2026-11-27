@@ -82,6 +82,7 @@ test("delayVerdict: unclear, silent microphone, silent cable", () => {
   assert.equal(v.text, "“CABLE Output” stayed silent: your voice isn't reaching VB-CABLE.");
   assert.equal(delayVerdict(null).verdict, "unclear");
   assert.equal(delayVerdict({ ok: false, reason: "something else" }).verdict, "unclear");
+  assert.equal(delayVerdict(run(60, { delayScore: 0.3 })).verdict, "good", "a match of exactly 0.3 is enough");
 });
 
 test("delayVerdict: notes for a quiet cable and for a microphone buffer that grew", () => {
@@ -180,6 +181,15 @@ test("classifyZeroRuns: the microphone's own silence explains CABLE Output's; th
   assert.deepEqual(classifyZeroRuns(null, undefined), { dropouts: [], micHoles: [], micSilent: [], explained: [] });
 });
 
+test("classifyZeroRuns: a mic run at the same frame, or exactly 5 ms shorter, explains CABLE Output's", () => {
+  const ms = (x) => (x * SR) / 1000;
+  assert.equal(classifyZeroRuns([{ startFrame: 1000, frames: 480 }], [{ startFrame: 1000, frames: 480 }]).explained.length, 1, "lag 0");
+  const slack = classifyZeroRuns([{ startFrame: 0, frames: 480 }], [{ startFrame: ms(40), frames: 480 + ms(5) }]);
+  assert.equal(slack.explained.length, 1, "5 ms longer");
+  const over = classifyZeroRuns([{ startFrame: 0, frames: 480 }], [{ startFrame: ms(40), frames: 480 + ms(5) + 1 }]);
+  assert.equal(over.dropouts.length, 1, "one frame more");
+});
+
 // ---------- the microphone's clock ----------
 
 /** Readings every 120 s for 60 min of lag(t) plus seeded uniform ± 10 ms. */
@@ -244,6 +254,31 @@ test("micClock: only the longest run of one microphone source is used", () => {
   assert.equal(r.readings.length, 16);
   assert.equal(r.readings[0].atSec, 1300);
   assert.ok(Math.abs(r.ppm) < 5, `ppm ${r.ppm}: the flat second run, not the rising first one`);
+});
+
+test("micClock: the buffer counts as full 40 ms above its start, not before", () => {
+  const at = (high) => [10, 10, 10, 10, 10, 10, high, 10, 10, 10, 10].map((lagMs, k) => ({ atSec: k * 120, lagMs, micGen: 1 }));
+  assert.equal(micClock(at(49.9), { durationSec: 1320 }).saturatedAtSec, null);
+  assert.equal(micClock(at(50), { durationSec: 1320 }).saturatedAtSec, 720);
+});
+
+test("micClock: a slope needs 4 readings over 600 s or more", () => {
+  const flat = (times) => times.map((atSec) => ({ atSec, lagMs: 20, micGen: 1 }));
+  assert.equal(micClock(flat([0, 120, 240, 360, 480]), { durationSec: 600 }).ppm, null, "5 readings over 480 s");
+  assert.equal(micClock(flat([0, 300, 600]), { durationSec: 600 }).ppm, null, "3 readings over 600 s");
+  const enough = micClock(flat([0, 200, 400, 600]), { durationSec: 600 });
+  assert.equal(enough.ppm, 0);
+  assert.equal(enough.direction, "same");
+});
+
+test("micClock: the lower bound counts from the first reading of the microphone source in use", () => {
+  // A rebuild made a new microphone source at about 1300 s; its buffer was full 240 s later.
+  const first = [2, 122, 242].map((atSec) => ({ atSec, lagMs: 12, micGen: 1 }));
+  const second = [10, 10, 50, 50, 50, 50, 50].map((lagMs, k) => ({ atSec: 1300 + k * 120, lagMs, micGen: 2 }));
+  const r = micClock([...first, ...second], { durationSec: 2100 });
+  assert.equal(r.saturatedAtSec, 1540);
+  assert.equal(r.ppmIsLowerBound, true);
+  near(r.ppm, (40 / 240) * 1000, 1e-9, "40 ms in 240 s, not in 1540 s");
 });
 
 test("micClock: three readings say nothing", () => {
@@ -328,6 +363,26 @@ test("renderPauses: one odd stamp (a clock adjustment) and slow drift are no pau
   assert.deepEqual(renderPauses([]), { pauses: [], late: { count: 0, maxMs: 0 } });
 });
 
+test("renderPauses: at either end of the list one odd stamp is no pause, a real pause is", () => {
+  const odd = (k, ms) => (i, p) => i === k && (p.producedMs += ms);
+  for (const [k, ms] of [
+    [0, -1000],
+    [1, 1000],
+    [98, 1000],
+    [99, 1000],
+  ]) {
+    assert.deepEqual(renderPauses(points(100, odd(k, ms))).pauses, [], `odd stamp at point ${k}`);
+  }
+  // A real pause delays the delivery too.
+  const paused = (from) => (i, p) => i >= from && ((p.producedMs += 500), (p.wallMs += 500));
+  for (const from of [1, 98, 99]) {
+    const r = renderPauses(points(100, paused(from)));
+    assert.equal(r.pauses.length, 1, `a pause before point ${from}`);
+    assert.equal(r.pauses[0].index, from);
+    near(r.pauses[0].ms, 500, 20, "pause length");
+  }
+});
+
 test("phaseTimeline: visible, minimized polls, a Hide ended early by a visible poll, Edge's visibility marks", () => {
   const t = phaseTimeline([
     { atMs: 1000, visible: true, minimized: false, focused: true },
@@ -378,6 +433,16 @@ test("stopAfterHide: never before the planned end, 2 min after the Hide, capped"
   assert.equal(stopAfterHide({ plannedEndSec: 3900, hideEndSec: 3900 }), 4020);
   assert.equal(stopAfterHide({ plannedEndSec: 3900, hideEndSec: 6000 }), 3900 + 2100);
   assert.equal(stopAfterHide({ plannedEndSec: 15, hideEndSec: 8, tailSec: 120, maxEndSec: 1000 }), 128);
+  assert.equal(stopAfterHide({ plannedEndSec: 3900, hideEndSec: 3900, maxEndSec: 3960 }), 3960, "maxEndSec caps it");
+});
+
+test("stopAfterHide: without a usable hide end there is no extension, and never NaN", () => {
+  assert.equal(stopAfterHide({ plannedEndSec: 3900 }), 3900);
+  for (const hideEndSec of [NaN, null, Infinity, "3900"]) assert.equal(stopAfterHide({ plannedEndSec: 3900, hideEndSec }), 3900, String(hideEndSec));
+  assert.equal(stopAfterHide({ plannedEndSec: 3900, hideEndSec: 3900, tailSec: NaN }), 3900);
+  assert.equal(stopAfterHide({ plannedEndSec: 3900, hideEndSec: 3900, maxEndSec: NaN }), 4020);
+  assert.equal(stopAfterHide({ hideEndSec: 3900 }), null, "nothing planned");
+  assert.equal(stopAfterHide(), null);
 });
 
 // ---------- mic mode ----------
@@ -408,10 +473,11 @@ function copySpeech(out, from) {
 /**
  * Envelopes and zero runs of the microphone (ref) and CABLE Output (sig) for
  * a mic-mode check: sig is the speech `lagMs` later, 10 ms later still at
- * every step (steps fall on 100 ms blocks), with `holes` ([atSec, ms] in
- * CABLE Output's time) of zeros.
+ * every step (steps fall on 100 ms blocks), `extraMs` later still from
+ * `fromSec` to `toSec` for each of `shifts` ([fromSec, toSec, extraMs]), with
+ * `holes` ([atSec, ms] in CABLE Output's time) of zeros.
  */
-function micRun({ seconds, lagMs = 40, stepEverySec = 0, holes = [] }) {
+function micRun({ seconds, lagMs = 40, stepEverySec = 0, holes = [], shifts = [] }) {
   const total = seconds * SR;
   const env = () => new EnvelopeStream({ capacity: (total / 240) | 0 });
   const refEnv = env();
@@ -422,7 +488,8 @@ function micRun({ seconds, lagMs = 40, stepEverySec = 0, holes = [] }) {
   const sig = new Float32Array(4800);
   const cuts = holes.map(([at, ms]) => [Math.round(at * SR), Math.round(at * SR + (ms * SR) / 1000)]);
   for (let start = 0; start < total; start += 4800) {
-    const lag = Math.round((lagMs * SR) / 1000) + (stepEverySec ? 480 * Math.floor(start / (stepEverySec * SR)) : 0);
+    let lag = Math.round((lagMs * SR) / 1000) + (stepEverySec ? 480 * Math.floor(start / (stepEverySec * SR)) : 0);
+    for (const [from, to, extraMs] of shifts) if (start >= from * SR && start < to * SR) lag += Math.round((extraMs * SR) / 1000);
     copySpeech(ref, start);
     copySpeech(sig, start - lag);
     for (const [a, b] of cuts) if (a < start + 4800 && b > start) sig.fill(0, Math.max(0, a - start), Math.min(4800, b - start));
@@ -495,6 +562,27 @@ test("analyzeSpeech: no speech → only the zero runs; the microphone's own sile
   assert.deepEqual(r.dropouts, [{ startFrame: 3 * SR, frames: 480, ms: 10 }]);
   assert.equal(r.micSilentSec, 0.5);
   assert.equal(r.micHoles, 0);
+  assert.deepEqual(r.micPauses, [{ startFrame: SR, frames: SR / 2, ms: 500 }]);
+});
+
+test("analyzeSpeech: the microphone's own zero runs of 100 ms or more are its pauses", () => {
+  const db = new Float32Array(800).fill(-70);
+  const refRuns = [
+    { startFrame: 0, frames: 4799 },
+    { startFrame: SR, frames: 4800 },
+    { startFrame: 2 * SR, frames: 480 },
+  ];
+  const r = analyzeSpeech({ refDb: db, sigDb: db, refRuns, sigRuns: [] });
+  assert.deepEqual(r.micPauses, [{ startFrame: SR, frames: 4800, ms: 100 }]);
+});
+
+test("analyzeSpeech: an utterance 600 ms late, beyond its own lag search, is a 600 ms gap", () => {
+  // Its own lag lies at the edge of the ± 300 ms search: not trusted, so the steady lag says when it was due.
+  const u = TAKES[0].utterances[2];
+  const r = analyzeSpeech(micRun({ seconds: 120, shifts: [[60 + u.start - 0.35, 60 + u.end + 0.35, 600]] }));
+  assert.equal(r.gaps.length, 1, JSON.stringify(r.gaps));
+  near(r.gaps[0].atSec, 60 + u.start, 0.02, "where it was due");
+  near(r.gaps[0].holeMs, 600, 20, "as long as it was late");
 });
 
 // ---------- the tone's clock ----------
@@ -518,6 +606,31 @@ test("clockFromEvents: regular skips give the offset; few events give the rate",
   assert.equal(r.direction, null);
   assert.deepEqual(clockFromEvents([], 1800), { ppm: 0, direction: null, ticksPer30Min: 0 });
   assert.deepEqual(clockFromEvents([], 0), { ppm: null, direction: null, ticksPer30Min: null });
+});
+
+test("clockFromEvents: a burst or a cluster of events is counted, but says nothing about the clocks", () => {
+  const at = (kind, times) => times.map((atSec) => ({ kind, atSec }));
+  const rate3 = (3 * 1800) / 3900;
+  // Three holes within one second (a CPU spike) in a 65-minute check: 1.4 per 30 minutes, not 4000.
+  assert.deepEqual(clockFromEvents(at("hole", [1200, 1200.4, 1200.9]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3 });
+  // Three skips 40 s apart in the middle, then none: steady drift would have gone on.
+  assert.deepEqual(clockFromEvents(at("skip", [1000, 1040, 1080]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3 });
+  assert.deepEqual(clockFromEvents(at("skip", [300, 340, 380]), 3900), { ppm: null, direction: null, ticksPer30Min: rate3 });
+  // Four holes: three 40 s apart early on, one at the end.
+  assert.equal(clockFromEvents(at("hole", [100, 140, 180, 3870]), 3900).ppm, null);
+  // Three skips 40 s apart in the last two minutes: a clock offset would have shown long before.
+  assert.equal(clockFromEvents(at("skip", [3780, 3820, 3860]), 3900).ppm, null);
+  // Ten holes half a second apart at the start of a 12 s check: no clock drifts 20000 ppm.
+  const glitchy = clockFromEvents(at("hole", Array.from({ length: 10 }, (_, k) => 5 + 0.5 * k)), 12);
+  assert.deepEqual(glitchy, { ppm: null, direction: null, ticksPer30Min: 1500 });
+});
+
+test("clockFromEvents: steady drift that began once the buffer filled gives its rate from then on", () => {
+  // 40 ppm faster: the first drop after 1000 s, then one every 250 s, in a 30-minute check.
+  const r = clockFromEvents([1000, 1250, 1500, 1750].map((atSec) => ({ kind: "skip", atSec })), 1800);
+  near(r.ppm, 40, 1e-9, "ppm");
+  assert.equal(r.direction, "faster");
+  near(r.ticksPer30Min, 7.2, 1e-9, "per 30 minutes once it began, not 4 in 30 minutes");
 });
 
 // ---------- the long check ----------
@@ -663,6 +776,112 @@ test("longVerdict: a fail outranks a setting; no tone found is no-signal", () =>
   assert.deepEqual(none.reasons, ["The test tone never reached “CABLE Output”."]);
 });
 
+test("longVerdict: a check that measured nothing has no tone road, and its lines say so", () => {
+  const zero = { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 0, levels: 0, steps: 0 };
+  const v = longVerdict(clean({ tone: { lockDb: null, minStableDb: null }, counts: zero, events: [] }));
+  assert.equal(v.verdict, "no-signal");
+  assert.equal(v.tonePath, null);
+  assert.equal(v.lines[1], "Gaps and clicks: not checked, because the test tone never reached “CABLE Output”.");
+  assert.ok(!v.lines.some((l) => l.startsWith("Clicks from the meeting's side") || l.startsWith("Gaps: none")), v.lines.join(" | "));
+  assert.deepEqual(v.micPath, clean().micPath, "the microphone's road does not need the tone");
+  const mic = longVerdict(micClean({ speech: { ...micClean().speech, lagMs: null, lagScore: null } }));
+  assert.equal(mic.verdict, "no-signal");
+  assert.ok(mic.lines.includes("Gaps: not checked, because your voice never reached “CABLE Output”."), mic.lines.join(" | "));
+  assert.ok(mic.lines.includes("Speech heard: 3 min, but none of it in CABLE Output."), mic.lines.join(" | "));
+});
+
+/** longVerdict's input with exactly the fields §3.4 lists. */
+const SPEC_FIELDS = ["counts", "durationSec", "events", "late", "levelChanges", "micPath", "micZeroFraction", "mode", "outages", "phases", "recoveries", "speech", "tone"];
+
+test("longVerdict: the microphone itself stopping fails, from the spec's inputs in mic mode", () => {
+  // Windows paused the microphone for 300 ms; CABLE Output repeats its silence 50 ms later.
+  const speech = analyzeSpeech({
+    refDb: new Float32Array(0),
+    sigDb: new Float32Array(0),
+    refRuns: [{ startFrame: 100 * SR, frames: 0.3 * SR }],
+    sigRuns: [{ startFrame: 100 * SR + 2400, frames: 0.3 * SR }],
+  });
+  const input = {
+    mode: "mic",
+    durationSec: 300,
+    phases: { visibleSec: 300, minimizedSec: 0, hiddenSec: 0, unknownSec: 0 },
+    counts: null,
+    events: [],
+    tone: null,
+    speech,
+    outages: [],
+    recoveries: 0,
+    micPath: null,
+    micZeroFraction: 0.0001,
+    late: { count: 0, maxMs: 0 },
+    levelChanges: [],
+  };
+  assert.deepEqual(Object.keys(input).sort(), SPEC_FIELDS);
+  const v = longVerdict(input);
+  assert.equal(v.verdict, "fail");
+  assert.deepEqual(v.reasons, ["The microphone itself stopped once (the longest for 300 ms): Windows paused it."]);
+  // A speech result without micPauses: its micSilentSec (runs of 200 ms or more) still tells.
+  const { micPauses, ...older } = speech;
+  assert.equal(micPauses.length, 1);
+  assert.deepEqual(longVerdict({ ...input, speech: older }).reasons, ["The microphone itself stopped for 300 ms in all: Windows paused it."]);
+});
+
+test("longVerdict: in tone mode the microphone's zero runs (refRuns) tell; without them a line says it was not checked", () => {
+  const paused = [{ startFrame: 2000 * SR, frames: 1.5 * SR }];
+  let v = longVerdict(clean({ refRuns: paused }));
+  assert.equal(v.verdict, "fail");
+  assert.deepEqual(v.reasons, ["The microphone itself stopped once (the longest for 1500 ms): Windows paused it."]);
+  assert.equal(longVerdict(clean({ refRuns: [{ startFrame: 2000 * SR, frames: 4799 }] })).verdict, "pass", "under 100 ms");
+  v = longVerdict(clean({ refRuns: undefined }));
+  assert.equal(v.verdict, "pass");
+  assert.ok(v.lines.includes("Whether the microphone itself stopped was not checked (no record of its silences)."), v.lines.join(" | "));
+  assert.ok(!longVerdict(clean()).lines.some((l) => l.startsWith("Whether the microphone")), "checked: nothing to say");
+});
+
+test("longVerdict: the noise gate starts at 1 % of digital silence", () => {
+  const refRuns = [{ startFrame: 600 * SR, frames: 150 * 48 }];
+  assert.equal(longVerdict(clean({ refRuns, micZeroFraction: 0.0099 })).verdict, "fail", "0.99 %: no noise gate");
+  assert.equal(longVerdict(clean({ refRuns, micZeroFraction: 0.01 })).verdict, "pass", "1 %: a noise gate");
+});
+
+test("longVerdict: exactly 6 clicks per 30 minutes on either road pass", () => {
+  // 13 skips 300 s apart in 65 minutes: 6.0 per 30 minutes (33 ppm).
+  const events = Array.from({ length: 13 }, (_, k) => ({ kind: "skip", atSec: 150 + 300 * k }));
+  let v = longVerdict(clean({ events, counts: { holes: 0, skips: 13, clicks: 0, dropouts: 0, gaps: 0 } }));
+  assert.equal(v.tonePath.ticksPer30Min, 6);
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  // 13 holes of the microphone in 65 minutes: 6.0 per 30 minutes.
+  const micPath = micClock(readings(() => 20, 105), { holes: 13, durationSec: 3900 });
+  assert.equal(micPath.ticksPer30Min, 6);
+  v = longVerdict(clean({ micPath }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+});
+
+test("longVerdict: a burst of three holes in a second is 1.4 clicks per 30 minutes, not a clock offset", () => {
+  const events = [1200, 1200.4, 1200.9].map((atSec) => ({ kind: "hole", atSec, holeMs: 10, phase: "minimized" }));
+  const v = longVerdict(clean({ events, counts: { holes: 3, skips: 0, clicks: 0, dropouts: 0, gaps: 0 } }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.deepEqual(v.tonePath, { ticksPer30Min: (3 * 1800) / 3900, ppm: null, direction: null });
+  assert.equal(v.lines[2], "Clicks from the meeting's side of the sound: 3 (about 1.4 per 30 minutes).");
+});
+
+test("longVerdict: Windows turning the voice down by exactly 3 dB needs a setting changed", () => {
+  assert.equal(longVerdict(clean({ levelChanges: [{ atSec: 330, fromDb: -12, toDb: -15 }] })).verdict, "fix-setting");
+  assert.equal(longVerdict(clean({ levelChanges: [{ atSec: 330, fromDb: -12, toDb: -14.9 }] })).verdict, "pass");
+});
+
+test("longVerdict: a gap of minutes reads in minutes", () => {
+  const v = longVerdict(
+    clean({
+      counts: { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 1, levels: 0, steps: 0 },
+      events: [{ kind: "gap", atFrame: 25 * 60 * SR, holeMs: 300000, phase: "hidden" }],
+    }),
+  );
+  assert.deepEqual(v.reasons, ["The sound stopped once (the longest for 5 min at 25:00 while hidden)."]);
+  const s = longVerdict(clean({ outages: [{ phase: "minimized", ms: 12500, cause: "render-error", atSec: 60 }] }));
+  assert.equal(s.lines[1], "Gaps: 1 (the longest 12.5 s at 1:00 while minimized).");
+});
+
 test("longVerdict: tone drop-outs and the tick count from the counts", () => {
   const v = longVerdict(
     clean({
@@ -758,6 +977,15 @@ test("restartVerdict", () => {
   assert.equal(unknown.verdict, "fail");
   assert.equal(unknown.text, "fail (back after 2.5 s; the app could not tell when Windows Audio was running again)");
   assert.equal(restartVerdict(null).verdict, "fail");
+});
+
+test("restartVerdict: back in exactly 2 s passes; the app's part of exactly 1 s passes", () => {
+  assert.deepEqual(restartVerdict({ outageMs: 2000, lostAtMs: 0, serviceBackAtMs: null, appMs: null, waitMs: null }), { verdict: "pass", text: "pass" });
+  assert.deepEqual(restartVerdict({ outageMs: 3000, lostAtMs: 0, serviceBackAtMs: 2000, appMs: 700, waitMs: 300 }), {
+    verdict: "pass",
+    text: "pass (Windows itself took about 2.0 s)",
+  });
+  assert.equal(restartVerdict({ outageMs: 3000, lostAtMs: 0, serviceBackAtMs: 2000, appMs: 701, waitMs: 300 }).verdict, "fail");
 });
 
 // ---------- the Gate 1 checklist ----------
@@ -894,6 +1122,68 @@ test("gateSummary: the route, the restart and the long check can fail or need a 
   assert.equal(gateSummary({ checks: { long } })[6].status, "note", "the microphone's road was not measured");
   long[0].recordedSec = 1200;
   assert.equal(gateSummary({ checks: { long } })[6].status, "todo", "shorter than 30 minutes");
+});
+
+/** A 65-minute tone check, as Part D builds its result from longVerdict(input). */
+function toneResult(input) {
+  const v = longVerdict(input);
+  return {
+    mode: "tone",
+    recordedSec: input.durationSec,
+    phases: input.phases,
+    verdict: v.verdict,
+    reasons: v.reasons,
+    lines: v.lines,
+    tonePath: v.tonePath,
+    micPath: { ...v.micPath, noiseGate: false },
+    tone: { levelDb: input.tone.lockDb, lockDb: input.tone.lockDb, minStableDb: input.tone.minStableDb, counts: input.counts },
+    outages: [],
+    renderPauses: [],
+    recoveries: 0,
+  };
+}
+
+test("gateSummary: a check whose tone never reached CABLE Output counts for no row", () => {
+  const zero = { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 0, levels: 0, steps: 0 };
+  const nothing = toneResult(clean({ tone: { lockDb: null, minStableDb: null }, counts: zero, events: [] }));
+  assert.equal(nothing.verdict, "no-signal");
+  let rows = gateSummary({ checks: { long: [nothing] } });
+  assert.equal(rows[5].status, "todo");
+  assert.ok(rows[5].text.includes("In the last one the test tone never reached “CABLE Output”, so it measured nothing."), rows[5].text);
+  assert.equal(rows[6].status, "todo");
+  assert.ok(rows[6].text.includes("measured nothing"), rows[6].text);
+  // An earlier check that measured counts; the later one that measured nothing does not hide it.
+  rows = gateSummary({ checks: { long: [toneResult(clean()), nothing] } });
+  assert.equal(rows[5].status, "pass");
+  assert.equal(rows[6].status, "pass");
+});
+
+test("gateSummary: a microphone that stopped by itself fails the gaps row", () => {
+  const stopped = toneResult(clean({ refRuns: [{ startFrame: 2000 * SR, frames: 1.5 * SR }] }));
+  assert.equal(stopped.verdict, "fail");
+  const rows = gateSummary({ checks: { long: [stopped] } });
+  assert.equal(rows[5].status, "fail");
+  assert.equal(
+    rows[5].text,
+    "In 31 min minimized and 29 min hidden: the microphone itself stopped (Windows paused it). Meet call still open at the end: your note (step 7.5).",
+  );
+  assert.equal(rows[6].status, "pass", "the clicks are fine");
+  // In the check with the voice too.
+  const voice = { mode: "mic", recordedSec: 300, phases: { minimizedSec: 300, hiddenSec: 0 }, verdict: "fail", reasons: [longVerdict(clean({ refRuns: [{ startFrame: 0, frames: SR }] })).reasons[0]], speech: { gaps: [], dropouts: [] } };
+  const both = gateSummary({ checks: { long: [toneResult(clean()), voice] } })[5];
+  assert.equal(both.status, "fail");
+  assert.ok(both.text.includes("the microphone itself stopped in the check with your voice"), both.text);
+});
+
+test("gateSummary: a rendering pause alone fails the gaps row; a slow microphone open is a note", () => {
+  const long = structuredClone(COMPLETE.checks.long);
+  long[0].renderPauses = [{ atSec: 1200, phase: "hidden", ms: 500 }];
+  const row = gateSummary({ checks: { long } })[5];
+  assert.equal(row.status, "fail");
+  assert.ok(row.text.includes("1 rendering pause"), row.text);
+  const mic = gateSummary({ voice: { mic: { settings: { allOff: true }, unlockMs: null, openedInMs: 2400 } } })[1];
+  assert.equal(mic.status, "note");
+  assert.ok(mic.text.includes("2.4 s to open"));
 });
 
 test("cable-check.js is pure: no clock, timer, console or DOM", () => {

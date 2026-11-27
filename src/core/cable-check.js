@@ -68,8 +68,15 @@ const list = (v) => (Array.isArray(v) ? v.filter((x) => x !== null && typeof x =
 /** "once", "twice", "3 times". */
 const times = (n) => (n === 1 ? "once" : n === 2 ? "twice" : `${n} times`);
 
+/** A length of time for people: "300 ms", "12.5 s", "5 min". */
+const lengthOfMs = (ms) =>
+  ms < 10000 ? `${Math.round(ms)} ms` : ms < 120000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms / 60000)} min`;
+
 /** A level in dB with a real minus sign: "−12.0 dB". */
 const dbText = (v) => `${v < 0 ? "−" : ""}${Math.abs(v).toFixed(1)} dB`;
+
+/** How the reason for a microphone that stopped begins: gateSummary looks for it in a check's reasons. */
+const MIC_STOPPED = "The microphone itself stopped";
 
 /** The window phase in words. */
 const PHASE_WORDS = { visible: "open", minimized: "minimized", hidden: "hidden" };
@@ -403,8 +410,12 @@ export function frameClock(syncPoints) {
  * PAUSE_STEP_MS from point i − 1, and the median offset of points i …
  * i + PAUSE_CONFIRM − 1 is above the median of the PAUSE_CONFIRM points before
  * i by more than PAUSE_STEP_MS (a real pause shifts every later point; one odd
- * stamp does not). Slow drift between the audio clock and the system clock
- * never forms a step. Main-thread lateness (wallMs − producedMs) above
+ * stamp does not). Near the ends of the list, where either side has fewer
+ * than PAUSE_CONFIRM points and its median cannot outvote one odd stamp, the
+ * delivery must have stepped too: wallMs − frame / 48 up by more than
+ * PAUSE_STEP_MS from point i − 1 (a real pause delays the delivery as well;
+ * an odd stamp does not). Slow drift between the audio clock and the system
+ * clock never forms a step. Main-thread lateness (wallMs − producedMs) above
  * PAUSE_STEP_MS is a late delivery, never a pause.
  * → { pauses: [{index, atFrame, producedMs, ms}] (index, frame and time of
  * point i), late: {count, maxMs} }
@@ -412,15 +423,22 @@ export function frameClock(syncPoints) {
 export function renderPauses(syncPoints) {
   const pts = syncTimes(syncPoints);
   const offsets = pts.map((p) => p.t - p.frame / FRAMES_PER_MS);
+  const wallOffset = (p) => (isNum(p.wallMs) ? p.wallMs - p.frame / FRAMES_PER_MS : null);
   const C = LIMITS.PAUSE_CONFIRM;
   const STEP = LIMITS.PAUSE_STEP_MS;
   const pauses = [];
   for (let i = 1; i < pts.length; i++) {
     const step = offsets[i] - offsets[i - 1];
     if (!(step > STEP)) continue;
-    const after = median(offsets.slice(i, i + C));
-    const before = median(offsets.slice(Math.max(0, i - C), i));
-    if (after - before > STEP) pauses.push({ index: pts[i].index, atFrame: pts[i].frame, producedMs: pts[i].t, ms: step });
+    const later = offsets.slice(i, i + C);
+    const earlier = offsets.slice(Math.max(0, i - C), i);
+    if (!(median(later) - median(earlier) > STEP)) continue;
+    if (later.length < C || earlier.length < C) {
+      const a = wallOffset(pts[i]);
+      const b = wallOffset(pts[i - 1]);
+      if (!(a !== null && b !== null && a - b > STEP)) continue;
+    }
+    pauses.push({ index: pts[i].index, atFrame: pts[i].frame, producedMs: pts[i].t, ms: step });
   }
   let count = 0;
   let maxMs = 0;
@@ -506,10 +524,14 @@ export function phaseTimeline(marks) {
 /**
  * When a long check stops after a Hide pressed during it: at least
  * tailSec after the Hide ends, never before the planned end, and never after
- * maxEndSec (plannedEndSec + EXTEND_MAX_SEC by default). → seconds since the
- * check started.
+ * maxEndSec (plannedEndSec + EXTEND_MAX_SEC by default). Without a usable
+ * hide end (or tail) there is no extension: plannedEndSec. → seconds since
+ * the check started; null only when plannedEndSec is not a number. Never
+ * NaN: the worklet could not stop by itself at a NaN.
  */
-export function stopAfterHide({ plannedEndSec, hideEndSec, tailSec = LIMITS.HIDE_TAIL_SEC, maxEndSec }) {
+export function stopAfterHide({ plannedEndSec, hideEndSec, tailSec = LIMITS.HIDE_TAIL_SEC, maxEndSec } = {}) {
+  if (!isNum(plannedEndSec)) return null;
+  if (!isNum(hideEndSec) || !isNum(tailSec)) return plannedEndSec;
   const cap = isNum(maxEndSec) ? maxEndSec : plannedEndSec + LIMITS.EXTEND_MAX_SEC;
   return Math.min(cap, Math.max(plannedEndSec, hideEndSec + tailSec));
 }
@@ -526,12 +548,16 @@ export function stopAfterHide({ plannedEndSec, hideEndSec, tailSec = LIMITS.HIDE
  * and yields once before calling it.
  * → { lagMs | null, lagScore | null, gaps (findGaps), speechSec, dropouts
  * (unexplained CABLE Output zero runs: [{startFrame, frames, ms}]), micHoles
- * (short microphone zero runs: n), micSilentSec }
+ * (short microphone zero runs: n), micSilentSec, micPauses (the
+ * microphone's own zero runs of GAP_MS or more: [{startFrame, frames, ms}],
+ * for longVerdict's "capture paused") }
  */
 export function analyzeSpeech({ refDb, sigDb, hopMs = 5, refRuns = [], sigRuns = [], sampleRate = 48000 } = {}) {
   const runs = classifyZeroRuns(refRuns, sigRuns, { sampleRate });
   const msOf = (frames) => (frames / sampleRate) * 1000;
-  const dropouts = runs.dropouts.map((r) => ({ startFrame: r.startFrame, frames: r.frames, ms: round(msOf(r.frames), 2) }));
+  const asList = (rs) => rs.map((r) => ({ startFrame: r.startFrame, frames: r.frames, ms: round(msOf(r.frames), 2) }));
+  const dropouts = asList(runs.dropouts);
+  const micPauses = asList(runList(refRuns).filter((r) => msOf(r.frames) >= LIMITS.GAP_MS));
   const micSilentSec = runs.micSilent.reduce((s, r) => s + r.frames, 0) / sampleRate;
   const ref = refDb && typeof refDb.length === "number" ? refDb : new Float32Array(0);
   const sig = sigDb && typeof sigDb.length === "number" ? sigDb : new Float32Array(0);
@@ -557,20 +583,37 @@ export function analyzeSpeech({ refDb, sigDb, hopMs = 5, refRuns = [], sigRuns =
       gaps = findGaps(ref, sig, hopMs, est.lagMs, { segLags, refMask });
     }
   }
-  return { lagMs, lagScore, gaps, speechSec, dropouts, micHoles: runs.micHoles.length, micSilentSec };
+  return { lagMs, lagScore, gaps, speechSec, dropouts, micHoles: runs.micHoles.length, micSilentSec, micPauses };
 }
 
 /** An event's time in seconds: atSec, else atFrame at 48 kHz; null without either. */
 const eventSec = (e) => (isNum(e.atSec) ? e.atSec : isNum(e.atFrame) ? e.atFrame / 48000 : null);
 
+/** The most two audio clocks drift apart (and the most the tone detector measures): one 10 ms event every 33 s. */
+const MAX_DRIFT_PPM = 300;
+
+/**
+ * A FIFO holds at most 120 ms (6 buffers of a 20 ms period), so steady drift
+ * gives its first drop or hole within 12 intervals of the start, plus one.
+ */
+const FIRST_EVENT_WITHIN = 13;
+
 /**
  * The clock offset of the tone road from the tone's events. A clock
  * crossing gives one event of one kind per 10 ms of drift (skips: the
- * tone's clock is faster than CABLE's; holes: slower). With 3 or more events
- * of one kind: ppm = 10 ms / the median interval (+ for skips, − for holes)
- * and ticksPer30Min = 1800 s / the median interval; else ticksPer30Min =
- * ticks × 1800 / durationSec and ppm = ticks × 10 ms / durationSec (a bound
- * when there are none). → { ppm, direction: "faster" | "slower" | null, ticksPer30Min }
+ * tone's clock is faster than CABLE's; holes: slower), at a steady interval
+ * once its FIFO has filled or drained. With 3 or more events of one kind
+ * that look like that, ppm = 10 ms / the median interval T (+ for skips, −
+ * for holes) and ticksPer30Min = 1800 s / T. They look like steady drift
+ * when T is at least 10 ms / MAX_DRIFT_PPM (33 s), the first came within 13
+ * intervals of the start, and from the first one to the end of the check
+ * they came at least every 2 T on average ((durationSec − first) / T ≤ 2 ×
+ * their number). Otherwise (a burst of holes in one second, a cluster that
+ * stopped) ticksPer30Min = ticks × 1800 / durationSec and ppm and direction
+ * are null: they say nothing about the clocks. With fewer than 3 events of
+ * one kind, ticksPer30Min is that same count rate and ppm = ticks × 10 ms /
+ * durationSec (a bound when there are none).
+ * → { ppm, direction: "faster" | "slower" | null, ticksPer30Min }
  */
 export function clockFromEvents(events, durationSec) {
   const evs = list(events);
@@ -582,26 +625,32 @@ export function clockFromEvents(events, durationSec) {
       .sort((a, b) => a - b);
   const skips = timesOf("skip");
   const holes = timesOf("hole");
-  const regular = skips.length >= 3 && skips.length >= holes.length ? { at: skips, sign: 1 } : holes.length >= 3 ? { at: holes, sign: -1 } : null;
-  if (regular) {
-    const gaps = [];
-    for (let i = 1; i < regular.at.length; i++) if (regular.at[i] > regular.at[i - 1]) gaps.push(regular.at[i] - regular.at[i - 1]);
-    const every = median(gaps);
-    if (isNum(every) && every > 0) {
-      return {
-        ppm: (regular.sign * 0.01 * 1e6) / every,
-        direction: regular.sign > 0 ? "faster" : "slower",
-        ticksPer30Min: 1800 / every,
-      };
-    }
-  }
   const skipCount = evs.filter((e) => e.kind === "skip").length;
   const holeCount = evs.filter((e) => e.kind === "hole").length;
   const ticks = skipCount + holeCount + evs.filter((e) => e.kind === "click").length;
   if (!isNum(durationSec) || !(durationSec > 0)) return { ppm: null, direction: null, ticksPer30Min: null };
+  const countRate = (ticks * 1800) / durationSec;
+  const regular = skips.length >= 3 && skips.length >= holes.length ? { at: skips, sign: 1 } : holes.length >= 3 ? { at: holes, sign: -1 } : null;
+  if (regular) {
+    const at = regular.at;
+    const intervals = [];
+    for (let i = 1; i < at.length; i++) if (at[i] > at[i - 1]) intervals.push(at[i] - at[i - 1]);
+    const every = median(intervals);
+    const steady =
+      isNum(every) &&
+      every >= 0.01 / (MAX_DRIFT_PPM * 1e-6) &&
+      at[0] <= FIRST_EVENT_WITHIN * every &&
+      durationSec - at[0] <= 2 * at.length * every;
+    if (!steady) return { ppm: null, direction: null, ticksPer30Min: countRate };
+    return {
+      ppm: (regular.sign * 0.01 * 1e6) / every,
+      direction: regular.sign > 0 ? "faster" : "slower",
+      ticksPer30Min: 1800 / every,
+    };
+  }
   const direction = skipCount > holeCount ? "faster" : holeCount > skipCount ? "slower" : null;
   const ppm = ((ticks * 0.01) / durationSec) * 1e6;
-  return { ppm: direction === "slower" ? -ppm : ppm, direction, ticksPer30Min: (ticks * 1800) / durationSec };
+  return { ppm: direction === "slower" ? -ppm : ppm, direction, ticksPer30Min: countRate };
 }
 
 /** "15 s" for a short check, "65 min" for a long one. */
@@ -619,27 +668,54 @@ function whereText(atSec, phase) {
 const per30 = (x) => round(x, 1).toFixed(1);
 
 /**
+ * Where the "capture paused" rule finds the microphone's own zero runs of
+ * GAP_MS or more: refRuns when given (both modes), else the mic-mode speech
+ * analysis (its micPauses; else its micSilentSec, the runs of 200 ms or more,
+ * whose number is not known). → { count, longestMs } | { totalMs } | null
+ * (nothing to check with).
+ */
+function micStops(refRuns, speech) {
+  const long = (ms) => ms >= LIMITS.GAP_MS;
+  const summary = (lengths) => ({ count: lengths.length, longestMs: lengths.reduce((a, b) => (b > a ? b : a), 0) });
+  if (Array.isArray(refRuns)) return summary(runList(refRuns).map((r) => r.frames / FRAMES_PER_MS).filter(long));
+  if (speech && Array.isArray(speech.micPauses)) {
+    return summary(list(speech.micPauses).map((p) => (isNum(p.ms) ? p.ms : (p.frames ?? 0) / FRAMES_PER_MS)).filter(long));
+  }
+  if (speech && isNum(speech.micSilentSec)) {
+    return speech.micSilentSec > 0 ? { totalMs: speech.micSilentSec * 1000 } : summary([]);
+  }
+  return null;
+}
+
+/**
  * Long-check verdict. input: { mode: "tone" | "mic", durationSec, phases
  * (spans()), counts (tone: ToneCheck counts), events (tone events with
  * atSec or atFrame, and phase), tone: {lockDb, minStableDb} (tone mode),
  * speech (analyzeSpeech(), mic mode), outages: [{phase, ms, cause, atSec?}]
  * (recoveries during the run and rendering pauses), recoveries: n, micPath
- * (micClock()), micZeroFraction (the microphone's digital silence / all
- * frames), late (renderPauses().late), levelChanges ([{atSec, fromDb, toDb}];
- * taken from the tone's "level" events when absent), refRuns (the
- * microphone's zero runs; optional) }.
+ * (micClock()), micZeroFraction (the frames in the microphone's zero runs of
+ * 1 ms or more, ZeroRuns.zeroFrames, / all frames), late
+ * (renderPauses().late), levelChanges ([{atSec, fromDb, toDb}]; taken from
+ * the tone's "level" events when absent), refRuns (the microphone's zero
+ * runs over the whole check, [{startFrame, frames}]: at least every run of
+ * GAP_MS or more. Tone mode needs them for "capture paused"; mic mode falls
+ * back to speech.micPauses) }.
  * It fails on: any gap (a tone gap, every outage); a drop-out (tone), or an
  * unexplained CABLE Output zero run of DROPOUT_MS or more (mic); more than
  * 6 clicks per 30 minutes on the tone's road (tone mode) or on the
  * microphone's road; more than 6 short drop-outs per 30 minutes (mic mode);
  * missing words (findGaps, mic mode); any recovery; the microphone itself
- * silent for GAP_MS or more ("capture paused"). The microphone's holes and
- * "capture paused" count only when it has no noise gate (micZeroFraction <
+ * silent for GAP_MS or more ("capture paused": the reason begins "The
+ * microphone itself stopped"; without refRuns or speech a line says it was
+ * not checked). The microphone's holes and "capture paused"
+ * count only when it has no noise gate (micZeroFraction <
  * NOISE_GATE_FRACTION); otherwise a line says so and the microphone's road
  * uses only its slope. With nothing failing, a tone quieter than
  * TONE_LEVEL_MIN_DB or a drop in volume of 3 dB or more needs a setting
- * changed ("fix-setting"). No tone found, or no voice in CABLE Output, is
- * "no-signal". Late deliveries never fail: a line reports them.
+ * changed ("fix-setting"). No tone found, or a voice on the microphone that
+ * never reached CABLE Output, is "no-signal": nothing on the cable was
+ * measured, so tonePath is null and the lines say gaps were not checked.
+ * Late deliveries never fail: a line reports them.
  * → { verdict: "pass" | "fix-setting" | "fail" | "no-signal", reasons, tonePath:
  * {ticksPer30Min, ppm, direction} | null, micPath, lines (at most 10) }
  */
@@ -656,6 +732,7 @@ export function longVerdict(input) {
   const outages = list(inp.outages);
   const recoveries = isNum(inp.recoveries) ? inp.recoveries : 0;
   const noiseGate = isNum(inp.micZeroFraction) && inp.micZeroFraction >= LIMITS.NOISE_GATE_FRACTION;
+  const noSignal = mode === "tone" ? !isNum(tone.lockDb) : !speech || (!isNum(speech.lagMs) && (speech.speechSec ?? 0) > 0);
   const fails = [];
   const fixes = [];
   const lines = [];
@@ -670,28 +747,37 @@ export function longVerdict(input) {
       : `${len(durationSec)} recorded.`,
   );
 
-  // Gaps: the tone's gap events and every outage (recoveries, rendering pauses).
-  const gapEvents = events.filter((e) => e.kind === "gap");
-  const gapCount = (mode === "tone" && counts && isNum(counts.gaps) ? Math.max(counts.gaps, gapEvents.length) : gapEvents.length) + outages.length;
-  if (gapCount > 0) {
-    const longest = [
-      ...gapEvents.map((e) => ({ ms: e.holeMs ?? e.ms ?? 0, atSec: eventSec(e), phase: e.phase })),
-      ...outages.map((o) => ({ ms: o.ms ?? 0, atSec: o.atSec, phase: o.phase })),
-    ].reduce((a, b) => (b.ms > a.ms ? b : a), { ms: 0, atSec: null, phase: null });
-    const where = whereText(longest.atSec, longest.phase);
-    fails.push(`The sound stopped ${times(gapCount)} (the longest for ${Math.round(longest.ms)} ms${where}).`);
-    lines.push(`Gaps: ${gapCount} (the longest ${Math.round(longest.ms)} ms${where}).`);
+  // Gaps: the tone's gap events and every outage (recoveries, rendering pauses). Nothing on the cable was
+  // measured without a signal there.
+  if (noSignal) {
+    lines.push(
+      mode === "tone"
+        ? "Gaps and clicks: not checked, because the test tone never reached “CABLE Output”."
+        : "Gaps: not checked, because your voice never reached “CABLE Output”.",
+    );
   } else {
-    lines.push("Gaps: none.");
+    const gapEvents = events.filter((e) => e.kind === "gap");
+    const gapCount = (mode === "tone" && counts && isNum(counts.gaps) ? Math.max(counts.gaps, gapEvents.length) : gapEvents.length) + outages.length;
+    if (gapCount > 0) {
+      const longest = [
+        ...gapEvents.map((e) => ({ ms: e.holeMs ?? e.ms ?? 0, atSec: eventSec(e), phase: e.phase })),
+        ...outages.map((o) => ({ ms: o.ms ?? 0, atSec: o.atSec, phase: o.phase })),
+      ].reduce((a, b) => (b.ms > a.ms ? b : a), { ms: 0, atSec: null, phase: null });
+      const where = whereText(longest.atSec, longest.phase);
+      fails.push(`The sound stopped ${times(gapCount)} (the longest for ${lengthOfMs(longest.ms)}${where}).`);
+      lines.push(`Gaps: ${gapCount} (the longest ${lengthOfMs(longest.ms)}${where}).`);
+    } else {
+      lines.push("Gaps: none.");
+    }
   }
   if (recoveries > 0) fails.push(`The app had to bring your voice back ${times(recoveries)}.`);
 
   // The tone's road: Windows' default playback device → VB-CABLE.
   let tonePath = null;
-  if (mode === "tone") {
+  if (mode === "tone" && !noSignal) {
     const dropouts = counts && isNum(counts.dropouts) ? counts.dropouts : events.filter((e) => e.kind === "dropout").length;
     if (dropouts > 0) {
-      const longest = Math.max(0, ...events.filter((e) => e.kind === "dropout").map((e) => e.holeMs ?? e.ms ?? 0));
+      const longest = events.filter((e) => e.kind === "dropout").reduce((m, e) => Math.max(m, e.holeMs ?? e.ms ?? 0), 0);
       fails.push(`The sound dropped out ${times(dropouts)} for 20 to 100 ms${longest > 0 ? ` (the longest ${Math.round(longest)} ms)` : ""}.`);
     }
     const fromEvents = clockFromEvents(events, durationSec);
@@ -739,39 +825,46 @@ export function longVerdict(input) {
     lines.push("The microphone's clock was not measured on this output route.");
   }
 
-  // The microphone itself: silent for GAP_MS or more while the app was capturing.
-  const refRuns = runList(inp.refRuns);
-  if (!noiseGate) {
-    const paused = refRuns.filter((r) => r.frames >= (LIMITS.GAP_MS * 48000) / 1000);
-    if (paused.length) {
-      const longest = Math.max(...paused.map((r) => r.frames)) / 48;
-      fails.push(`The microphone itself stopped ${times(paused.length)} (the longest for ${Math.round(longest)} ms): Windows paused it.`);
-    }
+  // The microphone itself: silent for GAP_MS or more while the app was capturing ("capture paused").
+  const stops = noiseGate ? null : micStops(inp.refRuns, speech);
+  if (stops && isNum(stops.count) && stops.count > 0) {
+    fails.push(`${MIC_STOPPED} ${times(stops.count)} (the longest for ${lengthOfMs(stops.longestMs)}): Windows paused it.`);
+  } else if (stops && isNum(stops.totalMs)) {
+    fails.push(`${MIC_STOPPED} for ${lengthOfMs(stops.totalMs)} in all: Windows paused it.`);
+  } else if (!noiseGate && stops === null) {
+    lines.push("Whether the microphone itself stopped was not checked (no record of its silences).");
   }
 
   // Mic mode: words, drop-outs.
   if (mode === "mic" && speech) {
     const gaps = list(speech.gaps);
     if (gaps.length) {
-      const longest = Math.max(...gaps.map((g) => g.holeMs ?? 0));
-      fails.push(`Words went missing ${times(gaps.length)} (the longest ${Math.round(longest)} ms).`);
+      const longest = gaps.reduce((m, g) => Math.max(m, g.holeMs ?? 0), 0);
+      fails.push(`Words went missing ${times(gaps.length)} (the longest ${lengthOfMs(longest)}).`);
     }
-    const drops = list(speech.dropouts).map((d) => ({ ...d, ms: isNum(d.ms) ? d.ms : (d.frames ?? 0) / 48 }));
+    const drops = list(speech.dropouts).map((d) => ({ ...d, ms: isNum(d.ms) ? d.ms : (d.frames ?? 0) / FRAMES_PER_MS }));
     const long = drops.filter((d) => d.ms >= LIMITS.DROPOUT_MS);
     const short = drops.filter((d) => d.ms < LIMITS.DROPOUT_MS);
     if (long.length) {
-      const longest = Math.max(...long.map((d) => d.ms));
-      fails.push(`CABLE Output dropped out ${times(long.length)} (the longest for ${Math.round(longest)} ms).`);
+      const longest = long.reduce((m, d) => Math.max(m, d.ms), 0);
+      fails.push(`CABLE Output dropped out ${times(long.length)} (the longest for ${lengthOfMs(longest)}).`);
     }
     if (rate(short.length) > LIMITS.TICKS_PER_30_MIN) {
       fails.push(`Too many short drop-outs in CABLE Output: about ${per30(rate(short.length))} per 30 minutes (6 at most).`);
     }
+    const heard = speech.speechSec ?? 0;
     lines.push(
       isNum(speech.lagMs)
-        ? `Speech heard: ${lengthText(speech.speechSec ?? 0, (speech.speechSec ?? 0) >= 90)}; your voice reached CABLE Output about ${Math.round(speech.lagMs)} ms later.`
-        : "No speech was heard, so only the silence was checked.",
+        ? `Speech heard: ${lengthText(heard, heard >= 90)}; your voice reached CABLE Output about ${Math.round(speech.lagMs)} ms later.`
+        : heard > 0
+          ? `Speech heard: ${lengthText(heard, heard >= 90)}, but none of it in CABLE Output.`
+          : "No speech was heard, so only the silence was checked.",
     );
-    lines.push(drops.length ? `Drop-outs in CABLE Output: ${drops.length} (the longest ${Math.round(Math.max(...drops.map((d) => d.ms)))} ms).` : "Drop-outs in CABLE Output: none.");
+    lines.push(
+      drops.length
+        ? `Drop-outs in CABLE Output: ${drops.length} (the longest ${lengthOfMs(drops.reduce((m, d) => Math.max(m, d.ms), 0))}).`
+        : "Drop-outs in CABLE Output: none.",
+    );
   }
 
   // The volume (tone mode): absolute, and drops while the check ran.
@@ -811,10 +904,6 @@ export function longVerdict(input) {
     );
   }
 
-  const noSignal =
-    mode === "tone"
-      ? !isNum(tone.lockDb)
-      : !speech || (!isNum(speech.lagMs) && (speech.speechSec ?? 0) > 0);
   let verdict;
   let reasons;
   if (noSignal) {
@@ -953,18 +1042,29 @@ function delayRow(results) {
   return row(name, "fail", `${text} Too slow.`);
 }
 
+/** The check failed because the microphone itself stopped (longVerdict's "capture paused" reason). */
+const micStopped = (run) =>
+  run.verdict === "fail" && Array.isArray(run.reasons) && run.reasons.some((t) => typeof t === "string" && t.startsWith(MIC_STOPPED));
+
+/** A check that measured nothing: its signal never reached CABLE Output. It counts as no check at all. */
+const measuredNothing = (run) => run.verdict === "no-signal";
+
+const NOTHING_MEASURED = " In the last one the test tone never reached “CABLE Output”, so it measured nothing.";
+
 function gapsRow(results) {
   const name = "No gaps while minimized and hidden";
   const meet = " Meet call still open at the end: your note (step 7.5).";
   const long = list(results.checks?.long);
   const toneRuns = long.filter((r) => r.mode === "tone");
   const enough = (r) => (r.phases?.minimizedSec ?? 0) >= LIMITS.MIN_PHASE_SEC && (r.phases?.hiddenSec ?? 0) >= LIMITS.MIN_PHASE_SEC;
-  const run = lastOf(toneRuns, enough);
+  const run = lastOf(toneRuns, (r) => !measuredNothing(r) && enough(r));
   if (!run) {
     const latest = toneRuns[toneRuns.length - 1];
-    const sofar = latest
-      ? ` The last one had ${Math.round((latest.phases?.minimizedSec ?? 0) / 60)} min minimized and ${Math.round((latest.phases?.hiddenSec ?? 0) / 60)} min hidden.`
-      : "";
+    const sofar = !latest
+      ? ""
+      : measuredNothing(latest)
+        ? NOTHING_MEASURED
+        : ` The last one had ${Math.round((latest.phases?.minimizedSec ?? 0) / 60)} min minimized and ${Math.round((latest.phases?.hiddenSec ?? 0) / 60)} min hidden.`;
     return row(name, "todo", `Run the long check (step 7): it needs 25 min minimized and 25 min hidden.${sofar}${meet}`);
   }
   const problems = [];
@@ -978,11 +1078,14 @@ function gapsRow(results) {
   if (outages) problems.push(`${outages} outage${outages === 1 ? "" : "s"}`);
   if (pauses) problems.push(`${pauses} rendering pause${pauses === 1 ? "" : "s"}`);
   if (recoveries) problems.push(`${recoveries} recover${recoveries === 1 ? "y" : "ies"}`);
+  // The tone replaced the microphone on the cable, but a microphone that stopped while hidden is a gap in the voice.
+  if (micStopped(run)) problems.push("the microphone itself stopped (Windows paused it)");
   for (const m of long.filter((r) => r.mode === "mic")) {
     const words = list(m.speech?.gaps).length;
     const drops = list(m.speech?.dropouts).filter((d) => (d.ms ?? 0) >= LIMITS.DROPOUT_MS).length;
     if (words) problems.push(`missing words ${times(words)} in the check with your voice`);
     if (drops) problems.push(`${drops} drop-out${drops === 1 ? "" : "s"} in the check with your voice`);
+    if (micStopped(m)) problems.push("the microphone itself stopped in the check with your voice");
   }
   const phases = `${Math.round(run.phases.minimizedSec / 60)} min minimized and ${Math.round(run.phases.hiddenSec / 60)} min hidden`;
   if (problems.length) return row(name, "fail", `In ${phases}: ${problems.join(", ")}.${meet}`);
@@ -995,11 +1098,13 @@ function gapsRow(results) {
 
 function ticksRow(results) {
   const name = "No clock-crossing clicks";
-  const run = lastOf(
-    list(results.checks?.long),
-    (r) => r.mode === "tone" && (r.recordedSec ?? 0) >= 30 * 60,
-  );
-  if (!run) return row(name, "todo", "Needs a long check with the test tone of at least 30 minutes (step 7).");
+  const longEnough = list(results.checks?.long).filter((r) => r.mode === "tone" && (r.recordedSec ?? 0) >= 30 * 60);
+  const run = lastOf(longEnough, (r) => !measuredNothing(r));
+  if (!run) {
+    const latest = longEnough[longEnough.length - 1];
+    const extra = latest && measuredNothing(latest) ? NOTHING_MEASURED : "";
+    return row(name, "todo", `Needs a long check with the test tone of at least 30 minutes (step 7).${extra}`);
+  }
   const tone = run.tonePath?.ticksPer30Min;
   const mp = run.micPath ?? null;
   const gate = mp?.noiseGate === true;
@@ -1043,9 +1148,11 @@ function connectRow(results) {
  * note); the delay (the highest estimate of the runs on the normal route;
  * runs forced onto the audio element are listed, not counted); no gaps
  * while minimized and hidden (25 min of each needed, plus the user's note
- * that the Meet call stayed open); no clock-crossing clicks (each road at
- * most 6 per 30 minutes); the Windows Audio restart (the latest recovery
- * that involved both the microphone and the context); Connect only.
+ * that the Meet call stayed open; a microphone that stopped by itself fails
+ * it too); no clock-crossing clicks (each road at most 6 per 30 minutes);
+ * the Windows Audio restart (the latest recovery that involved both the
+ * microphone and the context); Connect only. A long check whose verdict is
+ * "no-signal" measured nothing and counts for no row.
  * → [{ row, status: "pass" | "fail" | "todo" | "note", text }]
  */
 export function gateSummary(results) {

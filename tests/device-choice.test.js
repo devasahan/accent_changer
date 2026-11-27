@@ -88,6 +88,9 @@ test("findCableOutput: the exact label first, renamed endpoints too, never a pse
   assert.equal(findCableOutput(INPUTS.filter((d) => d.deviceId !== ID.cableOut)), null);
   assert.equal(findCableOutput(OUTPUTS), null, "an output list has no CABLE Output");
   assert.equal(findCableOutput(null), null);
+  // A renamed endpoint without Windows' numbering, listed first, still loses to the exact label.
+  const renamedFirst = [mic(ID.cableOut2, "Accent Mic (VB-Audio Virtual Cable)"), mic(ID.cableOut, "CABLE Output (VB-Audio Virtual Cable)")];
+  assert.equal(findCableOutput(renamedFirst).deviceId, ID.cableOut);
 });
 
 test("virtualOutputs: the cable and other virtual playback devices, in order", () => {
@@ -136,6 +139,7 @@ test("headphonesFor: names hidden, stand-in, the mic's earpiece, Windows' defaul
   const krisp = INPUTS.find((d) => d.deviceId === ID.krisp);
   assert.deepEqual(headphonesFor(snapshot({ labelsVisible: false }), { mic: headsetMic }), { entry: null, how: null, refusal: "NAMES_HIDDEN" });
   assert.equal(headphonesFor(null).refusal, "NAMES_HIDDEN", "no snapshot yet");
+  assert.equal(headphonesFor(snapshot({ labelsVisible: false }), { mic: headsetMic, standIn: true }).refusal, "NAMES_HIDDEN", "names hidden comes first");
   assert.equal(headphonesFor(snapshot(), { mic: headsetMic, standIn: true }).refusal, "STAND_IN_QUIET");
   const sib = headphonesFor(snapshot(), { mic: headsetMic });
   assert.equal(sib.how, "mic-sibling");
@@ -472,6 +476,32 @@ test("deviceWarnings: nameOf masks every label put into a text", () => {
   for (const w of list) assert.ok(!/priya|jabra/i.test(w.text), w.text);
   assert.ok(list[0].text.includes("“Headset Microphone ([name hidden])”"));
   assert.ok(list[0].text.includes("“Microphone Array (Realtek(R) Audio)”"));
+});
+
+test("deviceWarnings: the stand-in names the microphone that is missing, saved or in use before", () => {
+  const standIn = (fields, nameOf) =>
+    deviceWarnings({ ...QUIET, micLabel: "Microphone Array (Realtek(R) Audio)", standIn: true, ...fields }, nameOf).find(
+      (w) => w.code === "STAND_IN",
+    ).text;
+  const after = "is not connected, so the app uses “Microphone Array (Realtek(R) Audio)” for now. Plug it back in: the app switches back by itself.";
+  // Nothing saved (the user never picked a microphone): the one in use before is the missing one.
+  assert.equal(
+    standIn({ savedMicLabel: "", wantedMicLabel: "Headset Microphone (2- USB Audio Device)" }),
+    `Your microphone “Headset Microphone (2- USB Audio Device)” ${after}`,
+  );
+  assert.equal(
+    standIn({ savedMicLabel: "", wantedMicLabel: "Headset Microphone (Priya's Jabra)" }, reportLabel),
+    `Your microphone “Headset Microphone ([name hidden])” ${after}`,
+    "masked for results",
+  );
+  // The saved one comes first.
+  assert.ok(standIn({ savedMicLabel: "Microphone (USB Audio Device)", wantedMicLabel: "Headset (USB Audio Device)" }).startsWith("Your microphone “Microphone (USB Audio Device)”"));
+  // No name known: no empty quotes, and no "(no name)" in results.
+  for (const nameOf of [undefined, reportLabel]) {
+    assert.equal(standIn({ savedMicLabel: "", wantedMicLabel: "  " }, nameOf), `Your microphone ${after}`);
+    assert.equal(standIn({ savedMicLabel: "" }, nameOf), `Your microphone ${after}`);
+  }
+  assert.equal(WARNINGS.STAND_IN("", "B"), "Your microphone is not connected, so the app uses “B” for now. Plug it back in: the app switches back by itself.");
 });
 
 test("deviceWarnings: Windows' defaults, in any language, and loopbacks", () => {

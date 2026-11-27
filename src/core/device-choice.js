@@ -488,8 +488,9 @@ export const WARNINGS = Object.freeze({
     "Windows' default communications playback device is “CABLE Input”. Meeting apps that use it would play the interviewer into the cable, and you would not hear them. In Windows sound settings, right-click your headphones and choose “Set as Default Communication Device”.",
   COMMS_INPUT_IS_CABLE:
     "Windows' default communications microphone is “CABLE Output”, the app's own output. Apps that use it would hear the app instead of you, and nothing at all while the app is closed. In Windows sound settings → Recording, right-click your headset microphone and choose “Set as Default Communication Device”.",
-  STAND_IN: (saved, used) =>
-    `Your microphone “${saved}” is not connected, so the app uses “${used}” for now. Plug it back in: the app switches back by itself.`,
+  // missing: the name of the microphone that is not there ("" when none is known).
+  STAND_IN: (missing, used) =>
+    `Your microphone ${missing ? `“${missing}” ` : ""}is not connected, so the app uses “${used}” for now. Plug it back in: the app switches back by itself.`,
   OUTPUT_OVERRIDE_MISSING: (saved) =>
     `The playback device you picked, “${saved}”, is not there, so the app uses CABLE Input instead.`,
   NO_CABLE:
@@ -529,18 +530,22 @@ function feedbackCode(text) {
  * (Windows' default microphone is CABLE Output or a Stereo Mix), all three
  * from devices-match's feedbackWarnings() (any other text it gives is code
  * "FEEDBACK"); COMMS_OUTPUT_IS_CABLE, COMMS_INPUT_IS_CABLE (the default
- * communications devices); STAND_IN; OUTPUT_OVERRIDE_MISSING; NO_CABLE (no
- * output found); DEFAULT_RATE_LOW (below 44.1 kHz); CABLE_RATE (not 48 kHz);
- * BLUETOOTH_MIC. nameOf(label) is applied to every label put into a text:
- * the identity for the page, reportLabel for results. Labels of Windows'
- * defaults are the pseudo-devices' labels ("Default - …"; "" when absent).
- * ROUTE_CHANGED is added by the graph, not here.
+ * communications devices); STAND_IN (it names the microphone that is
+ * missing: savedMicLabel, else wantedMicLabel, the label of the microphone
+ * in use before when nothing is saved; no name when neither is known);
+ * OUTPUT_OVERRIDE_MISSING; NO_CABLE (no output found); DEFAULT_RATE_LOW
+ * (below 44.1 kHz); CABLE_RATE (not 48 kHz); BLUETOOTH_MIC. nameOf(label) is
+ * applied to every label put into a text: the identity for the page,
+ * reportLabel for results. Labels of Windows' defaults are the
+ * pseudo-devices' labels ("Default - …"; "" when absent). ROUTE_CHANGED is
+ * added by the graph, not here.
  * @returns {Array<{code: string, text: string}>}
  */
 export function deviceWarnings(
   {
     micLabel = "",
     savedMicLabel = "",
+    wantedMicLabel = "",
     standIn = false,
     outputFound,
     savedOutputMissing = false,
@@ -564,7 +569,10 @@ export function deviceWarnings(
   if (isCableInput(commsOutputLabel)) list.push({ code: "COMMS_OUTPUT_IS_CABLE", text: WARNINGS.COMMS_OUTPUT_IS_CABLE });
   if (isCableOutput(commsInputLabel)) list.push({ code: "COMMS_INPUT_IS_CABLE", text: WARNINGS.COMMS_INPUT_IS_CABLE });
   if (standIn) {
-    list.push({ code: "STAND_IN", text: WARNINGS.STAND_IN(nameOf(savedMicLabel ?? ""), nameOf(micLabel ?? "")) });
+    // Nothing is saved until the user picks a microphone: then the missing one is the one in use before.
+    const named = (s) => (typeof s === "string" && s.trim() ? s : "");
+    const missing = named(savedMicLabel) || named(wantedMicLabel);
+    list.push({ code: "STAND_IN", text: WARNINGS.STAND_IN(missing ? nameOf(missing) : "", nameOf(micLabel ?? "")) });
   }
   if (savedOutputMissing) {
     list.push({ code: "OUTPUT_OVERRIDE_MISSING", text: WARNINGS.OUTPUT_OVERRIDE_MISSING(nameOf(savedOutputLabel ?? "")) });

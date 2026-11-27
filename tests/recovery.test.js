@@ -297,6 +297,32 @@ test("fault: transient failures retry every 250 ms, then every second after 15 s
   assert.equal(r.phase, "waiting");
 });
 
+test("fault: the fast retries end exactly 15 s after the loss", () => {
+  const r = running();
+  r.event(ev.closed, 0);
+  r.event(ev.fail("rebuild", sinkError("transient")), 100);
+  r.event(ev.retry, 14900);
+  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 15000), [retryIn(1000)]);
+});
+
+test("fault: with only the context to rebuild, the cable back is enough (the microphone is not needed)", () => {
+  const r = running();
+  r.event(ev.closed, 0);
+  r.event(ev.fail("rebuild", sinkError("missing")), 50);
+  assert.deepEqual(r.event(ev.devices(true, false), 100), [CLEAR_RETRY, rebuild(false)]);
+  assert.equal(r.outage.devicesGoneAtMs, null, "no microphone involved: its absence is not counted");
+});
+
+test("fault: the microphone missing from the device list counts as gone while its reopen is in flight", () => {
+  const r = running();
+  r.event(ev.micEnded, 0);
+  assert.equal(r.outage.needMic, false, "the reopen-mic in flight took the flag");
+  assert.deepEqual(r.event(ev.devices(true, false), 20), []);
+  assert.equal(r.outage.devicesGoneAtMs, 20);
+  r.event(ev.devices(true, true), 300);
+  assert.equal(r.outage.devicesBackAtMs, 300);
+});
+
 test("fault: a busy microphone during a fault is retried in 250 ms, not 5 s", () => {
   const r = running();
   r.event(ev.micEnded, 0);
@@ -360,6 +386,36 @@ test("stale timers are ignored in the other phases", () => {
   r.event(ev.ok("rebuild"), 300);
   assert.deepEqual(r.event(ev.retry, 310), [], "a retry timer while verifying");
   assert.equal(r.phase, "verifying");
+});
+
+test("stop() forgets the devices: after a new start, the first device list counts as a change", () => {
+  const r = new OutputRecovery();
+  r.start(0);
+  const blocked = micError("blocked", "NotAllowedError");
+  r.event(ev.fail("rebuild", blocked), 40);
+  assert.deepEqual(r.event(ev.devices(true, true), 100), [REBUILD_START]);
+  r.event(ev.fail("rebuild", blocked), 140);
+  r.stop();
+  r.start(200);
+  r.event(ev.fail("rebuild", blocked), 240);
+  assert.equal(r.phase, "blocked");
+  assert.deepEqual(r.event(ev.devices(true, true), 300), [REBUILD_START]);
+});
+
+test("still-trying is never reported for a change", () => {
+  const r = running();
+  r.event({ type: "mic-request", reason: "user" }, 0);
+  const reports = [];
+  for (let k = 0; k < 6; k++) {
+    const t = 100 + k * 1000;
+    r.event(ev.ok("reopen-mic"), t);
+    r.event({ type: "mic-request", reason: "user" }, t + 10);
+    const acts = r.event(ev.heartbeat, t + 20);
+    assert.deepEqual(acts[1], { do: "reopen-mic", mode: "full" });
+    reports.push(...acts.filter((a) => a.do === "report"));
+  }
+  assert.equal(r.outage.attempts, 7);
+  assert.deepEqual(reports, []);
 });
 
 test("idle ignores everything; stop() clears both timers and goes idle", () => {
@@ -512,12 +568,38 @@ test("change: a microphone that fails while the old one stays live → running, 
   assert.deepEqual(r.log, []);
 });
 
-test("change: a newer request that came in while it failed is still served", () => {
+test("change: a newer request that came in while it failed is still served, after the failure is reported", () => {
   const r = running();
   r.event({ type: "mic-request", reason: "user" }, 0);
   assert.deepEqual(r.event({ type: "mic-request", reason: "user" }, 50), []);
-  assert.deepEqual(r.event(ev.fail("reopen-mic", micError("busy"), { kept: true }), 100), [{ do: "reopen-mic", mode: "full" }]);
+  const error = micError("busy");
+  assert.deepEqual(r.event(ev.fail("reopen-mic", error, { kept: true }), 100), [
+    { do: "report", kind: "change-failed", error },
+    { do: "reopen-mic", mode: "full" },
+  ]);
   assert.equal(r.outage.kind, "change");
+  assert.equal(r.outage.attempts, 1, "a change of its own");
+});
+
+test("change: a microphone that fails while an output change waits: the output change keeps the live microphone", () => {
+  const r = running();
+  assert.deepEqual(r.event({ type: "mic-request", reason: "user" }, 1000), [{ do: "reopen-mic", mode: "full" }]);
+  assert.deepEqual(r.event({ type: "rebuild-request", reason: "output" }, 1050), []);
+  const error = micError("busy", "NotReadableError");
+  // The new microphone is busy; the old one still feeds the cable. The output change must not reopen the busy one.
+  assert.deepEqual(r.event(ev.fail("reopen-mic", error, { kept: true }), 1100), [
+    { do: "report", kind: "change-failed", error },
+    rebuild(false, "full"),
+  ]);
+  assert.equal(r.outage.kind, "change");
+  assert.equal(r.outage.cause, "output");
+  assert.equal(r.outage.needMic, false);
+  assert.deepEqual(r.event(ev.ok("rebuild"), 1400), [SET_VERIFY]);
+  const acts = r.event(ev.heartbeat, 1450);
+  assert.deepEqual(brief(acts), [CLEAR_VERIFY, { do: "report", kind: "applied" }]);
+  assert.deepEqual(acts[1].record, { cause: "output", ms: 350, attempts: 1, steps: ["rebuild"] });
+  assert.equal(r.phase, "running");
+  assert.deepEqual(r.log, [], "no outage: the voice never stopped");
 });
 
 test("change: a failure without the old mic → a fault (change-failed), reported lost", () => {
