@@ -150,6 +150,22 @@ test("stop: a tone lost at the very end is closed as a gap in the last summary",
   assert.equal(sent(w, "done").length, 1);
 });
 
+test("stop in mic mode: silence still going on at the very end is closed as a run in the last summary, on both inputs", () => {
+  const w = watch({ mode: "mic" });
+  const ref = zeroFill(noise(3, 5), 129600, 14400); // the microphone silent for the last 0.3 s
+  const sig = zeroFill(noise(3, 9), 120000, 24000); // CABLE Output silent for the last 0.5 s
+  run(w, ref, sig);
+  assert.deepEqual(sent(w, "summary").flatMap((m) => [...m.refRuns, ...m.sigRuns]), [], "still going on: not reported yet");
+  w.port.deliver("stop");
+  const final = sent(w, "summary").pop();
+  assert.equal(final.final, true);
+  assert.equal(final.frame, 144000);
+  assert.deepEqual(final.refRuns, [{ startFrame: 129600, frames: 14400 }]);
+  assert.deepEqual(final.sigRuns, [{ startFrame: 120000, frames: 24000 }]);
+  assert.equal(final.sigZeroFrames, 24000);
+  assert.equal(sent(w, "done").length, 1);
+});
+
 test("extend: a later stop, never earlier than what was watched", () => {
   const w = watch({ mode: "tone", stopAfterFrames: 60000 });
   run(w, noise(0.5), tone({ seconds: 0.5 }));

@@ -19,7 +19,7 @@ import {
 } from "./helpers/fake-checks.js";
 import { Checks, CHECK_TEXTS, captureLatencyMs } from "../src/audio/measure.js";
 import { synthSpeech, addNoise, whiteNoise, delayed } from "./helpers/synth.js";
-import { stopAfterHide, LIMITS } from "../src/core/cable-check.js";
+import { stopAfterHide, analyzeSpeech, LIMITS } from "../src/core/cable-check.js";
 import { envelopeDb } from "../src/core/delay-estimate.js";
 
 const ZERO_COUNTS = { holes: 0, skips: 0, clicks: 0, dropouts: 0, gaps: 0, levels: 0, steps: 0, noises: 0 };
@@ -227,7 +227,7 @@ test("measureDelay: a generation that ends under the recorder is the same restar
   assert.equal(s.graph.taps.size, 0, "a once-tap does not come back after the rebuild");
 });
 
-test("measureDelay on the audio element route: its own context on CABLE Input, no micBus", async () => {
+test("measureDelay on the audio element route: its own context on CABLE Input, no micBus, and the run says so", async () => {
   const s = setup({ method: "element", routePreference: "element" });
   const before = nodes.length;
   const p = s.checks.measureDelay();
@@ -243,6 +243,9 @@ test("measureDelay on the audio element route: its own context on CABLE Input, n
   assert.equal(r.micFifoScore, null);
   assert.equal(r.ok, true);
   assert.equal(node.context.state, "closed", "its own context is closed");
+  // Gate 1's delay row lists a run forced onto the audio element beside the others and does not count it.
+  assert.equal(r.route, "element");
+  assert.equal(r.routePreference, "element");
 });
 
 test("measureDelay on the element route when CABLE Input refuses its own context: the graph's context and a note", async () => {
@@ -468,6 +471,30 @@ test("hideFor without a check: only the hide; the platform's refusal reaches the
   assert.ok(s.logs.includes("warn check hide failed Error"));
 });
 
+test("the minimized phase: the window's state is asked for every 5th summary", async () => {
+  // The page itself cannot tell a minimized window from a hidden one; only the platform's window state can,
+  // and Gate 1 needs 25 minutes minimized.
+  const s = setup();
+  const { handle, node, start, progress } = await startTone(s, 0.5);
+  const asked = [];
+  s.platform.windowState = async () => {
+    asked.push(clock.now - start);
+    return { visible: true, minimized: clock.now >= start + 5000 && clock.now < start + 20_000, focused: false };
+  };
+  for (let k = 1; k <= 30; k++) {
+    summary(node, { frame: k * 48000, at: start + k * 1000 });
+    await flush(1); // the answer arrives before the next summary
+  }
+  node.port.emit({ type: "done", frame: 30 * 48000 });
+  const r = await handle.done;
+  assert.deepEqual(asked, [5000, 10_000, 15_000, 20_000, 25_000, 30_000]);
+  assert.deepEqual(r.phases, { visibleSec: 15, minimizedSec: 15, hiddenSec: 0, unknownSec: 0 });
+  assert.equal(r.lines[0], "30 s recorded: 15 s minimized, 0 s hidden, 15 s open.");
+  assert.deepEqual(progress.map((p) => p.phase).filter((p, i, all) => p !== all[i - 1]), ["visible", "minimized", "visible"]);
+  assert.equal(progress[progress.length - 1].phasesSoFar.minimizedSec, 15);
+  assert.ok(s.logs.includes("info check long phase minimized"), s.logs.join("\n"));
+});
+
 test("the microphone's buffer: a 1 s reading at summary 2 and every 120 after, through a once-tap at the graph", async () => {
   const s = setup();
   const { handle, node, start } = await startTone(s, 10);
@@ -503,6 +530,30 @@ test("the microphone's buffer: a 1 s reading at summary 2 and every 120 after, t
   assert.equal(s.graph.taps.size, 0);
 });
 
+test("the microphone's buffer: a check with more than 40 readings keeps 40 in its result, the first and the last among them", async () => {
+  // 41 readings: at 2 s and then every 120 s up to 4802 s (an 81-minute check). The buffer fills by 1 ms a reading.
+  const s = setup();
+  const { handle, node, start } = await startTone(s, 81);
+  let taken = 0;
+  for (let k = 1; k <= 4802; k++) {
+    summary(node, { frame: k * 48000, at: start + k * 1000 });
+    if (k === 2 || (k > 2 && (k - 2) % 120 === 0)) {
+      await flush();
+      await answerReading(newest("ac-recorder"), 480 + 48 * taken);
+      taken++;
+    }
+  }
+  node.port.emit({ type: "done", frame: 4802 * 48000 });
+  const r = await handle.done;
+  assert.equal(taken, 41);
+  assert.equal(r.micPath.readingsTaken, 41);
+  const kept = r.micPath.readings;
+  assert.equal(kept.length, 40);
+  assert.deepEqual(kept[0], { atSec: 2, lagMs: 10 });
+  assert.deepEqual(kept[39], { atSec: 4802, lagMs: 50 });
+  assert.ok(kept.every((x, i) => i === 0 || x.atSec > kept[i - 1].atSec), "in order, none twice");
+});
+
 test("the microphone's holes: 8–11 ms runs after a watcher's first 10 s count; not around an outage or a new source", async () => {
   const s = setup();
   const { handle, node, start } = await startTone(s, 10);
@@ -527,13 +578,35 @@ test("the microphone's holes: 8–11 ms runs after a watcher's first 10 s count;
   assert.equal(r.micPath.holesPer30Min, 60);
 });
 
-test("priming: zero runs of a watcher's first 100 ms that last less than 100 ms are its sources starting", async () => {
-  const s = setup();
-  const { handle, node, start } = await startTone(s, 1);
+test("priming: runs in a watcher's first 100 ms that last less than 100 ms are its sources starting; longer ones count", async () => {
+  // Mic mode, where it matters: a new source node's buffer starts empty, so CABLE Output starts every watcher
+  // with a short silence at its frame 0 (20–31 ms in headless Chromium on the fake VB-CABLE loop), and no
+  // microphone run explains it. Counted, it would fail every check as a drop-out.
+  let s = setup();
+  let handle = await s.checks.startLong({ mode: "mic", minutes: 1 });
+  let node = newest("ac-cablewatch");
+  let start = clock.now;
+  summary(node, {
+    mode: "mic",
+    frame: 48000,
+    at: start + 1000,
+    refRuns: [{ startFrame: 0, frames: 700 }, { startFrame: 100, frames: 6000 }],
+    sigRuns: [{ startFrame: 0, frames: 1440 }],
+  });
+  node.port.emit({ type: "done", frame: 48000 });
+  let r = await handle.done;
+  assert.deepEqual(r.speech.dropouts, [], "CABLE Output's 30 ms at frame 0 is not a drop-out");
+  assert.equal(r.speech.micHoles, 1, "nor is the microphone's 15 ms at frame 0 one of its short runs");
+  // The 125 ms run is kept: the microphone itself stopped.
+  assert.equal(r.verdict, "fail");
+  assert.deepEqual(r.reasons, ["The microphone itself stopped once (the longest for 125 ms): Windows paused it."]);
+
+  // Tone mode keeps the same 125 ms run.
+  s = setup();
+  ({ handle, node, start } = await startTone(s, 1));
   summary(node, { frame: 48000, at: start + 1000, refRuns: [{ startFrame: 0, frames: 700 }, { startFrame: 100, frames: 6000 }] });
   node.port.emit({ type: "done", frame: 48000 });
-  const r = await handle.done;
-  // The 125 ms run is kept: the microphone itself stopped.
+  r = await handle.done;
   assert.equal(r.verdict, "fail");
   assert.ok(r.reasons.some((x) => x.startsWith("The microphone itself stopped once")), JSON.stringify(r.reasons));
 });
@@ -542,11 +615,18 @@ test("tone events around an outage are the outage's own: left out of the counts;
   const s = setup();
   const { handle, node, start } = await startTone(s, 1);
   const ev = (kind, sec, more = {}) => ({ kind, atFrame: Math.round(sec * 48000), frames: 480, ...more });
+  // The outage below runs from 20.0 to 20.3 s, so from 19.0 to 22.3 s is its own. The volume drops at 20.6 s.
   seconds(node, start, 1, 60, (k) => {
-    if (k === 21) return { events: [ev("hole", 20.4, { holeMs: 10 }), ev("skip", 20.7, { phaseStepDeg: 112.5 })], counts: { holes: 1, skips: 1 } };
-    if (k > 21 && k < 41) return { counts: { holes: 1, skips: 1 } };
-    if (k === 41) return { events: [ev("hole", 40.5, { holeMs: 10 }), ev("level", 40.2, { fromDb: -12, toDb: -16 })], counts: { holes: 2, skips: 1, levels: 1 } };
-    if (k > 41) return { counts: { holes: 2, skips: 1, levels: 1 } };
+    if (k === 20) return { events: [ev("click", 19.6)], counts: { clicks: 1 } };
+    if (k === 21) {
+      return {
+        events: [ev("hole", 20.4, { holeMs: 10 }), ev("level", 20.6, { fromDb: -12, toDb: -16 }), ev("skip", 20.7, { phaseStepDeg: 112.5 })],
+        counts: { clicks: 1, holes: 1, skips: 1, levels: 1 },
+      };
+    }
+    if (k > 21 && k < 41) return { counts: { clicks: 1, holes: 1, skips: 1, levels: 1 } };
+    if (k === 41) return { events: [ev("hole", 40.5, { holeMs: 10 })], counts: { clicks: 1, holes: 2, skips: 1, levels: 1 } };
+    if (k > 41) return { counts: { clicks: 1, holes: 2, skips: 1, levels: 1 } };
     return {};
   });
   s.graph.lost("render-error", start + 20_000);
@@ -554,9 +634,10 @@ test("tone events around an outage are the outage's own: left out of the counts;
   node.port.emit({ type: "done", frame: 60 * 48000 });
   const r = await handle.done;
   assert.deepEqual(r.tone.counts, { ...ZERO_COUNTS, holes: 1, levels: 1 });
-  assert.equal(r.tone.aroundOutages, 2);
-  assert.deepEqual(r.tone.events.map((e) => e.kind), ["hole", "level"]);
-  assert.deepEqual(r.tone.events[1], { atSec: 40.2, phase: "visible", kind: "level", db: -4, fromDb: -12, toDb: -16 });
+  assert.equal(r.tone.aroundOutages, 3);
+  assert.deepEqual(r.tone.events.map((e) => e.kind), ["level", "hole"]);
+  assert.deepEqual(r.tone.events[0], { atSec: 20.6, phase: "visible", kind: "level", db: -4, fromDb: -12, toDb: -16 });
+  assert.deepEqual(r.tone.events[1], { atSec: 40.5, phase: "visible", kind: "hole", ms: 10 });
 });
 
 /** The watcher's answer to "stop": its last summary at `sec`, then done. */
@@ -799,7 +880,7 @@ test("a check that starts on the context route and is rebuilt on the audio eleme
   assert.deepEqual((await p2).notes, []);
 });
 
-test("mic mode: envelopes on the check's timeline, the outage left at −120, the speech analysis, Analysing first", async () => {
+test("mic mode: the speech analysis of the envelopes, a CABLE Output drop-out where it was, Analysing first", async () => {
   const s = setup();
   const progress = [];
   const handle = await s.checks.startLong({ mode: "mic", minutes: 0.5, onProgress: (p) => progress.push(p) });
@@ -832,6 +913,61 @@ test("mic mode: envelopes on the check's timeline, the outage left at −120, th
   assert.equal(progress[progress.length - 1], a, "Analysing is the last progress");
 });
 
+test("mic mode across a rebuild: the new watcher's envelopes go after the outage, the outage reads as silence, CABLE Output's runs around it are its own", async () => {
+  const s = setup();
+  const handle = await s.checks.startLong({ mode: "mic", minutes: 0.5 });
+  let node = newest("ac-cablewatch");
+  const start = clock.now;
+  const x = addNoise(synthSpeech({ seconds: 31, seed: 9, leadSec: 0.3, tailSec: 0.3 }).samples, -60);
+  const refDb = envelopeDb(x, 48000, { hopMs: 5, winMs: 10 }).db;
+  const sigDb = envelopeDb(delayed(x, 1920), 48000, { hopMs: 5, winMs: 10 }).db; // 40 ms later
+  // 300 ms of speech that never reached CABLE Output, at 26.8 s: after the rebuild.
+  const hole = Math.round(26.8 * 200) + 8;
+  sigDb.fill(-120, hole, hole + 60);
+  /** The envelopes of a watcher whose frame 0 is `fromSec` into the check: one summary's worth a call. */
+  const envelopes = (fromSec) => {
+    let f0 = 0;
+    return () => {
+      const n = f0 === 0 ? 199 : 200;
+      const at = fromSec * 200 + f0;
+      const e = { frame0: f0, ref: refDb.slice(at, at + n), sig: sigDb.slice(at, at + n), dropped: 0 };
+      f0 += n;
+      return e;
+    };
+  };
+  const first = envelopes(0);
+  for (let k = 1; k <= 10; k++) summary(node, { mode: "mic", frame: k * 48000, at: start + k * 1000, env: first() });
+  // The voice is lost at 10.2 s and back at 12.0 s: the new watcher's frame 0 is 12 s into the check.
+  clock.now = start + 10_200;
+  await s.graph.rebuild({ backAtMs: start + 12_000 });
+  node = newest("ac-cablewatch");
+  const second = envelopes(12);
+  // Two 10 ms holes on CABLE Output, both in pauses of the speech: at 12.5 s the sound's buffers settle after
+  // the outage (its own), at 24.7 s nothing explains it (a drop-out).
+  const sigRuns = (k) => (k === 1 ? [{ startFrame: 24000, frames: 480 }] : k === 13 ? [{ startFrame: 609600, frames: 480 }] : []);
+  for (let k = 1; k <= 18; k++) summary(node, { mode: "mic", frame: k * 48000, at: start + 12_000 + k * 1000, env: second(), sigRuns: sigRuns(k) });
+  node.port.emit({ type: "done", frame: 18 * 48000 });
+  const r = await handle.done;
+
+  // What the analysis should have had: both watchers' envelopes where they were, −120 for the outage between.
+  const wantRef = new Float32Array(5999).fill(-120);
+  const wantSig = new Float32Array(5999).fill(-120);
+  wantRef.set(refDb.subarray(0, 1999));
+  wantSig.set(sigDb.subarray(0, 1999));
+  wantRef.set(refDb.subarray(2400, 5999), 2400);
+  wantSig.set(sigDb.subarray(2400, 5999), 2400);
+  const want = analyzeSpeech({ refDb: wantRef, sigDb: wantSig, hopMs: 5 });
+  assert.equal(r.speech.speechSec, Math.round(want.speechSec * 10) / 10, "the outage reads as silence, not as speech");
+  assert.ok(Math.abs(r.speech.lagMs - 40) <= 5, String(r.speech.lagMs));
+  assert.equal(r.speech.gaps.length, 1, JSON.stringify(r.speech.gaps));
+  assert.ok(Math.abs(r.speech.gaps[0].atSec - 26.8) <= 0.3, JSON.stringify(r.speech.gaps));
+  assert.deepEqual(r.speech.gaps.map((g) => g.atSec), want.gaps.map((g) => g.atSec));
+  assert.deepEqual(r.speech.dropouts, [{ atSec: 24.7, phase: "visible", ms: 10 }]);
+  assert.equal(r.speech.aroundOutages, 1);
+  assert.deepEqual(r.outages, [{ atSec: 10.2, phase: "visible", ms: 1800, cause: "render-error" }]);
+  assert.equal(r.recordedSec, 30);
+});
+
 test("results and logs hold no device names or ids", async () => {
   const s = setup();
   const t = await startTone(s, 0.25);
@@ -842,6 +978,45 @@ test("results and logs hold no device names or ids", async () => {
   assert.equal(r.defaultOutputChanges.length, 1);
   const text = JSON.stringify(r) + s.logs.join("\n");
   for (const bad of ["Priya", "Headset", "cable-in", "cable-out", "deviceId"]) assert.ok(!text.includes(bad), bad);
+});
+
+test("a gap within 2 s of a change of Windows' default playback device is listed with it, in both modes", async () => {
+  const gapNotes = (r) => r.notes.filter((n) => n.startsWith("The sound stopped at"));
+  // Tone mode: Windows switches its default playback device 10 s in; the tone stops at 10.5 s and at 25.5 s.
+  let s = setup();
+  const t = await startTone(s, 0.5);
+  const gap = (sec) => ({ kind: "gap", atFrame: sec * 48000, frames: 9600, holeMs: 200 });
+  seconds(t.node, t.start, 1, 30, (k) => {
+    if (k === 11) {
+      s.graph.devices({ defaultOutputLabel: "Default - Speakers" });
+      return { counts: { gaps: 1 }, events: [gap(10.5)] };
+    }
+    if (k === 26) return { counts: { gaps: 2 }, events: [gap(25.5)] };
+    return k > 11 ? { counts: { gaps: k > 26 ? 2 : 1 } } : {};
+  });
+  t.node.port.emit({ type: "done", frame: 30 * 48000 });
+  let r = await t.handle.done;
+  assert.deepEqual(r.defaultOutputChanges, [{ atSec: 10 }]);
+  assert.deepEqual(gapNotes(r), [CHECK_TEXTS.defaultOutputGap(10.5)]);
+  assert.deepEqual(r.tone.events.map((e) => e.note ?? null), [CHECK_TEXTS.defaultOutput, null]);
+
+  // Mic mode: 300 ms with nothing on CABLE Output at 11.5 s and at 25.5 s, the same change 10 s in.
+  s = setup();
+  const handle = await s.checks.startLong({ mode: "mic", minutes: 0.5 });
+  const node = newest("ac-cablewatch");
+  const start = clock.now;
+  for (let k = 1; k <= 30; k++) {
+    if (k === 11) s.graph.devices({ defaultOutputLabel: "Default - Speakers" });
+    const sigRuns = k === 12 ? [{ startFrame: 11.5 * 48000, frames: 14400 }] : k === 26 ? [{ startFrame: 25.5 * 48000, frames: 14400 }] : [];
+    summary(node, { mode: "mic", frame: k * 48000, at: start + k * 1000, sigRuns });
+  }
+  node.port.emit({ type: "done", frame: 30 * 48000 });
+  r = await handle.done;
+  assert.deepEqual(r.speech.dropouts.map((d) => [d.atSec, d.ms, d.note ?? null]), [
+    [11.5, 300, CHECK_TEXTS.defaultOutput],
+    [25.5, 300, null],
+  ]);
+  assert.deepEqual(gapNotes(r), [CHECK_TEXTS.defaultOutputGap(11.5)]);
 });
 
 test("the element route's long check: its own context follows the microphone when the graph swaps it", async () => {
