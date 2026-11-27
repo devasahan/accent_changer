@@ -1,14 +1,28 @@
 /**
  * Records several inputs side by side, sample-aligned (they are read in the
- * same render quantum), and posts them to the page in 100 ms chunks.
- * Messages in: "start", "stop". Messages out: { type: "chunk", parts },
- * { type: "stopped" }.
+ * same render quantum), and posts them to the page in chunks (4800 frames =
+ * 100 ms at 48 kHz unless processorOptions.chunkFrames says otherwise).
+ * Used by the app's checks (src/audio/measure.js) and by the Step 0 probe.
+ *
+ * Any number of inputs (the node's numberOfInputs), mono. An input that is
+ * not connected, or not flowing yet, is written as zeros, so the inputs stay
+ * aligned. It works with or without an output: with numberOfOutputs 0 the
+ * browser keeps pulling it as long as its context runs.
+ *
+ * Messages in: "start" (from now on, recording starts afresh), "stop" (the
+ * part of a chunk recorded so far is sent, then { type: "stopped" }).
+ * Messages out: { type: "chunk", parts } (one Float32Array per input, their
+ * buffers transferred), { type: "stopped" }.
  */
-class SpikeRecorder extends AudioWorkletProcessor {
+const CHUNK_FRAMES = 4800;
+
+class Recorder extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    this.inputsCount = options.numberOfInputs;
-    this.chunkFrames = options.processorOptions?.chunkFrames ?? Math.round(sampleRate / 10);
+    const inputs = options?.numberOfInputs;
+    this.inputsCount = Number.isInteger(inputs) && inputs > 0 ? inputs : 1;
+    const chunk = options?.processorOptions?.chunkFrames;
+    this.chunkFrames = Number.isInteger(chunk) && chunk > 0 ? chunk : CHUNK_FRAMES;
     this.active = false;
     this.fresh();
     this.port.onmessage = (e) => {
@@ -37,7 +51,14 @@ class SpikeRecorder extends AudioWorkletProcessor {
 
   process(inputs) {
     if (!this.active) return true;
-    const frames = inputs[0]?.[0]?.length ?? 128;
+    let frames = 128;
+    for (let i = 0; i < this.inputsCount; i++) {
+      const channel = inputs[i]?.[0];
+      if (channel) {
+        frames = channel.length;
+        break;
+      }
+    }
     let k = 0;
     while (k < frames) {
       const take = Math.min(frames - k, this.chunkFrames - this.fill);
@@ -55,4 +76,4 @@ class SpikeRecorder extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor("spike-recorder", SpikeRecorder);
+registerProcessor("ac-recorder", Recorder);
