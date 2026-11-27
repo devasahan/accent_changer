@@ -12,10 +12,23 @@
 //! - `show_for_user` shows, restores and focuses it, because the user asked
 //!   (a second launch from the Start menu). It also stops a pending re-show.
 //!
+//! The stale flag has a second effect. While tao's flag says "hidden" but
+//! the window is on screen, any change tao makes to its window flags hides
+//! the window again (tao-0.37.3 `window_state.rs` 312-319 and 405-409). So
+//! after `show_quietly`, until `show_for_user` or `hide_window` runs again,
+//! make no other tao call on the main window: no size, position, maximize,
+//! resizable, decorations, always on top or fullscreen. tao does the same by
+//! itself when the display scale changes while the window is maximized
+//! (`event_loop.rs` 1946-1955). The window and its taskbar button are then
+//! gone until the user starts the app again from the Start menu
+//! (`show_for_user`). The user's own minimize, maximize and restore are
+//! safe: tao only takes note of them.
+//!
 //! Step 5 (close to tray, the tray menu) must use `hide_window` and
-//! `show_for_user`, and must never show the window by itself. The timed
-//! re-show of `window_hide_for` is the one exception to the plan's "the app
-//! never opens a window by itself", for Session B's check only.
+//! `show_for_user`, must keep to the rule above, and must never show the
+//! window by itself. The timed re-show of `window_hide_for` is the one
+//! exception to the plan's "the app never opens a window by itself", for
+//! Session B's check only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -112,7 +125,11 @@ pub fn hide_window(app: &AppHandle) -> Result<(), String> {
 
 /// Show the window again where it was, restored if it was minimized, without
 /// activating it: the meeting keeps the keyboard. Call on the main thread.
-/// tao's flag stays "hidden" (on purpose: see the top of this file).
+/// tao's flag stays "hidden" (on purpose: see the top of this file). Until
+/// `show_for_user` or `hide_window` runs again, make no other tao call on the
+/// main window (size, position, maximize, resizable, decorations, always on
+/// top, fullscreen): tao would hide it again, and so does a display-scale
+/// change of a maximized window. The user brings it back from the Start menu.
 pub fn show_quietly(window: &WebviewWindow) {
     #[cfg(windows)]
     match window.hwnd() {

@@ -74,8 +74,7 @@ pub fn write_settings(path: &Path, json: &str) -> Result<(), String> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(|e| save_error(&e))?;
     let name = path.file_name().map_or_else(|| FILE_NAME.into(), |n| n.to_string_lossy());
-    let n = TEMP_COUNT.fetch_add(1, Ordering::Relaxed);
-    let temp = dir.join(format!("{name}.{}-{n}.tmp", std::process::id()));
+    let temp = temp_path(dir, &name);
     let written = write_file(&temp, json.as_bytes()).and_then(|()| replace(&temp, path));
     if let Err(e) = written {
         let _ = fs::remove_file(&temp);
@@ -83,6 +82,13 @@ pub fn write_settings(path: &Path, json: &str) -> Result<(), String> {
     }
     log::info!("settings saved ({} bytes)", json.len());
     Ok(())
+}
+
+/// A temporary file in `dir` that no other save uses:
+/// `settings.json.<pid>-<n>.tmp`, where n counts this process's saves.
+fn temp_path(dir: &Path, name: &str) -> PathBuf {
+    let n = TEMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{name}.{}-{n}.tmp", std::process::id()))
 }
 
 /// Write and flush to the disk, so the rename never puts an empty file in place.
@@ -325,11 +331,32 @@ mod tests {
     }
 
     #[test]
-    fn temporary_names_never_repeat() {
-        let dir = TempDir::new("names");
-        let before = TEMP_COUNT.load(Ordering::Relaxed);
-        write_settings(&dir.file(), "{}").unwrap();
-        write_settings(&dir.file(), "{}").unwrap();
-        assert!(TEMP_COUNT.load(Ordering::Relaxed) >= before + 2);
+    fn every_save_gets_its_own_temporary_name() {
+        let dir = Path::new("app-data");
+        let (first, second) = (temp_path(dir, FILE_NAME), temp_path(dir, FILE_NAME));
+        assert_ne!(first, second, "two saves never write the same temporary file");
+        let prefix = format!("{FILE_NAME}.{}-", std::process::id());
+        for temp in [&first, &second] {
+            assert_eq!(temp.parent(), Some(dir), "next to settings.json, so the rename stays on one drive");
+            let name = temp.file_name().unwrap().to_str().unwrap();
+            let n = name.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(".tmp"));
+            assert!(n.is_some_and(|n| n.parse::<u64>().is_ok()), "settings.json.<pid>-<n>.tmp: {name}");
+        }
+    }
+
+    #[test]
+    fn a_save_puts_a_new_file_in_place_instead_of_rewriting_the_old_one() {
+        // A second name for the old file (a hard link; NTFS has them too) keeps
+        // the old text when a save renames a new file over settings.json. If a
+        // save wrote into the old file instead, the second name would show the
+        // new text, and a crash halfway through would leave half a file.
+        let dir = TempDir::new("replace");
+        write_settings(&dir.file(), r#"{"micLabel":"old"}"#).unwrap();
+        let old = dir.0.join("old-settings.json");
+        fs::hard_link(dir.file(), &old).unwrap();
+        write_settings(&dir.file(), r#"{"micLabel":"new"}"#).unwrap();
+        assert_eq!(read_settings(&dir.file()), Ok(Some(r#"{"micLabel":"new"}"#.to_string())));
+        assert_eq!(fs::read_to_string(&old).unwrap(), r#"{"micLabel":"old"}"#, "the old file was written over");
+        assert!(dir.temps().is_empty(), "{:?}", dir.temps());
     }
 }

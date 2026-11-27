@@ -30,7 +30,7 @@ function messageOf(err) {
 function parseSettings(text) {
   if (text === null || text === undefined) return null;
   try {
-    return JSON.parse(String(text).replace(/^﻿/, ""));
+    return JSON.parse(String(text).replace(/^\uFEFF/, ""));
   } catch {
     return text;
   }
