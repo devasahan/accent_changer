@@ -12,10 +12,19 @@
  * Text goes in through textContent only. Nothing touches the page when this
  * module is imported: main.js makes the view once the page has loaded.
  */
-import { PSEUDO_IDS, headphonesFor, pseudoTarget, reportLabel, siblingOutput, virtualOutputs } from "../core/device-choice.js";
+import {
+  PSEUDO_IDS,
+  causeText,
+  headphonesFor,
+  pseudoTarget,
+  reportLabel,
+  routeWords as routeWordsOf,
+  siblingOutput,
+  virtualOutputs,
+} from "../core/device-choice.js";
 import { isCableInput, isCableOutput } from "../core/devices-match.js";
 import { restartVerdict } from "../core/cable-check.js";
-import { captureLatencyMs } from "../audio/measure.js";
+import { captureLatencyMs, epochOf } from "../audio/measure.js";
 
 /** Texts of this part of the page (plain English, no device names). */
 export const VOICE_TEXTS = Object.freeze({
@@ -29,9 +38,6 @@ export const VOICE_TEXTS = Object.freeze({
   cableFound: "installed (CABLE Input found)",
   cableMissing: "not installed yet (needed for Session B)",
   slowOpen: " (slow: did a question appear?)",
-  normalRoute: "the normal route",
-  backupRoute: "a slower backup route",
-  permissionFix: ", after a permission fix",
   bringingBack: "bringing it back…",
   waitingForYou: "waiting for you (see step 2)",
   notReaching: " Your voice is not reaching the meeting yet: see step 2.",
@@ -66,17 +72,6 @@ export const CHOICE_TEXTS = Object.freeze({
 /** States in which the voice graph waits for the user (a refusal; in Edge, a click): it does not try by itself. */
 const WAITING_STATES = Object.freeze(["mic-blocked", "sink-refused", "needs-gesture"]);
 
-/** Why the voice stopped, in words (the recovery log; the same words as the status line). */
-const CAUSE_WORDS = Object.freeze({
-  "render-error": "the audio device reported an error",
-  "render-stalled": "the audio stopped moving",
-  "context-suspended": "the audio was paused",
-  "context-closed": "the audio engine closed",
-  "sink-changed": "the playback device changed",
-  "mic-ended": "the microphone stopped",
-  "change-failed": "the change you made did not work",
-});
-
 const LEVEL_FLOOR_DB = -60;
 const MAX_LOG_LINES = 20;
 
@@ -91,8 +86,8 @@ const pad2 = (n) => String(n).padStart(2, "0");
 /** A device the app can use by its id: not a pseudo-device, not an id-less entry. */
 const isReal = (d) => Boolean(d) && typeof d.deviceId === "string" && d.deviceId !== "" && !PSEUDO_IDS.includes(d.deviceId);
 
-/** The epoch ms of a time on the page's performance.now() timeline. */
-export const epochOf = (perfMs) => Date.now() - (performance.now() - perfMs);
+/** The epoch ms of a time on the page's performance.now() timeline (measure.js's, one for the page). */
+export { epochOf };
 
 /** "14:03:12" (seconds true) or "14:03", in local time. */
 export function clockText(epochMs, { seconds = true } = {}) {
@@ -113,16 +108,16 @@ const offText = (v) => (v === false ? "off" : v === true || (typeof v === "strin
  * The route method in plain words: "the normal route" (the app's own audio
  * context on CABLE Input), "a slower backup route" (an audio element), and
  * ", after a permission fix" when WebView2's saved permission had to be set
- * first. Only the results keep the method's own name.
+ * first; "not yet" without a route. The words are device-choice.js's
+ * routeWords, which the warnings and the checklist use too. Only the results
+ * keep the method's own name.
  */
 export function routeWords(method) {
-  if (typeof method !== "string" || !method) return VOICE_TEXTS.notYet;
-  const base = method.startsWith("element") ? VOICE_TEXTS.backupRoute : VOICE_TEXTS.normalRoute;
-  return method.endsWith("-after-permission") ? base + VOICE_TEXTS.permissionFix : base;
+  return routeWordsOf(method, VOICE_TEXTS.notYet);
 }
 
-/** The cause of an outage in words. */
-export const causeWords = (cause) => CAUSE_WORDS[cause] ?? "a problem with the sound";
+/** The cause of an outage in words: device-choice.js's causeText, as the status line says it. */
+export const causeWords = causeText;
 
 /**
  * One line of the recovery log for a record of OutputRecovery.log:

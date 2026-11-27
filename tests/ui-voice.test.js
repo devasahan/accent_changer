@@ -547,6 +547,18 @@ test("U15: step 2 names the route in plain words", () => {
   assert.doesNotMatch(shown, /audio element|fallback|\+/);
 });
 
+test("U27: step 2 uses the runtime's own route words, cause words and epochOf (one table each)", async () => {
+  const shared = await import("../src/core/device-choice.js");
+  const measure = await import("../src/audio/measure.js");
+  const voice = await import("../src/ui/voice.js");
+  for (const method of ["context", "element", "context-after-permission", "element-after-permission"]) {
+    assert.equal(voice.routeWords(method), shared.routeWords(method), method);
+  }
+  assert.equal(voice.causeWords, shared.causeText);
+  assert.equal(voice.epochOf, measure.epochOf);
+  assert.equal(voice.causeWords("mic-ended"), "the microphone stopped");
+});
+
 test("U18: step 2 says each sentence once: a warning that is the status line is not listed under it", () => {
   const { v, $ } = view(personalGraph());
   const g = v.graph;
