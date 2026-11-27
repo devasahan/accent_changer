@@ -13,6 +13,7 @@ import {
   longVerdict,
   micClock,
   micHoleCount,
+  noiseGateOf,
   phaseTimeline,
   renderPauses,
   restartVerdict,
@@ -200,10 +201,21 @@ function readings(lagAt, seed, { micGen = 1, every = 120, minutes = 60 } = {}) {
   return out;
 }
 
+/**
+ * The passthrough's buffer as H1 has it, less a fresh source's own 10 ms: d0 ms when its source was made (ageSec
+ * before the first reading), then ppm/1000 ms more per second up to `top`, then a 10 ms drop each time it gets
+ * there (a saw-tooth just below top). A 60 ms buffer: it rises only 30 to 50 ms before it drops.
+ */
+const h1 = (ppm, { d0 = 10, top = 55, ageSec = 0 } = {}) => (t) => {
+  const x = d0 + (ppm / 1000) * (t + ageSec);
+  return (x <= top ? x : top - 10 + ((x - top) % 10)) - 10;
+};
+
 test("micClock: a microphone 20 ppm faster fills its buffer, then saturates", () => {
   const r = micClock(readings((t) => Math.min(60, 10 + 0.02 * t), 101), { holes: 0, durationSec: 3600 });
   assert.equal(r.direction, "faster");
-  assert.ok(r.saturatedAtSec >= 1200 && r.saturatedAtSec <= 3000, `saturatedAtSec ${r.saturatedAtSec}`);
+  // 25 ms above its start at about 1250 s; each reading has ± 10 ms.
+  assert.ok(r.saturatedAtSec >= 750 && r.saturatedAtSec <= 1750, `saturatedAtSec ${r.saturatedAtSec}`);
   near(r.ppm, 20, 8, "ppm");
   assert.equal(r.ppmIsLowerBound, false);
   assert.ok(r.dropsPer30Min <= 6, `dropsPer30Min ${r.dropsPer30Min}`);
@@ -215,14 +227,14 @@ test("micClock: a microphone 20 ppm faster fills its buffer, then saturates", ()
 });
 
 test("micClock: 80 ppm faster is too many drops", () => {
-  const r = micClock(readings((t) => Math.min(80, 10 + 0.08 * t), 102), { durationSec: 3600 });
+  const r = micClock(readings((t) => Math.min(55, 10 + 0.08 * t), 102), { durationSec: 3600 });
   assert.equal(r.direction, "faster");
   assert.ok(r.ppm >= 45, `ppm ${r.ppm}`);
   assert.ok(r.dropsPer30Min > 6, `dropsPer30Min ${r.dropsPer30Min}`);
 });
 
 test("micClock: a buffer full within minutes gives a lower bound", () => {
-  const r = micClock(readings((t) => Math.min(100, 10 + 0.2 * t), 103), { durationSec: 3600 });
+  const r = micClock(readings((t) => Math.min(50, 10 + 0.2 * t), 103), { durationSec: 3600 });
   assert.ok(r.saturatedAtSec <= 480, `saturatedAtSec ${r.saturatedAtSec}`);
   assert.equal(r.ppmIsLowerBound, true);
   assert.ok(r.ppm >= 80, `ppm ${r.ppm}`);
@@ -256,10 +268,13 @@ test("micClock: only the longest run of one microphone source is used", () => {
   assert.ok(Math.abs(r.ppm) < 5, `ppm ${r.ppm}: the flat second run, not the rising first one`);
 });
 
-test("micClock: the buffer counts as full 40 ms above its start, not before", () => {
-  const at = (high) => [10, 10, 10, 10, 10, 10, high, 10, 10, 10, 10].map((lagMs, k) => ({ atSec: k * 120, lagMs, micGen: 1 }));
-  assert.equal(micClock(at(49.9), { durationSec: 1320 }).saturatedAtSec, null);
-  assert.equal(micClock(at(50), { durationSec: 1320 }).saturatedAtSec, 720);
+test("micClock: the buffer counts as full once readings stay 25 ms above its start; one high reading does not", () => {
+  const at = (lags) => lags.map((lagMs, k) => ({ atSec: k * 120, lagMs, micGen: 1 }));
+  const flat = [10, 10, 10, 10, 10, 10];
+  assert.equal(micClock(at([...flat, 50, 10, 10, 10, 10]), { durationSec: 1320 }).saturatedAtSec, null, "one reading 40 ms up");
+  assert.equal(micClock(at([...flat, 34.9, 34.9, 34.9, 34.9, 34.9]), { durationSec: 1320 }).saturatedAtSec, null, "24.9 ms up");
+  assert.equal(micClock(at([...flat, 35, 35, 35, 35, 35]), { durationSec: 1320 }).saturatedAtSec, 720, "25 ms up");
+  assert.equal(micClock(at([...flat, 35, 10, 35, 35, 35]), { durationSec: 1320 }).saturatedAtSec, 720, "from the first high reading");
 });
 
 test("micClock: a slope needs 4 readings over 600 s or more", () => {
@@ -278,7 +293,58 @@ test("micClock: the lower bound counts from the first reading of the microphone 
   const r = micClock([...first, ...second], { durationSec: 2100 });
   assert.equal(r.saturatedAtSec, 1540);
   assert.equal(r.ppmIsLowerBound, true);
-  near(r.ppm, (40 / 240) * 1000, 1e-9, "40 ms in 240 s, not in 1540 s");
+  near(r.ppm, (25 / 240) * 1000, 1e-9, "25 ms in 240 s, not in 1540 s");
+});
+
+test("micClock (H1): a microphone 50 ppm faster fails, whatever its buffer held when its source was made", () => {
+  // 9 drops per 30 minutes. Its buffer rises 35 to 45 ms before it drops: never 40 ms above a base that already rose.
+  for (const d0 of [0, 10, 20]) {
+    for (const seed of [201, 202, 203]) {
+      const r = micClock(readings(h1(50, { d0 }), seed, { minutes: 65 }), { holes: 0, durationSec: 3900 });
+      assert.equal(r.direction, "faster", `d0 ${d0} seed ${seed}: ${JSON.stringify({ ...r, readings: undefined })}`);
+      assert.ok(r.ticksPer30Min > 6, `d0 ${d0} seed ${seed}: ticksPer30Min ${r.ticksPer30Min}`);
+    }
+  }
+});
+
+test("micClock (H1): a microphone 400 ppm faster, its buffer full within two minutes, fails with a lower bound", () => {
+  for (const seed of [211, 212, 213]) {
+    const r = micClock(readings(h1(400), seed, { minutes: 65 }), { holes: 0, durationSec: 3900 });
+    assert.equal(r.direction, "faster", `seed ${seed}`);
+    assert.equal(r.ppmIsLowerBound, true, `seed ${seed}`);
+    assert.ok(r.saturatedAtSec <= 240 && r.ticksPer30Min > 6, `seed ${seed}: ${r.saturatedAtSec} ${r.ticksPer30Min}`);
+  }
+});
+
+test("micClock (H1): a buffer that had filled before the readings began is not measured, never “the same clock”", () => {
+  // 50 ppm faster, its source made 20 minutes before the check: full and dropping from the first reading.
+  const faster = micClock(readings(h1(50, { ageSec: 1200 }), 221, { minutes: 65 }), { holes: 0, durationSec: 3900 });
+  // The same clock, its buffer filled while rendering paused (setSinkId at the start): just as full, just as flat.
+  const paused = micClock(readings(h1(0, { d0: 52 }), 222, { minutes: 65 }), { holes: 0, durationSec: 3900 });
+  for (const r of [faster, paused]) {
+    assert.equal(r.fullAtStart, true);
+    assert.equal(r.saturatedAtSec, null);
+    assert.equal(r.ppm, null);
+    assert.equal(r.slopePpm, null);
+    assert.equal(r.direction, null);
+  }
+  // Holes still tell a slower clock.
+  const slower = micClock(readings(() => 42, 223), { holes: 12, durationSec: 3600 });
+  assert.equal(slower.fullAtStart, true);
+  assert.equal(slower.direction, "slower");
+  near(slower.ppm, -33.3, 0.1, "ppm from the holes");
+});
+
+test("micClock (H1): the same clock, its buffer empty at the start, never counts as full", () => {
+  for (let seed = 231; seed <= 240; seed++) {
+    for (const d0 of [0, 10, 20]) {
+      const r = micClock(readings(h1(0, { d0 }), seed, { minutes: 65 }), { holes: 0, durationSec: 3900 });
+      assert.equal(r.saturatedAtSec, null, `seed ${seed} d0 ${d0}`);
+      assert.equal(r.fullAtStart, false, `seed ${seed} d0 ${d0}`);
+      assert.equal(r.direction, "same", `seed ${seed} d0 ${d0}: ppm ${r.ppm}`);
+      assert.ok(r.ticksPer30Min < 1, `seed ${seed} d0 ${d0}: ${r.ticksPer30Min}`);
+    }
+  }
 });
 
 test("micClock: three readings say nothing", () => {
@@ -797,32 +863,51 @@ test("longVerdict: 7 clicks per 30 minutes on the microphone's road fail", () =>
   assert.equal(v.lines[3], "Clicks from your microphone's side: about 7.0 per 30 minutes (its clock runs 39 ppm faster than VB-CABLE's).");
 });
 
-test("longVerdict: a microphone with a noise gate skips the hole rules and says so", () => {
+test("longVerdict: with a noise gate 'capture paused' is skipped, and the holes seen count as a lower bound, never a pass", () => {
   const holes = 14;
   const micPath = micClock(readings(() => 20, 105), { holes, durationSec: 3900 });
-  assert.ok(micPath.ticksPer30Min > 6, "the holes alone would fail");
+  assert.ok(micPath.ticksPer30Min > 6, "the holes alone fail");
   const refRuns = [{ startFrame: 600 * SR, frames: 150 * 48 }];
   let v = longVerdict(clean({ micPath, refRuns, micZeroFraction: 0.05 }));
-  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  // The buffer's slope was measured over 60 minutes (flat): the clock is not faster. A slower one's holes hide in
+  // the gate's silence, so the 14 seen are only some of them: they fail, and say "at least".
+  assert.deepEqual(v.reasons, ["Too many clicks from your microphone's side: at least 6.5 per 30 minutes (6 at most)."]);
   assert.ok(
     v.lines.includes(
       "Your microphone sends digital silence in pauses (a noise gate?), so pauses and short drop-outs in the microphone itself could not be checked.",
     ),
   );
-  // The buffer's slope was measured over 60 minutes (flat): with a noise gate only the slope counts. It shows the
-  // clock is not faster; a slower one's holes would hide in the gate's silence.
   assert.ok(
     v.lines.includes(
-      "Clicks from your microphone's side: about 0.0 per 30 minutes (its clock is not faster than VB-CABLE's; whether it is slower could not be checked).",
+      "Clicks from your microphone's side: at least 6.5 per 30 minutes (its clock is not faster than VB-CABLE's; its noise gate hides the clicks a slower clock makes, so there may be more).",
     ),
     v.lines.join(" | "),
   );
   assert.ok(!v.lines.some((l) => l.includes("too short")), "60 minutes of readings are not too short");
+  // 3 holes seen (1.4 per 30 minutes) are no measurement: the road was not measured, and the line says so.
+  v = longVerdict(clean({ micPath: micClock(readings(() => 20, 105), { holes: 3, durationSec: 3900 }), refRuns, micZeroFraction: 0.05 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.ok(
+    v.lines.includes(
+      "Clicks from your microphone's side: not measured, at least 1.4 per 30 minutes (its clock is not faster than VB-CABLE's; its noise gate hides the clicks a slower clock makes).",
+    ),
+    v.lines.join(" | "),
+  );
+  // None seen: not measured either, never "about 0.0".
+  v = longVerdict(clean({ micPath: micClock(readings(() => 20, 105), { holes: 0, durationSec: 3900 }), refRuns, micZeroFraction: 0.05 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.ok(
+    v.lines.includes(
+      "Clicks from your microphone's side: not measured (its clock is not faster than VB-CABLE's; its noise gate hides the clicks a slower clock makes).",
+    ),
+    v.lines.join(" | "),
+  );
+  assert.ok(!v.lines.some((l) => l.includes("about 0.0 per 30 minutes")), v.lines.join(" | "));
   // Without the noise gate both rules apply.
   v = longVerdict(clean({ micPath, refRuns, micZeroFraction: 0.001 }));
   assert.deepEqual(v.reasons, [
     "Too many clicks from your microphone's side: about 6.5 per 30 minutes (6 at most).",
-    "The microphone itself stopped once (the longest for 150 ms): Windows paused it.",
+    "Your microphone sent only digital silence once (the longest for 150 ms at 10:00): it was muted, or Windows paused it.",
   ]);
 });
 
@@ -885,7 +970,7 @@ test("longVerdict: a check that measured nothing has no tone road, and its lines
 const SPEC_FIELDS = ["counts", "durationSec", "events", "late", "levelChanges", "micPath", "micZeroFraction", "mode", "outages", "phases", "recoveries", "speech", "tone"];
 
 test("longVerdict: the microphone itself stopping fails, from the spec's inputs in mic mode", () => {
-  // Windows paused the microphone for 300 ms; CABLE Output repeats its silence 50 ms later.
+  // Windows paused the microphone for 300 ms (or it was muted); CABLE Output repeats its silence 50 ms later.
   const speech = analyzeSpeech({
     refDb: new Float32Array(0),
     sigDb: new Float32Array(0),
@@ -910,22 +995,28 @@ test("longVerdict: the microphone itself stopping fails, from the spec's inputs 
   assert.deepEqual(Object.keys(input).sort(), SPEC_FIELDS);
   const v = longVerdict(input);
   assert.equal(v.verdict, "fail");
-  assert.deepEqual(v.reasons, ["The microphone itself stopped once (the longest for 300 ms): Windows paused it."]);
+  assert.deepEqual(v.reasons, ["Your microphone sent only digital silence once (the longest for 300 ms at 1:40): it was muted, or Windows paused it."]);
   // A speech result without micPauses: its micSilentSec (runs of 200 ms or more) still tells.
   const { micPauses, ...older } = speech;
   assert.equal(micPauses.length, 1);
-  assert.deepEqual(longVerdict({ ...input, speech: older }).reasons, ["The microphone itself stopped for 300 ms in all: Windows paused it."]);
+  assert.deepEqual(longVerdict({ ...input, speech: older }).reasons, [
+    "Your microphone sent only digital silence for 300 ms in all: it was muted, or Windows paused it.",
+  ]);
 });
 
 test("longVerdict: in tone mode the microphone's zero runs (refRuns) tell; without them a line says it was not checked", () => {
   const paused = [{ startFrame: 2000 * SR, frames: 1.5 * SR }];
   let v = longVerdict(clean({ refRuns: paused }));
   assert.equal(v.verdict, "fail");
-  assert.deepEqual(v.reasons, ["The microphone itself stopped once (the longest for 1500 ms): Windows paused it."]);
-  assert.equal(longVerdict(clean({ refRuns: [{ startFrame: 2000 * SR, frames: 4799 }] })).verdict, "pass", "under 100 ms");
+  assert.deepEqual(v.reasons, ["Your microphone sent only digital silence once (the longest for 1500 ms at 33:20): it was muted, or Windows paused it."]);
+  assert.deepEqual(
+    longVerdict(clean({ refRuns: [{ startFrame: 2000 * SR, frames: 4799 }] })).reasons,
+    ["The microphone itself dropped out once for 20 to 100 ms (the longest 99 ms at 33:20)."],
+    "under 100 ms: a drop-out, not a stop",
+  );
   assert.deepEqual(
     longVerdict(clean({ refRuns: [{ startFrame: 2000 * SR, frames: 4800 }] })).reasons,
-    ["The microphone itself stopped once (the longest for 100 ms): Windows paused it."],
+    ["Your microphone sent only digital silence once (the longest for 100 ms at 33:20): it was muted, or Windows paused it."],
     "exactly 100 ms",
   );
   v = longVerdict(clean({ refRuns: undefined }));
@@ -934,10 +1025,137 @@ test("longVerdict: in tone mode the microphone's zero runs (refRuns) tell; witho
   assert.ok(!longVerdict(clean()).lines.some((l) => l.startsWith("Whether the microphone")), "checked: nothing to say");
 });
 
+test("longVerdict: the microphone's own drop-outs of 20 to 100 ms fail in both modes, unless it has a noise gate", () => {
+  const run = (sec, frames, extra = {}) => ({ startFrame: sec * SR, frames, ...extra });
+  // Tone mode. 20 ms (960 frames) is a drop-out; just under it is not (the 8–11 ms ones are holes: clicks).
+  assert.equal(longVerdict(clean({ refRuns: [run(900, 959)] })).verdict, "pass", "under 20 ms");
+  let v = longVerdict(
+    clean({ refRuns: [run(900, 960), run(1300, 2400, { atSec: 1300.2, phase: "minimized" }), run(2500, 1920, { atSec: 2500, phase: "hidden" })] }),
+  );
+  assert.equal(v.verdict, "fail");
+  assert.deepEqual(v.reasons, ["The microphone itself dropped out 3 times for 20 to 100 ms (the longest 50 ms at 21:40 while minimized)."]);
+  // Next to a stop, both count.
+  v = longVerdict(clean({ refRuns: [run(900, 960), run(2000, 1.5 * SR)] }));
+  assert.deepEqual(v.reasons, [
+    "Your microphone sent only digital silence once (the longest for 1500 ms at 33:20): it was muted, or Windows paused it.",
+    "The microphone itself dropped out once for 20 to 100 ms (the longest 20 ms at 15:00).",
+  ]);
+  // A microphone with a noise gate sends digital silence in pauses: its short silences say nothing.
+  v = longVerdict(clean({ refRuns: [run(900, 2400)], micZeroFraction: 0.02 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+
+  // Mic mode: three 50 ms drop-outs that CABLE Output repeats 40 ms later. They are the microphone's (explained),
+  // so CABLE Output has no drop-out of its own, but the meeting heard them all the same.
+  const refRuns = [run(60, 2400), run(150, 2400), run(240, 2400)];
+  const sigRuns = refRuns.map((r) => ({ startFrame: r.startFrame + 40 * 48, frames: r.frames }));
+  const runs = analyzeSpeech({ refDb: new Float32Array(0), sigDb: new Float32Array(0), refRuns, sigRuns });
+  assert.deepEqual(runs.dropouts, [], "CABLE Output's runs are the microphone's");
+  const speech = { ...micClean().speech, dropouts: runs.dropouts, micHoles: runs.micHoles, micPauses: runs.micPauses };
+  v = longVerdict(micClean({ speech, refRuns }));
+  assert.equal(v.verdict, "fail");
+  assert.deepEqual(v.reasons, ["The microphone itself dropped out 3 times for 20 to 100 ms (the longest 50 ms at 1:00)."]);
+  assert.ok(v.lines.includes("Drop-outs in CABLE Output: none."), v.lines.join(" | "));
+  // Without refRuns the speech analysis still tells the stops, but not the drop-outs: a line says so.
+  v = longVerdict(micClean({ speech, refRuns: undefined }));
+  assert.equal(v.verdict, "pass");
+  assert.ok(
+    v.lines.includes("Whether the microphone itself dropped out for 20 to 100 ms was not checked (no record of its short silences)."),
+    v.lines.join(" | "),
+  );
+});
+
 test("longVerdict: the noise gate starts at 1 % of digital silence", () => {
   const refRuns = [{ startFrame: 600 * SR, frames: 150 * 48 }];
   assert.equal(longVerdict(clean({ refRuns, micZeroFraction: 0.0099 })).verdict, "fail", "0.99 %: no noise gate");
   assert.equal(longVerdict(clean({ refRuns, micZeroFraction: 0.01 })).verdict, "pass", "1 %: a noise gate");
+});
+
+test("noiseGateOf: the short silences make a noise gate; runs of 2 s or more are left out", () => {
+  const total = 3900 * SR;
+  const run = (sec, frames) => ({ startFrame: sec * SR, frames });
+  // One run of 60 s in 65 minutes (1.5 %) is the microphone stopping, not a gate; so is one of 30 minutes.
+  assert.equal(noiseGateOf(60 / 3900, [run(2500, 60 * SR)], total), false);
+  assert.equal(noiseGateOf(1800 / 3900, [run(2000, 1800 * SR)], total), false);
+  // The limit is 2 s: with 38 s of short runs (0.97 %), a run of exactly 2 s is left out, one a frame shorter counts.
+  assert.equal(noiseGateOf((38 + 2) / 3900, [run(100, 2 * SR)], total), false, "exactly 2 s: left out");
+  assert.equal(noiseGateOf((38 + (2 * SR - 1) / SR) / 3900, [run(100, 2 * SR - 1)], total), true, "just under 2 s: a gate's");
+  // Short ones above 1 % make a gate, whatever long runs come with them.
+  assert.equal(noiseGateOf((40 + 600) / 3900, [run(100, 600 * SR)], total), true);
+  // Many silences make a gate however long each was (a gate shuts at every pause); a few never do.
+  const many = (n) => Array.from({ length: n }, (_, k) => run(100 + 150 * k, 30 * SR));
+  assert.equal(noiseGateOf((20 * 30) / 3900, many(20), total), true, "20 silences of 30 s");
+  assert.equal(noiseGateOf((19 * 30) / 3900, many(19), total), false, "19 silences of 30 s");
+  assert.equal(noiseGateOf((19 * 30 + 0.1) / 3900, [...many(19), run(3500, 0.1 * SR)], total), true, "the 20th: exactly 100 ms");
+  assert.equal(noiseGateOf((19 * 30 + 0.1) / 3900, [...many(19), run(3500, 0.1 * SR - 1)], total), false, "shorter is no silence");
+  // Under 1 % of digital silence is never a gate, however many short silences make it up.
+  const stalls = Array.from({ length: 30 }, (_, k) => run(100 + 60 * k, 0.2 * SR));
+  assert.equal(noiseGateOf(6 / 3900, stalls, total), false, "30 stalls of 200 ms");
+  // Without the runs (an older caller) the total decides, as before; without a fraction there is no gate.
+  assert.equal(noiseGateOf(0.02, undefined, total), true);
+  assert.equal(noiseGateOf(null, many(30), total), false);
+});
+
+test("longVerdict: one long silence is the microphone stopping, however long, never a noise gate", () => {
+  // 60 s of digital silence while hidden in a 65-minute tone check: 1.5 % of it, all in one run.
+  const hidden = { startFrame: 2500 * SR, frames: 60 * SR, atSec: 2500, phase: "hidden" };
+  let v = longVerdict(clean({ refRuns: [hidden], micZeroFraction: 60 / 3900 }));
+  assert.equal(v.verdict, "fail");
+  assert.deepEqual(v.reasons, [
+    "Your microphone sent only digital silence once (the longest for 60.0 s at 41:40 while hidden): it was muted, or Windows paused it.",
+  ]);
+  assert.ok(!v.lines.some((l) => l.includes("noise gate")), v.lines.join(" | "));
+  assert.deepEqual(v.micSilence, { checked: true, gate: false });
+  // The whole hidden half: 46 % of the check in one run.
+  v = longVerdict(clean({ refRuns: [{ ...hidden, frames: 1800 * SR }], micZeroFraction: 1800 / 3900 }));
+  assert.equal(v.verdict, "fail");
+  assert.ok(v.reasons[0].startsWith("Your microphone sent only digital silence once (the longest for 30 min"), v.reasons[0]);
+  // Two mutes of 20 s and 5 s while open: both count; the longest is named.
+  const mutes = [
+    { startFrame: 200 * SR, frames: 20 * SR, atSec: 200, phase: "visible" },
+    { startFrame: 3800 * SR, frames: 5 * SR, atSec: 3800, phase: "visible" },
+  ];
+  v = longVerdict(clean({ refRuns: mutes, micZeroFraction: 25 / 3900 }));
+  assert.deepEqual(v.reasons, [
+    "Your microphone sent only digital silence twice (the longest for 20.0 s at 3:20 while open): it was muted, or Windows paused it.",
+  ]);
+});
+
+test("longVerdict: a noise gate's many short silences are not judged, and the result says so", () => {
+  // 200 silences of 0.5 s spread over 65 minutes: 100 s, 2.6 % of the check.
+  const gate = Array.from({ length: 200 }, (_, k) => ({ startFrame: (60 + 19 * k) * SR, frames: 0.5 * SR }));
+  let v = longVerdict(clean({ refRuns: gate, micZeroFraction: 100 / 3900 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.deepEqual(v.micSilence, { checked: false, gate: true });
+  assert.ok(v.lines.some((l) => l.startsWith("Your microphone sends digital silence in pauses (a noise gate?)")), v.lines.join(" | "));
+  // A long silence on top of a gate's is not judged either: the gate's short ones alone are over 1 %.
+  v = longVerdict(clean({ refRuns: [...gate, { startFrame: 2500 * SR, frames: 60 * SR }], micZeroFraction: 160 / 3900 }));
+  assert.equal(v.verdict, "pass");
+  assert.equal(v.micSilence.gate, true);
+  // A gate in a quiet room, shut for 10 s at a time between sounds: few short silences, but many silences.
+  const quiet = Array.from({ length: 25 }, (_, k) => ({ startFrame: (100 + 150 * k) * SR, frames: 10 * SR }));
+  v = longVerdict(clean({ refRuns: quiet, micZeroFraction: 250 / 3900 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.equal(v.micSilence.gate, true);
+  // Without a record of the microphone's silences nothing was judged either.
+  assert.deepEqual(longVerdict(clean({ refRuns: undefined })).micSilence, { checked: false, gate: false });
+});
+
+test("longVerdict, mic mode: a capture pause of 3, 4 or 20 s in a 5-minute check with your voice fails", () => {
+  for (const sec of [3, 4, 20]) {
+    const refRuns = [{ startFrame: 150 * SR, frames: sec * SR }];
+    const { micPauses } = analyzeSpeech({ refDb: new Float32Array(0), sigDb: new Float32Array(0), refRuns, sigRuns: [] });
+    const speech = { ...micClean().speech, micPauses };
+    // From refRuns, as the check gives them, and from the speech analysis's micPauses alone.
+    const fromRuns = longVerdict(micClean({ speech, refRuns, micZeroFraction: sec / 300 }));
+    const fromPauses = longVerdict(micClean({ speech, refRuns: undefined, micZeroFraction: sec / 300 }));
+    for (const v of [fromRuns, fromPauses]) {
+      assert.equal(v.verdict, "fail", `${sec} s`);
+      assert.deepEqual(v.reasons, [
+        `Your microphone sent only digital silence once (the longest for ${sec < 10 ? `${sec * 1000} ms` : `${sec}.0 s`} at 2:30): it was muted, or Windows paused it.`,
+      ]);
+      assert.equal(v.micSilence.gate, false, `${sec} s is ${((sec / 300) * 100).toFixed(1)} % but one run`);
+    }
+  }
 });
 
 test("longVerdict: exactly 6 clicks per 30 minutes on either road pass", () => {
@@ -1003,6 +1221,7 @@ const micClean = (overrides = {}) => ({
   micPath: micClock(readings(() => 20, 109, { minutes: 4 }), { holes: 0, durationSec: 300 }),
   micZeroFraction: 0,
   late: { count: 0, maxMs: 0 },
+  refRuns: [],
   ...overrides,
 });
 
@@ -1042,8 +1261,36 @@ test("longVerdict, mic mode: pass, missing words, drop-outs, voice never arrived
   assert.equal(v.verdict, "no-signal");
   assert.deepEqual(v.reasons, ["Your voice never reached “CABLE Output”."]);
   v = longVerdict(micClean({ speech: { ...micClean().speech, lagMs: null, lagScore: null, speechSec: 0 } }));
-  assert.equal(v.verdict, "pass", "no speech: only the zero runs are checked");
+  assert.equal(v.verdict, "no-signal", "no speech: only the zero runs were checked, which is no pass");
+  assert.deepEqual(v.reasons, [
+    "No speech was heard, so the check could not tell whether words went missing: run it again and read aloud the whole time.",
+  ]);
   assert.ok(v.lines.includes("No speech was heard, so only the silence was checked."));
+});
+
+test("longVerdict, mic mode: a check with your voice that heard too little speech measured nothing; what it found still fails", () => {
+  // 5 minutes: at least 30 s of speech (10 %), and never under 10 s.
+  const heard = (speechSec, extra = {}) => longVerdict(micClean({ speech: { ...micClean().speech, speechSec }, ...extra }));
+  assert.equal(heard(30).verdict, "pass");
+  assert.equal(heard(29.9).verdict, "no-signal");
+  let v = heard(20);
+  assert.equal(v.verdict, "no-signal");
+  assert.deepEqual(v.reasons, [
+    "Too little speech was heard (20 s in 5 min), so the check could not tell whether words went missing: run it again and read aloud the whole time.",
+  ]);
+  // A 1-minute check needs 10 s.
+  assert.equal(longVerdict(micClean({ durationSec: 60, speech: { ...micClean().speech, speechSec: 10 } })).verdict, "pass");
+  assert.equal(longVerdict(micClean({ durationSec: 60, speech: { ...micClean().speech, speechSec: 9.9 } })).verdict, "no-signal");
+  // A capture pause or an outage still fails it: that is evidence, speech or not.
+  v = heard(0, { refRuns: [{ startFrame: 100 * SR, frames: 3 * SR }] });
+  assert.equal(v.verdict, "fail");
+  assert.ok(v.reasons[0].startsWith("Your microphone sent only digital silence once"), v.reasons[0]);
+  v = heard(5, { outages: [{ atSec: 100, phase: "minimized", ms: 400, cause: "render-error" }], recoveries: 1 });
+  assert.equal(v.verdict, "fail");
+  // The gaps row counts it for nothing, as any check that measured nothing.
+  const tone = structuredClone(COMPLETE.checks.long[0]);
+  const quiet = { mode: "mic", recordedSec: 300, phases: { minimizedSec: 300, hiddenSec: 0 }, ...heard(0), speech: { gaps: [], dropouts: [] } };
+  assert.equal(gateSummary({ checks: { long: [tone, quiet] } })[5].status, "pass");
 });
 
 test("longVerdict: at most 10 lines, and safe with nothing", () => {
@@ -1150,18 +1397,44 @@ test("longVerdict, mic mode: CABLE Output that carried only digital silence is n
   assert.deepEqual(v.reasons, ["Your voice never reached “CABLE Output”."]);
 });
 
-test("longVerdict: with a noise gate the microphone's road is too short to measure only when its readings were too few", () => {
-  // 4 minutes of readings and 3 holes: no slope, and the holes say nothing.
-  const few = micClock(readings(() => 20, 110, { minutes: 4 }), { holes: 3, durationSec: 300 });
-  let v = longVerdict(clean({ micPath: few, micZeroFraction: 0.05 }));
+test("longVerdict: with a noise gate the microphone's road is too short to measure only with too few readings and no hole; holes seen always count", () => {
+  const per30Text = (x) => (Math.round(x * 10) / 10).toFixed(1);
+  // 4 minutes of readings and no hole: no slope, nothing seen.
+  let v = longVerdict(clean({ micPath: micClock(readings(() => 20, 110, { minutes: 4 }), { holes: 0, durationSec: 300 }), micZeroFraction: 0.05 }));
   assert.ok(v.lines.includes("The microphone's clock could not be measured (the check was too short)."), v.lines.join(" | "));
-  // 20 ppm faster with 14 holes: the drops from the slope count (3.6 per 30 minutes), not the holes too (10.6).
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  // 3 holes in 5 minutes: no slope, but the holes seen are 18 per 30 minutes at least, as without a gate.
+  const few = micClock(readings(() => 20, 110, { minutes: 4 }), { holes: 3, durationSec: 300 });
+  v = longVerdict(clean({ micPath: few, micZeroFraction: 0.05 }));
+  assert.deepEqual(v.reasons, ["Too many clicks from your microphone's side: at least 18.0 per 30 minutes (6 at most)."]);
+  assert.ok(
+    v.lines.includes(
+      "Clicks from your microphone's side: at least 18.0 per 30 minutes (the check was too short to measure its clock; its noise gate hides the clicks a slower clock makes, so there may be more).",
+    ),
+    v.lines.join(" | "),
+  );
+  // One hole in 30 minutes and no slope: not measured, at least 1.0.
+  v = longVerdict(clean({ micPath: micClock(readings(() => 20, 110, { minutes: 4 }), { holes: 1, durationSec: 1800 }), micZeroFraction: 0.05 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.ok(
+    v.lines.includes(
+      "Clicks from your microphone's side: not measured, at least 1.0 per 30 minutes (the check was too short to measure its clock; its noise gate hides the clicks a slower clock makes).",
+    ),
+    v.lines.join(" | "),
+  );
+  // 20 ppm faster with 14 holes: a faster clock makes no holes, so the road is measured: the drops from the slope
+  // (3.6 per 30 minutes) plus the holes seen (7.0), as micClock adds them without a gate.
   const faster = micClock(readings((t) => Math.min(60, 10 + 0.02 * t), 101), { holes: 14, durationSec: 3600 });
   assert.ok(faster.ticksPer30Min > 6 && faster.dropsPer30Min <= 6, JSON.stringify(faster));
   v = longVerdict(clean({ micPath: faster, micZeroFraction: 0.05 }));
-  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  const sum = per30Text(faster.slopePpm * 0.18 + 7);
+  assert.deepEqual(v.reasons, [`Too many clicks from your microphone's side: about ${sum} per 30 minutes (6 at most).`]);
   const line = v.lines.find((l) => l.startsWith("Clicks from your microphone's side"));
-  assert.equal(line, `Clicks from your microphone's side: about ${(faster.slopePpm * 0.18).toFixed(1)} per 30 minutes (its clock runs ${Math.round(faster.slopePpm)} ppm faster than VB-CABLE's).`);
+  assert.equal(line, `Clicks from your microphone's side: about ${sum} per 30 minutes (its clock runs ${Math.round(faster.slopePpm)} ppm faster than VB-CABLE's).`);
+  // The same without holes passes on the slope's drops.
+  v = longVerdict(clean({ micPath: { ...faster, holes: 0, holesPer30Min: 0 }, micZeroFraction: 0.05 }));
+  assert.equal(v.verdict, "pass", JSON.stringify(v.reasons));
+  assert.ok(v.lines.includes(`Clicks from your microphone's side: about ${per30Text(faster.slopePpm * 0.18)} per 30 minutes (its clock runs ${Math.round(faster.slopePpm)} ppm faster than VB-CABLE's).`), v.lines.join(" | "));
   // 80 ppm faster: the slope alone fails it.
   const fast = micClock(readings((t) => Math.min(80, 10 + 0.08 * t), 102), { durationSec: 3600 });
   v = longVerdict(clean({ micPath: fast, micZeroFraction: 0.05 }));
@@ -1175,7 +1448,7 @@ test("longVerdict: with a noise gate the microphone's road is too short to measu
 
 test("longVerdict, mic mode: 6 short drop-outs per 30 minutes pass, 7 fail", () => {
   const short = (n) => Array.from({ length: n }, (_, k) => ({ startFrame: (10 + 60 * k) * SR, frames: 480, ms: 10 }));
-  const at = (n) => longVerdict(micClean({ durationSec: 1800, speech: { ...micClean().speech, dropouts: short(n) } }));
+  const at = (n) => longVerdict(micClean({ durationSec: 1800, speech: { ...micClean().speech, speechSec: 900, dropouts: short(n) } }));
   assert.equal(at(6).verdict, "pass", JSON.stringify(at(6).reasons));
   assert.deepEqual(at(7).reasons, ["Too many short drop-outs in CABLE Output: about 7.0 per 30 minutes (6 at most)."]);
 });
@@ -1269,15 +1542,16 @@ test("gateSummary: a complete Session B", () => {
       "Zoom's Test Mic hears you",
       "Delay at most 120 ms",
       "No gaps while minimized and hidden",
-      "No clock-crossing clicks",
+      "No regular clicks",
       "Windows Audio restart: back within 2 s",
       "Connect only",
     ],
   );
-  assert.deepEqual(statuses(rows), ["pass", "pass", "pass", "todo", "pass", "pass", "pass", "pass", "pass"]);
+  // The microphone row stays a note: whether anything asked at the 1st and 3rd start is in the user's notes.
+  assert.deepEqual(statuses(rows), ["pass", "note", "pass", "todo", "pass", "pass", "pass", "pass", "pass"]);
   assert.equal(rows[4].text, "The highest of 3 measurements: about 93 ms (± 10). Through the audio element (not counted): 140 ms.");
   assert.ok(rows[5].text.includes("31 min minimized and 29 min hidden"));
-  assert.ok(rows[5].text.endsWith("Meet call still open at the end: your note (step 7.5)."));
+  assert.ok(rows[5].text.endsWith("Meet call still open at the end: your note (Session B step 7.5)."));
   assert.equal(rows[7].text, "Back after 3.0 s: pass (Windows itself took about 2.7 s).");
   assert.ok(rows[6].text.includes("about 2.5 per 30 min") && rows[6].text.includes("about 1.2 per 30 min"));
   for (const r of rows) assert.ok(!/undefined|NaN|null/.test(r.text), r.text);
@@ -1346,6 +1620,63 @@ test("gateSummary: the route, the restart and the long check can fail or need a 
   assert.equal(gateSummary({ checks: { long } })[6].status, "todo", "shorter than 30 minutes");
 });
 
+test("gateSummary: a tone check forced onto the audio element (step 7.6) is listed beside the clicks row, not counted", () => {
+  // Step 7 on the normal route: too many clicks on the meeting's side. Step 7.6: 30 minutes through the audio
+  // element with the app open, few clicks, and no microphone's side (micBus is not reachable on that route).
+  const normal = {
+    ...structuredClone(COMPLETE.checks.long[0]),
+    verdict: "fail",
+    reasons: ["Too many clicks from the meeting's side: about 12.0 per 30 minutes (6 at most)."],
+    tonePath: { ticksPer30Min: 12, ppm: -66.7, direction: "slower" },
+    route: "context",
+    routePreference: "auto",
+  };
+  const element = {
+    mode: "tone",
+    recordedSec: 1800,
+    phases: { visibleSec: 1800, minimizedSec: 0, hiddenSec: 0, unknownSec: 0 },
+    verdict: "pass",
+    reasons: [],
+    tone: { counts: { gaps: 0, dropouts: 0 } },
+    outages: [],
+    renderPauses: [],
+    recoveries: 0,
+    tonePath: { ticksPer30Min: 1, ppm: -5.6, direction: "slower" },
+    micPath: null,
+    route: "element",
+    routePreference: "element",
+  };
+  const ticks = (...long) => gateSummary({ checks: { long } })[6];
+  assert.equal(ticks(normal).status, "fail");
+  assert.ok(ticks(normal).text.endsWith("Run the comparison through the audio element (Session B step 7.6)."), ticks(normal).text);
+  for (const order of [[normal, element], [element, normal]]) {
+    const row = ticks(...order);
+    assert.equal(row.status, "fail", "the normal route's clicks still fail the row");
+    assert.equal(
+      row.text,
+      "The meeting's side: about 12.0 per 30 min; your microphone's side: about 1.2 per 30 min (6 at most each). Through the audio element (not counted): about 1.0 per 30 min.",
+    );
+  }
+  // A normal route that passes stays a pass, whatever the comparison found.
+  const passing = { ...normal, verdict: "pass", reasons: [], tonePath: { ticksPer30Min: 2.5, ppm: 14, direction: "faster" } };
+  const loud = { ...element, verdict: "fail", tonePath: { ticksPer30Min: 9, ppm: 50, direction: "faster" } };
+  assert.equal(ticks(passing, loud).status, "pass");
+  assert.ok(ticks(passing, loud).text.endsWith("Through the audio element (not counted): about 9.0 per 30 min."));
+  // The comparison alone is no check of the normal route; one that measured nothing is not listed.
+  assert.equal(ticks(element).status, "todo");
+  assert.ok(ticks(element).text.endsWith("(Session B step 7). Through the audio element (not counted): about 1.0 per 30 min."), ticks(element).text);
+  assert.ok(!ticks({ ...element, verdict: "no-signal", tonePath: null }).text.includes("audio element"));
+  // Results made before routePreference was recorded count as the normal route.
+  const { routePreference, ...old } = element; // eslint-disable-line no-unused-vars
+  assert.equal(ticks(normal, old).status, "note");
+  // The gaps row never takes a comparison either, even one with long enough phases and a gap.
+  const phased = { ...element, phases: { visibleSec: 0, minimizedSec: 1800, hiddenSec: 1800 }, tone: { counts: { gaps: 1, dropouts: 0 } } };
+  assert.equal(gateSummary({ checks: { long: [normal, phased] } })[5].status, "pass");
+  const alone = gateSummary({ checks: { long: [phased] } })[5];
+  assert.equal(alone.status, "todo");
+  assert.ok(!alone.text.includes("The last one had"), alone.text);
+});
+
 /** A 65-minute tone check, as Part D builds its result from longVerdict(input). */
 function toneResult(input) {
   const v = longVerdict(input);
@@ -1387,14 +1718,114 @@ test("gateSummary: a microphone that stopped by itself fails the gaps row", () =
   assert.equal(rows[5].status, "fail");
   assert.equal(
     rows[5].text,
-    "In 31 min minimized and 29 min hidden: the microphone itself stopped (Windows paused it). Meet call still open at the end: your note (step 7.5).",
+    "In 31 min minimized and 29 min hidden: your microphone sent only digital silence (muted, or paused by Windows). Meet call still open at the end: your note (Session B step 7.5).",
   );
   assert.equal(rows[6].status, "pass", "the clicks are fine");
   // In the check with the voice too.
   const voice = { mode: "mic", recordedSec: 300, phases: { minimizedSec: 300, hiddenSec: 0 }, verdict: "fail", reasons: [longVerdict(clean({ refRuns: [{ startFrame: 0, frames: SR }] })).reasons[0]], speech: { gaps: [], dropouts: [] } };
   const both = gateSummary({ checks: { long: [toneResult(clean()), voice] } })[5];
   assert.equal(both.status, "fail");
-  assert.ok(both.text.includes("In the check with your voice: the microphone itself stopped (Windows paused it)."), both.text);
+  assert.ok(both.text.includes("In the check with your voice: your microphone sent only digital silence (muted, or paused by Windows)."), both.text);
+});
+
+test("gateSummary: a long capture pause while hidden fails the gaps row; a noise gate makes it a note, never a pass", () => {
+  // README step 7 with 60 s of digital silence from the microphone while hidden (1.5 % of the check).
+  const paused = { startFrame: 2500 * SR, frames: 60 * SR, atSec: 2500, phase: "hidden" };
+  const withMic = (input) => {
+    const v = longVerdict(input);
+    return { ...toneResult(input), micSilence: v.micSilence, micPath: { ...v.micPath, noiseGate: v.micSilence.gate } };
+  };
+  let rows = gateSummary({ checks: { long: [withMic(clean({ refRuns: [paused], micZeroFraction: 60 / 3900 }))] } });
+  assert.equal(rows[5].status, "fail");
+  assert.ok(rows[5].text.includes("your microphone sent only digital silence (muted, or paused by Windows)"), rows[5].text);
+  // A noise gate: the check passes, the row is a note that says what could not be checked.
+  const gate = Array.from({ length: 200 }, (_, k) => ({ startFrame: (60 + 19 * k) * SR, frames: 0.5 * SR }));
+  const gated = withMic(clean({ refRuns: gate, micZeroFraction: 100 / 3900 }));
+  assert.equal(gated.verdict, "pass");
+  rows = gateSummary({ checks: { long: [gated] } });
+  assert.equal(rows[5].status, "note");
+  assert.equal(
+    rows[5].text,
+    "No gaps in 31 min minimized and 29 min hidden. Whether your microphone itself stopped could not be checked: it sends digital silence in pauses (a noise gate?). I decide with the details. Meet call still open at the end: your note (Session B step 7.5).",
+  );
+  // With what the check saw (measure.js adds the count and the longest silences).
+  const seen = { ...gated, micSilence: { ...gated.micSilence, zeroFraction: 0.0256, count: 200, longest: [{ atSec: 2196, phase: "hidden", ms: 500 }] } };
+  assert.equal(
+    gateSummary({ checks: { long: [seen] } })[5].text,
+    "No gaps in 31 min minimized and 29 min hidden. Whether your microphone itself stopped could not be checked: it sent only digital silence 200 times (the longest for 500 ms at 36:36 while hidden): a noise gate, or a microphone that kept stopping. I decide with the details. Meet call still open at the end: your note (Session B step 7.5).",
+  );
+  // The same from the check with your voice; and a failure still fails.
+  const voice = { mode: "mic", recordedSec: 300, phases: { minimizedSec: 300, hiddenSec: 0 }, verdict: "pass", reasons: [], speech: { gaps: [], dropouts: [] } };
+  rows = gateSummary({ checks: { long: [toneResult(clean()), { ...voice, micSilence: { checked: false, gate: true } }] } });
+  assert.equal(rows[5].status, "note");
+  rows = gateSummary({ checks: { long: [{ ...gated, renderPauses: [{ atSec: 1200, phase: "hidden", ms: 500 }] }] } });
+  assert.equal(rows[5].status, "fail");
+  // With a setting to change as well, the note says both.
+  rows = gateSummary({ checks: { long: [withMic(clean({ refRuns: gate, micZeroFraction: 100 / 3900, tone: { lockDb: -14, minStableDb: -14 } }))] } });
+  assert.equal(rows[5].status, "note");
+  assert.ok(rows[5].text.includes("a setting needs changing") && rows[5].text.includes("could not be checked"), rows[5].text);
+  // A result that only says so in micPath (the clicks row's field) is a note too.
+  rows = gateSummary({ checks: { long: [{ ...toneResult(clean()), micPath: { ...toneResult(clean()).micPath, noiseGate: true } }] } });
+  assert.equal(rows[5].status, "note");
+});
+
+test("gateSummary: a microphone that dropped out by itself for 20 to 100 ms fails the gaps row", () => {
+  // Two 40 ms drop-outs while hidden: the tone was on the cable, but in normal use the voice carries them.
+  const dropped = toneResult(clean({ refRuns: [{ startFrame: 2400 * SR, frames: 1920 }, { startFrame: 2800 * SR, frames: 1920 }] }));
+  dropped.micDropouts = { count: 2, longestMs: 40, runs: [] };
+  assert.equal(dropped.verdict, "fail");
+  let rows = gateSummary({ checks: { long: [dropped] } });
+  assert.equal(rows[5].status, "fail");
+  assert.equal(
+    rows[5].text,
+    "In 31 min minimized and 29 min hidden: the microphone itself dropped out twice for 20 to 100 ms. Meet call still open at the end: your note (Session B step 7.5).",
+  );
+  assert.equal(rows[6].status, "pass", "the clicks are fine");
+  // A result without the count still fails, in words without a number.
+  delete dropped.micDropouts;
+  rows = gateSummary({ checks: { long: [dropped] } });
+  assert.equal(
+    rows[5].text,
+    "In 31 min minimized and 29 min hidden: the microphone itself dropped out for 20 to 100 ms. Meet call still open at the end: your note (Session B step 7.5).",
+  );
+  // In the check with the voice too.
+  const voice = {
+    mode: "mic",
+    recordedSec: 300,
+    phases: { minimizedSec: 300, hiddenSec: 0 },
+    verdict: "fail",
+    reasons: longVerdict(micClean({ refRuns: [{ startFrame: 60 * SR, frames: 2400 }] })).reasons,
+    speech: { gaps: [], dropouts: [] },
+    micDropouts: { count: 1, longestMs: 50, runs: [] },
+  };
+  const both = gateSummary({ checks: { long: [toneResult(clean()), voice] } })[5];
+  assert.equal(both.status, "fail");
+  assert.ok(both.text.includes("In the check with your voice: the microphone itself dropped out once for 20 to 100 ms."), both.text);
+});
+
+test("gateSummary: the microphone row is a note until the user's notes say whether anything asked; a fail stays a fail", () => {
+  const rows = (voice) => gateSummary({ voice })[1];
+  let row = rows({ mic: { settings: { allOff: true }, openedInMs: 420, unlockMs: 300 } });
+  assert.equal(row.status, "note", "processing off and a quick open: still the notes' to say");
+  assert.equal(
+    row.text,
+    "Processing is off. Whether Windows or the app asked anything at the 1st and 3rd start: your notes (Session B step 4); the first start's timings are in the log file.",
+  );
+  assert.equal(rows({ mic: { settings: { allOff: false } } }).status, "fail");
+  assert.equal(rows({}).status, "todo");
+});
+
+test("gateSummary: the microphone row judges the launch's first open, whatever reopens came later", () => {
+  // The first start opened the microphone in 1.8 s (a prompt?); a reopen after Session B step 9 took 300 ms.
+  let row = gateSummary({ voice: { start: { ms: 2500, openedInMs: 1800, unlockMs: 400 }, mic: { settings: { allOff: true }, openedInMs: 300, unlockMs: 400 } } })[1];
+  assert.equal(row.status, "note");
+  assert.ok(row.text.includes("The microphone took 1.8 s to open at the start: was there a prompt?"), row.text);
+  // The other way round: a quick first open and a slow reopen say nothing about a prompt.
+  row = gateSummary({ voice: { start: { ms: 900, openedInMs: 250, unlockMs: 200 }, mic: { settings: { allOff: true }, openedInMs: 1900, unlockMs: 200 } } })[1];
+  assert.ok(!row.text.includes("to open"), row.text);
+  // Results without the first start's times: the microphone's own, as before.
+  row = gateSummary({ voice: { start: { ms: 900 }, mic: { settings: { allOff: true }, openedInMs: 1900, unlockMs: null } } })[1];
+  assert.ok(row.text.includes("1.9 s to open"), row.text);
 });
 
 test("gateSummary: a rendering pause alone fails the gaps row; a slow microphone open is a note", () => {
@@ -1420,7 +1851,7 @@ test("gateSummary: the check with your voice fails the gaps row on its outages, 
   assert.equal(row.status, "fail");
   assert.equal(
     row.text,
-    "No gaps in 31 min minimized and 29 min hidden. In the check with your voice: 1 outage, 1 rendering pause, 1 recovery. Meet call still open at the end: your note (step 7.5).",
+    "No gaps in 31 min minimized and 29 min hidden. In the check with your voice: 1 outage, 1 rendering pause, 1 recovery. Meet call still open at the end: your note (Session B step 7.5).",
   );
   for (const extra of [{ outages: [{ atSec: 3, phase: "visible", ms: 300 }] }, { renderPauses: [{ atSec: 3, ms: 300 }] }, { recoveries: 2 }]) {
     long[1] = voice(extra);
@@ -1438,7 +1869,7 @@ test("gateSummary: a voice much quieter in CABLE Output in a delay run is a sett
   assert.equal(row.status, "note");
   assert.equal(
     row.text,
-    "No gaps in 31 min minimized and 29 min hidden, but a setting needs changing. In “Measure the delay” the voice arrived 8.0 dB quieter in CABLE Output: check that CABLE Input and CABLE Output are at 100 % in Windows sound settings, and that Communications is set to “Do nothing”. Meet call still open at the end: your note (step 7.5).",
+    "No gaps in 31 min minimized and 29 min hidden, but a setting needs changing. In “Measure the delay” the voice arrived 8.0 dB quieter in CABLE Output: check that CABLE Input and CABLE Output are at 100 % in Windows sound settings, and that Communications is set to “Do nothing”. Meet call still open at the end: your note (Session B step 7.5).",
   );
   // 3 dB is fine; a run forced onto the audio element is not counted, nor is one that did not measure clearly.
   assert.equal(gateSummary(checks(delayRun(80, "auto", { levelDiffDb: -3 })))[5].status, "pass");
@@ -1460,7 +1891,7 @@ test("gateSummary: other sound mixed into the test tone fails the gaps row", () 
   long[0].tone.counts.noises = 1;
   let row = gateSummary({ checks: { long } })[5];
   assert.equal(row.status, "fail");
-  assert.equal(row.text, "In 31 min minimized and 29 min hidden: other sound mixed into the test tone once. Meet call still open at the end: your note (step 7.5).");
+  assert.equal(row.text, "In 31 min minimized and 29 min hidden: other sound mixed into the test tone once. Meet call still open at the end: your note (Session B step 7.5).");
   // A result whose counts have no such field: from its events, else from its reasons.
   delete long[0].tone.counts.noises;
   long[0].tone.events = [{ atSec: 1500, phase: "hidden", kind: "noise", ms: 300000 }];
@@ -1471,6 +1902,124 @@ test("gateSummary: other sound mixed into the test tone fails the gaps row", () 
   row = gateSummary({ checks: { long } })[5];
   assert.equal(row.status, "fail");
   assert.ok(row.text.includes("other sound mixed into the test tone."), row.text);
+});
+
+test("gateSummary: a long check that ended early for a reason nobody chose fails the gaps row, with that reason", () => {
+  const note = "“CABLE Output” stopped recording (did Windows Audio restart?), so the check ended early.";
+  const early = { verdict: "fail", reasons: [note], endedEarly: { why: "cable-ended", note } };
+  const long = structuredClone(COMPLETE.checks.long);
+  // It ended in its last minutes, with enough of each phase and nothing wrong in them: its own verdict fails.
+  Object.assign(long[0], early);
+  let rows = gateSummary({ checks: { long } });
+  assert.equal(rows[5].status, "fail");
+  assert.equal(rows[5].text, `${note} No gaps in 31 min minimized and 29 min hidden. Meet call still open at the end: your note (Session B step 7.5).`);
+  assert.equal(rows[6].status, "pass", "the clicks in the hour it recorded still count");
+  // With a gap as well: both.
+  long[0].tone.counts.gaps = 1;
+  assert.equal(
+    gateSummary({ checks: { long } })[5].text,
+    `${note} In 31 min minimized and 29 min hidden: 1 gap. Meet call still open at the end: your note (Session B step 7.5).`,
+  );
+  long[0].tone.counts.gaps = 0;
+  // A check you stopped yourself has no endedEarly: it is judged on what it recorded.
+  assert.equal(gateSummary({ checks: { long: [{ ...long[0], verdict: "pass", reasons: [], endedEarly: null }] } })[5].status, "pass");
+  // Too little recorded: still to do, and the row says why it ended.
+  const short = { ...long[0], phases: { visibleSec: 150, minimizedSec: 1800, hiddenSec: 600 } };
+  rows = gateSummary({ checks: { long: [short] } });
+  assert.equal(rows[5].status, "todo");
+  assert.ok(rows[5].text.includes(`The last one had 30 min minimized and 10 min hidden. ${note}`), rows[5].text);
+  // A complete check after it counts.
+  assert.equal(gateSummary({ checks: { long: [long[0], structuredClone(COMPLETE.checks.long[0])] } })[5].status, "pass");
+  // The check with your voice ended early: it fails the row too.
+  const voice = { ...structuredClone(COMPLETE.checks.long[1]), ...early };
+  const row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
+  assert.equal(row.status, "fail");
+  assert.equal(
+    row.text,
+    "No gaps in 31 min minimized and 29 min hidden. In the check with your voice: it ended early. Meet call still open at the end: your note (Session B step 7.5).",
+  );
+});
+
+test("gateSummary: the clicks row counts a check that ended early, and says so", () => {
+  const note = "“CABLE Output” stopped recording (did Windows Audio restart?), so the check ended early.";
+  const long = structuredClone(COMPLETE.checks.long);
+  Object.assign(long[0], { verdict: "fail", reasons: [note], endedEarly: { why: "cable-ended", note }, recordedSec: 3700 });
+  const row = gateSummary({ checks: { long } })[6];
+  assert.equal(row.status, "pass", row.text);
+  assert.ok(row.text.endsWith(" That check ended early: these come from its first 62 min."), row.text);
+});
+
+test("gateSummary: in Edge the gaps row is judged on the time the page was not on screen", () => {
+  // Edge cannot tell minimized from hidden: README's Edge run minimizes the window, and every minute of it reads
+  // as hidden (platform/browser.js answers minimized: null).
+  const edgeRun = { ...structuredClone(COMPLETE.checks.long[0]), phases: { visibleSec: 300, minimizedSec: 0, hiddenSec: 3600 } };
+  let row = gateSummary({ shell: "browser", checks: { long: [edgeRun] } })[5];
+  assert.equal(row.status, "pass", row.text);
+  assert.equal(
+    row.text,
+    "No gaps in 60 min not on screen (Edge can't tell minimized from hidden). Meet call still open at the end: your note (Session B step 7.5).",
+  );
+  // The same run in the app is not enough: it had no minimized phase.
+  row = gateSummary({ shell: "app", checks: { long: [edgeRun] } })[5];
+  assert.equal(row.status, "todo");
+  // 50 minutes not on screen are needed in Edge, whichever phase they read as; the todo text asks for that.
+  const short = { ...edgeRun, phases: { visibleSec: 300, minimizedSec: 600, hiddenSec: 2399 } };
+  row = gateSummary({ shell: "browser", checks: { long: [short] } })[5];
+  assert.equal(row.status, "todo");
+  assert.equal(
+    row.text,
+    "Run the long check with the Edge window minimized (Session B step 7): it needs 50 min not on screen (Edge can't tell minimized from hidden). The last one was 50 min not on screen. Meet call still open at the end: your note (Session B step 7.5).",
+  );
+  short.phases.hiddenSec = 2400;
+  assert.equal(gateSummary({ shell: "browser", checks: { long: [short] } })[5].status, "pass");
+  // A gap fails it as anywhere.
+  edgeRun.tone.counts.gaps = 1;
+  row = gateSummary({ shell: "browser", checks: { long: [edgeRun] } })[5];
+  assert.equal(row.status, "fail");
+  assert.ok(row.text.startsWith("In 60 min not on screen (Edge can't tell minimized from hidden): 1 gap."), row.text);
+});
+
+test("gateSummary: the gaps row counts every long drop-out of a check with your voice, not only those among its first 50", () => {
+  // 50 short drop-outs first (the list keeps only them), then a long one: the check itself failed on it.
+  const short = Array.from({ length: 50 }, (_, k) => ({ atSec: 10 + k, phase: "minimized", ms: 9 }));
+  const voice = {
+    ...structuredClone(COMPLETE.checks.long[1]),
+    verdict: "fail",
+    reasons: ["CABLE Output dropped out once (the longest for 45 ms)."],
+    speech: { gaps: [], dropouts: short, dropoutCount: 51, longDropoutCount: 1 },
+  };
+  let row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
+  assert.equal(row.status, "fail", row.text);
+  assert.ok(row.text.includes("In the check with your voice: 1 drop-out."), row.text);
+  // Results made before the count was kept: the list is what there is.
+  delete voice.speech.longDropoutCount;
+  voice.speech.dropouts = [...short.slice(0, 49), { atSec: 70, phase: "minimized", ms: 45 }];
+  row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
+  assert.equal(row.status, "fail", row.text);
+});
+
+test("gateSummary: a check with your voice forced onto the audio element is a comparison, not counted in the gaps row", () => {
+  const voice = { ...structuredClone(COMPLETE.checks.long[1]), routePreference: "element", speech: { gaps: [{ atSec: 30, holeMs: 300 }], dropouts: [] } };
+  const row = gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5];
+  assert.equal(row.status, "pass", row.text);
+  voice.routePreference = "auto";
+  assert.equal(gateSummary({ checks: { long: [structuredClone(COMPLETE.checks.long[0]), voice] } })[5].status, "fail");
+});
+
+test("gateSummary: a step number in the checklist is Session B's, and names the place on the page", () => {
+  const rows = gateSummary({});
+  const texts = rows.map((r) => r.text);
+  for (const t of texts) {
+    for (const m of t.matchAll(/step (\d+(?:\.\d+)?)/g)) {
+      const before = t.slice(0, m.index);
+      assert.ok(before.endsWith("Session B ") || / of this page/.test(t.slice(m.index, m.index + 30)), `${m[0]} in: ${t}`);
+    }
+  }
+  assert.equal(rows[4].text, "Press “Measure the delay” in step 3 of this page (Session B step 6).");
+  assert.equal(rows[7].text, "Restart Windows Audio (Session B step 9), then wait for a new line under Recoveries in step 2 of this page.");
+  assert.equal(rows[8].text, "Press “Connect only” in step 5 of this page (Session B step 10).");
+  assert.equal(rows[3].text, "Your note from Session B step 5: did Zoom's Test Mic play your voice back?");
+  assert.equal(gateSummary({ sanas: { ok: false } })[8].text, "Sanas did not accept the connection: see step 5 of this page.");
 });
 
 test("gateSummary: exactly 25 minutes in each phase, and a tone check of exactly 30 minutes, count", () => {
@@ -1487,30 +2036,70 @@ test("gateSummary: exactly 25 minutes in each phase, and a tone check of exactly
   assert.equal(rows[6].status, "todo");
 });
 
-test("gateSummary: with a noise gate the clicks row uses the buffer's slope, as the check's own verdict does", () => {
+test("gateSummary: with a noise gate the clicks row counts the holes seen as a lower bound, as the check's own verdict does", () => {
   const long = structuredClone(COMPLETE.checks.long);
-  const at = (micPath) => {
-    long[0].micPath = { ...micPath, noiseGate: true };
+  const at = (micPath, noiseGate = true) => {
+    long[0].micPath = { ...micPath, noiseGate };
     return gateSummary({ checks: { long } })[6];
   };
-  // Flat over 65 minutes with 3 holes: "slower" by the holes, but the slope is what counts.
+  const hides = " Your microphone's noise gate hides the clicks a slower clock makes: I decide with the details.";
+  // Flat over 65 minutes with 3 holes seen: the clock is not faster, and a slower one's other holes may hide in the
+  // gate's silence. 1.4 per 30 minutes is a lower bound: a note, never a pass, and never "about 0.0".
   const flat = micClock(readings(() => 20, 105, { minutes: 65 }), { holes: 3, durationSec: 3900 });
   let row = at(flat);
+  assert.equal(row.status, "note");
+  assert.equal(row.text, `The meeting's side: about 2.5 per 30 min; your microphone's side: not measured, at least 1.4 per 30 min (6 at most each).${hides}`);
+  // Without the gate the same holes are the whole count, and pass.
+  row = at(flat, false);
   assert.equal(row.status, "pass");
-  assert.ok(row.text.includes("your microphone's side: about 0.0 per 30 min"), row.text);
+  assert.ok(row.text.includes("your microphone's side: about 1.4 per 30 min"), row.text);
   // A result that kept only the spec's fields has its slope worked out again from its readings.
   const { slopePpm, slopeIsLowerBound, ...kept } = flat;
   assert.ok(Number.isFinite(slopePpm) && slopeIsLowerBound === false);
   row = at(kept);
-  assert.equal(row.status, "pass");
-  assert.ok(row.text.includes("your microphone's side: about 0.0 per 30 min"), row.text);
-  // Too few readings: not measured, as the check's own line says.
+  assert.equal(row.status, "note");
+  assert.ok(row.text.includes("your microphone's side: not measured, at least 1.4 per 30 min"), row.text);
+  // No hole seen: not measured.
+  row = at(micClock(readings(() => 20, 105, { minutes: 65 }), { holes: 0, durationSec: 3900 }));
+  assert.equal(row.status, "note");
+  assert.ok(row.text.includes(`your microphone's side: not measured (6 at most each).${hides}`), row.text);
+  // 17 holes seen (7.8 per 30 minutes): too many even as a lower bound.
+  row = at(micClock(readings(() => 20, 105, { minutes: 65 }), { holes: 17, durationSec: 3900 }));
+  assert.equal(row.status, "fail");
+  assert.equal(
+    row.text,
+    "The meeting's side: about 2.5 per 30 min; your microphone's side: at least 7.8 per 30 min (6 at most each). Run the comparison through the audio element (Session B step 7.6).",
+  );
+  // Too few readings: not measured, with or without holes (3 in 65 minutes: at least 1.4).
+  row = at(micClock(readings(() => 20, 108, { minutes: 4 }), { holes: 0, durationSec: 3900 }));
+  assert.equal(row.status, "note");
+  assert.ok(row.text.includes("your microphone's side: not measured (6 at most each)."), row.text);
   row = at(micClock(readings(() => 20, 108, { minutes: 4 }), { holes: 3, durationSec: 3900 }));
   assert.equal(row.status, "note");
-  assert.ok(row.text.includes("your microphone's side: not measured"), row.text);
-  // Faster: the drops from the slope count, not the holes too.
-  assert.equal(at(micClock(readings((t) => Math.min(60, 10 + 0.02 * t), 101), { holes: 14, durationSec: 3900 })).status, "pass");
+  assert.ok(row.text.includes("your microphone's side: not measured, at least 1.4 per 30 min"), row.text);
+  // Faster: a faster clock makes no holes, so the road is measured: the drops from the slope, plus the holes seen.
+  const faster = micClock(readings((t) => Math.min(60, 10 + 0.02 * t), 101), { holes: 0, durationSec: 3900 });
+  row = at(faster);
+  assert.equal(row.status, "pass", row.text);
+  assert.ok(row.text.includes(`your microphone's side: about ${(Math.round(faster.slopePpm * 1.8) / 10).toFixed(1)} per 30 min`), row.text);
+  assert.equal(at(micClock(readings((t) => Math.min(60, 10 + 0.02 * t), 101), { holes: 14, durationSec: 3900 })).status, "fail");
   assert.equal(at(micClock(readings((t) => Math.min(80, 10 + 0.08 * t), 102), { holes: 0, durationSec: 3900 })).status, "fail");
+});
+
+test("longVerdict and gateSummary: a microphone buffer that had already filled is not measured, never a pass", () => {
+  // 50 ppm faster (9 drops per 30 minutes), its buffer full from the first reading: the slope is flat.
+  const full = micClock(readings(h1(50, { ageSec: 1200 }), 221, { minutes: 65 }), { holes: 0, durationSec: 3900 });
+  const text = "The microphone's clock could not be measured: its buffer had already filled when the check began.";
+  const long = structuredClone(COMPLETE.checks.long);
+  for (const micZeroFraction of [0.001, 0.05]) {
+    const v = longVerdict(clean({ micPath: full, micZeroFraction }));
+    assert.ok(v.lines.includes(text), v.lines.join(" | "));
+    assert.ok(!v.lines.some((l) => l.startsWith("Clicks from your microphone's side")), v.lines.join(" | "));
+    long[0].micPath = { ...full, noiseGate: micZeroFraction >= LIMITS.NOISE_GATE_FRACTION };
+    const row = gateSummary({ checks: { long } })[6];
+    assert.equal(row.status, "note", row.text);
+    assert.ok(row.text.includes("your microphone's side: not measured"), row.text);
+  }
 });
 
 test("cable-check.js is pure: no clock, timer, console or DOM", () => {

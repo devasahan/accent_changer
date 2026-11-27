@@ -290,6 +290,7 @@ export class VoiceGraph extends EventTarget {
     this._micGen = 0;
     this._mutedCount = 0;
     this._unlockMs = null;
+    this._firstOpenedInMs = null; // how long the first start's microphone took to open (kept through reopens)
 
     this._snapshot = null;
     this._output = null;
@@ -354,6 +355,7 @@ export class VoiceGraph extends EventTarget {
     this._running = true;
     this._micHolesTotal = 0;
     this._unlockMs = null;
+    this._firstOpenedInMs = null;
     this._blockedError = null;
     this._stillTrying = null;
     this._unsubscribeDevices = onDeviceChange((snap) => this._onDevices(snap), { where: this._where });
@@ -523,6 +525,30 @@ export class VoiceGraph extends EventTarget {
     });
   }
 
+  /**
+   * The tone check: a new source node for the microphone, so that its buffer
+   * (H1) starts empty and the check's readings measure the microphone's clock
+   * from here. The buffer of the source made at the start or at the last
+   * rebuild may have filled long before the check: with a faster clock, or
+   * while rendering paused (setSinkId). Only while the test source feeds
+   * inBus: the meeting hears the tone, not the swap. Under the lock.
+   * → Promise<boolean>: true when micBus now has the new source (micGen + 1).
+   */
+  renewMicSource() {
+    return this._lock.run(async () => {
+      const gen = this._gen;
+      const stream = this.micStream;
+      if (!gen || gen.disposed || !gen.micBus || !gen.testNode || !stream) return false;
+      try {
+        this._connectMicSource(gen, stream);
+        return true;
+      } catch (err) {
+        this._log("warn", `mic source renew failed ${nameOf(err)}`);
+        return false;
+      }
+    });
+  }
+
   /** Step 4/7: the converted voice into the processor's input 1. Kept across rebuilds. */
   setConvertedSource(stream) {
     this._convertedSource = stream ?? null;
@@ -673,8 +699,16 @@ export class VoiceGraph extends EventTarget {
     return this._recovery.log;
   }
 
+  /**
+   * The first start: { ms, attempts, steps, openedInMs, unlockMs }, or null
+   * until it is done. openedInMs and unlockMs are that start's own (the
+   * microphone's open, the label unlock): a later reopen (after a fault, a
+   * stand-in, a change) never replaces them, so a slow first open, the hint
+   * of a permission prompt, stays in the results.
+   */
   get startRecord() {
-    return this._recovery.startRecord;
+    const r = this._recovery.startRecord;
+    return r ? { ...r, openedInMs: this._firstOpenedInMs, unlockMs: this._unlockMs } : null;
   }
 
   /**
@@ -850,6 +884,7 @@ export class VoiceGraph extends EventTarget {
         const ms = Math.round(a.kind === "back" ? r.outageMs : r.ms);
         let line = `${head} ${ms} ms ${r.attempts} attempts steps ${(r.steps ?? []).join(",")}`;
         if (a.kind === "started") {
+          this._firstOpenedInMs = this._mic?.openedInMs ?? null;
           line += ` unlock ${this._unlockMs ?? "-"} ms mic opened in ${this._mic?.openedInMs ?? "-"} ms`;
         }
         if (a.kind === "back") line += ` app ${r.appMs ?? "-"} ms wait ${r.waitMs ?? "-"} ms micToo ${Boolean(r.micToo)}`;

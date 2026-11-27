@@ -282,7 +282,7 @@ test("fault: the mic ends → reopen-mic; a context error during it → a rebuil
   assert.equal(record.cause, "mic-ended");
 });
 
-test("fault: transient failures retry every 250 ms, then every second after 15 s", () => {
+test("fault: transient failures retry every 250 ms, then every second after a minute", () => {
   const r = running();
   r.event(ev.closed, 0);
   assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 100), [retryIn(250)]);
@@ -290,19 +290,21 @@ test("fault: transient failures retry every 250 ms, then every second after 15 s
   assert.deepEqual(r.event(ev.fail("rebuild", named("InvalidStateError")), 400), [retryIn(250)]);
   assert.deepEqual(r.event(ev.retry, 650), [rebuild(false)]);
   assert.deepEqual(r.event(ev.fail("rebuild", named("TimeoutError")), 700), [retryIn(250)]);
-  r.event(ev.retry, 14000);
-  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 14999), [retryIn(250)]);
   r.event(ev.retry, 15100);
-  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 15200), [retryIn(1000)]);
+  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 15200), [retryIn(250)], "a slow Windows Audio restart: still fast");
+  r.event(ev.retry, 59000);
+  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 59999), [retryIn(250)]);
+  r.event(ev.retry, 60100);
+  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 60200), [retryIn(1000)]);
   assert.equal(r.phase, "waiting");
 });
 
-test("fault: the fast retries end exactly 15 s after the loss", () => {
+test("fault: the fast retries end exactly a minute after the loss", () => {
   const r = running();
   r.event(ev.closed, 0);
   r.event(ev.fail("rebuild", sinkError("transient")), 100);
-  r.event(ev.retry, 14900);
-  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 15000), [retryIn(1000)]);
+  r.event(ev.retry, 59900);
+  assert.deepEqual(r.event(ev.fail("rebuild", sinkError("transient")), 60000), [retryIn(1000)]);
 });
 
 test("fault: with only the context to rebuild, the cable back is enough (the microphone is not needed)", () => {
@@ -919,6 +921,25 @@ test("Windows Audio restart without devices events (back after 2.7 s): Windows' 
   assert.equal(record.waitMs, 250);
   assert.equal(record.attempts, 11);
   assert.deepEqual(restartVerdict(record), { verdict: "pass", text: "pass (Windows itself took about 2.7 s)" });
+});
+
+test("Windows Audio restart without devices events that takes 16 s or 30 s: the app's part is still one fast retry", () => {
+  // README step 9 allows up to 30 s. With a 1 s retry after 15 s, waitMs was always ~1000 ms and
+  // appMs + waitMs > RESTART_APP_MS: the row failed however quickly the app rebuilt.
+  for (const [backAt, firstOk, text] of [
+    [16000, 16210, "pass (Windows itself took about 16.2 s)"],
+    [30000, 30010, "pass (Windows itself took about 30.0 s)"],
+  ]) {
+    const { r, t } = restartWithoutDevices(backAt);
+    assert.equal(t, firstOk);
+    r.event(ev.ok("rebuild"), t + 190);
+    const record = r.event(ev.heartbeat, t + 270)[1].record;
+    assert.equal(record.serviceBackAtMs, firstOk);
+    assert.equal(record.appMs, 270);
+    assert.equal(record.waitMs, 250);
+    assert.equal(record.micToo, true);
+    assert.deepEqual(restartVerdict(record), { verdict: "pass", text });
+  }
 });
 
 test("recovery.js is pure: no clock, timer, console or DOM", () => {

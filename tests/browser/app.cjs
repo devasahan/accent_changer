@@ -1496,6 +1496,8 @@ async function longTone(app) {
   check(L.phases?.hiddenSec >= 3 && L.phases?.hiddenSec <= 7, "the hidden phase is counted (about 5 s)", json(L.phases));
   const readings = L.micPath?.readings ?? [];
   check(readings.length >= 1 && readings.every((x) => Math.abs(x.lagMs) <= 40), "the microphone's buffer was read", json(readings));
+  check(L.micPath?.renewed === true && L.micPath?.fullAtStart === false, "the tone check read it from a new microphone source", json(L.micPath));
+  note(`microphone buffer readings: ${json(readings)}`);
   check(Array.isArray(L.renderPauses) && L.renderPauses.length === 0, "no rendering pauses", json(L.renderPauses));
   check(L.verdict === "fail" && L.reasons.some((x) => /sound stopped/.test(x)), "the gap fails the check", json(L.reasons));
   note(`ticks per 30 min: tone ${L.tonePath?.ticksPer30Min}, microphone ${L.micPath?.ticksPer30Min} (not asserted: fake clocks)`);

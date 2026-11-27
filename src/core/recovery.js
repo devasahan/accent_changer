@@ -13,9 +13,12 @@
  * heartbeat of a routed generation arrives (the meter worklet's message, made
  * on the audio thread), so a context that says "running" but plays nothing
  * is caught. Recovery never gives up: it retries every 250 ms for the first
- * 15 s of an outage, then every second, and at once when the devices come
- * back. Timers are backstops only: device events, heartbeats and errors
- * arrive as events and are never throttled in a hidden window.
+ * minute of an outage, then every second, and at once when the devices come
+ * back. The fast minute covers a slow Windows Audio restart (its device list
+ * stays, so only a retry notices it is back): the Gate 1 row counts one retry
+ * interval of waiting against the app, and one second would fail it whatever
+ * the app did. Timers are backstops only: device events, heartbeats and
+ * errors arrive as events and are never throttled in a hidden window.
  *
  * Every fault outage is logged with its timings, so the Gate 1 row "Windows
  * Audio restart: voice back within 2 s" can tell Windows' own restart time
@@ -29,7 +32,7 @@ import { redact } from "./redact.js";
 export const RECOVERY_DEFAULTS = Object.freeze({
   verifyMs: 600, // after an op resolves, a heartbeat of a routed generation must arrive within this
   fastRetryMs: 250, // retry interval during the first fastWindowMs of an outage …
-  fastWindowMs: 15000,
+  fastWindowMs: 60000, // a Windows Audio restart that takes long still gets the fast retries (README: up to 30 s)
   slowRetryMs: 1000, // … then this, forever
   startBusyRetryMs: 5000, // first start only: the mic is held by another app (NotReadableError)
   waitBackstopMs: 2000, // first start only: no mic / no cable yet; a devices event usually comes first
