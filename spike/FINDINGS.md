@@ -1,6 +1,6 @@
 # Step 0 findings: is Sanas good enough?
 
-Status: **documentation checks done; the probe has been reviewed, fixed and extended to compare Sanas with two ready-made apps; laptop measurements pending.** The checklist and the decision rule at the bottom decide what happens next.
+Status: **documentation checks done; the probe has been reviewed, fixed and extended to compare Sanas with two ready-made apps; laptop measurements pending, for your voice and for your friend's.** The checklist and the decision rule at the bottom decide what happens next.
 
 ## What the Sanas docs say (read 2026-11-26)
 
@@ -47,7 +47,7 @@ Both need no build. If one of them beats Sanas cloud on your laptop, you can use
 | Unknown until measured | Delay and CPU load on your laptop; whether the trial includes conversion of your own voice | Real delay and CPU load |
 | Your earlier use | none | Before this test, on this laptop with a Bluetooth headset: the accent sounded very good, but it felt heavy, your voice sometimes cut off, and your lips didn't match your words (no video delay) |
 
-Your NVIDIA T1200 GPU doesn't change this. All three run their accent model in the cloud or on the CPU. No open-source model converts an accent live while keeping your voice: the live voice tools change only whose voice it sounds like, and the accent models run offline only.
+Your laptop's graphics chip doesn't change this. All three run their accent model in the cloud or on the CPU. No open-source model converts an accent live while keeping your voice: the live voice tools change only whose voice it sounds like, and the accent models run offline only.
 
 A Bluetooth headset explains part of your earlier Krisp problems: in call mode it lowers the sound quality both ways, can drop out, and adds a delay of its own that varies, which no fixed video delay can match. So Part 2 tests Krisp with a wired or USB headset: the read-aloud run counts the cut-offs (gaps) and measures the delay for OBS, and the CPU check shows how heavy it is.
 
@@ -81,6 +81,7 @@ A Bluetooth headset explains part of your earlier Krisp problems: in call mode i
   - This page's own address is a check that must pass.
   - An unlisted address is a check that must fail.
   - Otherwise the result says "inconclusive", and the app's own test (Step 1) decides.
+- **Whose voice** (step 1): yours or your friend's (README, Part 1, "Your friend's voice test"). Each person has their own remembered script and model name. The page always opens on yours, and the choice can change only on a page that holds no recording, run or note, so one results file holds one voice. The file says whose (`speaker`: `you` or `friend`, also in every run's `settings`; schema 4), and your friend's files are named `sanas-check-friend-…`.
 - **Your rating** per sentence and per run: natural, still your voice, every word right, sounds American. A line counts only with all four. A run nobody rated has `rated: false` and no score, not 0/10.
 - **Blind listener** per run: the lines played (5 by default, different lines for each run), and how many of them a friend heard with every word right, how many sound like you, and how many sound American.
 
@@ -99,16 +100,23 @@ Known limit: when the delay changes partway through one sentence, for example wh
 
 ## Go / no-go checklist
 
-GO needs every row to pass (from the plan).
+GO needs every row to pass (from the plan). The delay, gaps and listening rows are judged for each voice, yours and your friend's:
+
+- **A voice passes** when, at one sample rate (the one the app will use for that person), its runs that did not drop pass the delay, gaps and listening rows.
+- **A dropped run** is noted and run again, not counted.
+- **Stability and the quiet test** belong to the connection, not the voice, so they count once.
+
+Normally both voices must pass. "Both voices", below the tables, says what happens when only one does: it can still be GO if that one is your friend's.
 
 | Check | Pass | Fail | Result |
 |---|---|---|---|
 | Individual sign-up | key within ~3 days | sales/company only | ✅ self-serve per docs (confirm on sign-up) |
 | Terms | personal use allowed, nothing forbids this use | forbidden, or you reject the data terms | ✅ website terms allow personal use; read console terms |
 | Usable from a desktop JS app | browser SDK or WebSocket/WebRTC API | enterprise only | ✅ Browser SDK (MIT) |
-| Delay median / p95 | ≤ 380 / 480 ms (best ≤ 300 / 380) | worse | ⏳ |
-| Gaps in speech (3 runs) | ≤ 1 per run | more | ⏳ |
+| Delay median / p95 (each Sanas run that counts, for each voice) | ≤ 380 / 480 ms (best ≤ 300 / 380) | worse | ⏳ |
+| Gaps in speech (each Sanas run that counts, for each voice) | ≤ 1 per run | more | ⏳ |
 | Listening test (your 15 sentences) | ≥ 8/10, a line counting only if natural, your voice, every word right and American (6–7 = your call) | ≤ 5/10 or words mangled | ⏳ |
+| Listening test (your friend's 15 sentences, rated by them) | the same bar: ≥ 8/10, a line counting only with all four boxes ticked (6–7 = their call, in the Notes of their results file) | ≤ 5/10 or words mangled | ⏳ (their voice test) |
 | Price | ≤ $0.05/min | more | ✅ $0.009/min |
 | Stability (65 min) | no drop and no silent loop; reconnect ≤ 5 s | drops with no recovery | ⏳ |
 | Quiet test (15 min) | after at least 14 min of silence (`silenceLongestSec` ≥ 840; the page rounds minutes down, so it shows at least 14.0 min), the converted voice comes back within about 6 s of speaking again, by the second 3-s look (`convertedBackAfterSec` ≤ 6.5) | later, never, or the call drops; a shorter silence is no test: redo it | ⏳ |
@@ -121,13 +129,25 @@ Also recorded. These decide how the app is built, not GO / NO-GO:
 | Region: `sanas.sipHosts` and `webrtc.remote` in the results file (Mumbai is nearer than Ohio) | ⏳ |
 | AT5.2 bandwidth at 48 kHz (`bandwidthSigHz`) | ⏳ |
 
-## Decision rule: build our app, or use a ready-made one?
+**Both voices.** Your friend is the app's main user, so their voice test decides as much as your runs do. Until it is done, a GO from your runs alone is provisional: the build goes on meanwhile, as you chose, and a NO-GO after their test loses that work. If only one voice passes, that person gets one more sitting first, with the other model name (`_Masculine` / `_Feminine`) if the Console shows both:
 
-Build the rest of our app (plan Steps 2 and 4–9) only if Sanas cloud passes the GO checklist above **and** one of these holds:
+- for your friend, their voice test again (README, Part 1, "Your friend's voice test", steps 1 to 9, with that other model name in its step 3: about 45 minutes, about $0.05);
+- for you, two runs at the sample rate the app would use for you, as in Part 1, steps 3.3 to 3.7, with that other model name in step 3.5 (about 30 minutes, about $0.03).
+
+If it fails again:
+
+- **Only your friend's voice passes:** GO, because the app is mainly for your friend: our app is then the one for your friend, as the decision rule below says. In your own interviews, use a ready-made app that passes the bar in [INTERVIEW.md](../INTERVIEW.md) (a paid plan once its free trial has ended), or no tool.
+- **Only your voice passes:** NO-GO for the app as planned, because it is mainly for your friend. Your friend tries the ready-made apps with their own voice (Part 2's way, with their own trials; on their own PC that needs Node.js, this code and about 2 hours), and you decide with me whether the app is still worth finishing for you alone.
+
+## Decision rule: our app, or a ready-made one?
+
+You chose to build the rest of our app (plan Steps 2 and 4–9) now, while these tests run. Our app is the one to use only if Sanas cloud passes the GO checklist above **and** one of these holds (Part 2, with your voice, is the yardstick):
 
 1. It rates at least as well as the best ready-made app, with at most about 100 ms more delay. "Rates" means your score and the blind listener's counts (every word right, sounds like you, and sounds American). Count our app's own path in that delay.
 2. After hearing both, you still prefer our own app, for cost or lightness.
 3. The ready-made apps are unavailable, too expensive, or their terms don't allow this use.
+
+**If only your friend's voice passed** ("Both voices" above), items 1 and 2 are judged for your friend, not for you: item 1 compares Sanas cloud with a ready-made app tried with their voice, by their score, and is skipped if they haven't tried one; item 2 is their preference. With item 1 skipped, our app is the one for your friend. Your own interviews follow [INTERVIEW.md](../INTERVIEW.md).
 
 An app on the laptop whose usual total CPU (not a spike) is above about 60 % in a Zoom video call, with the app on, counts as worse (Sanas's own guidance).
 
@@ -135,4 +155,4 @@ Before a ready-made app is used in a real interview, it must also pass the bar i
 
 Otherwise use the winner directly. For lip sync, set OBS "Video Delay (Async)" to its measured delay (INTERVIEW.md, section 3). Wrapping it in our app would only add delay.
 
-Decision: **pending** the laptop runs.
+Decision: **pending** your laptop runs and your friend's voice test. A GO before their test is provisional.

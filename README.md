@@ -13,18 +13,19 @@ Results so far: [spike/FINDINGS.md](spike/FINDINGS.md).
 ## What to do, in order
 
 1. **Part 1, now:** test Sanas cloud with this page. It takes about 2 hours of your time over 2–3 sittings, plus about 1 h 20 min of runs you don't need to watch, and about $1 of Sanas credit.
-2. **Part 2, 5–6 days before your interview** (about 2 hours): try Krisp and the Sanas desktop app with the same page, and ask a friend for a short blind listening test.
-3. **Your interview:** follow [INTERVIEW.md](INTERVIEW.md) with the app that passes its bar. Our own app can't be ready in time.
+2. **Your friend's voice test, after your first Part 1 sitting** (about 45 minutes with your friend, and about $0.05 of Sanas credit): [Your friend's voice test](#your-friends-voice-test-about-45-minutes) below. Your friend is the app's main user, so Sanas must convert their accent well too: the decision waits for this test.
+3. **Part 2, any time after Part 1** (about 2 hours): try Krisp and the Sanas desktop app with the same page, and ask a friend who knows your voice for a short blind listening test. It is the yardstick for Sanas cloud and our app. It uses up both apps' free trials, so read "An interview before our app is ready?" below this list first.
 4. **When I say the app's test build is ready** (about 15 minutes, any day): [Session A2](#session-a2-try-the-apps-test-build-about-15-minutes) below.
 5. **When I say the Session B build is ready** (about 2¼ hours in all, about 80 minutes of it with you; about 35 minutes more if its step 7.6 is needed): [Session B](#session-b-your-voice-into-the-meeting-2-to-3-hours) below.
-6. **Send me the results file** after every sitting.
+6. **Send me the results file** after every sitting (your friend's file only with their agreement).
+7. **Later, on your friend's PC:** nothing to do yet. [Later, on your friend's PC](#later-on-your-friends-pc) below says what they will need.
 
 Two rules for every sitting with the test page (Parts 1 and 2; the app in Sessions A2 and B has **Copy results** instead):
 
 - **Download results (JSON) before you close the page.** Runs, ratings and notes live only in the open page. Each file has its own time stamp, so send all of them.
-- **Keep the page open in its own tab until you have downloaded.** Don't reload it, and open other sites (Zoom, Meet) in a new tab (Ctrl+T). The page remembers your script text, model name, sample rate and devices, but not your recording, runs, ratings or notes. Once it holds any of them, Edge asks "Leave site?" or "Reload site?" every time you leave or reload the page, even right after a download. If a step is still running, choose **Cancel**. If you changed anything since you last downloaded the results (a run, a rating, a blind-test count or a note), choose **Cancel** and download first. Otherwise choose **Leave** (or **Reload**).
+- **Keep the page open in its own tab until you have downloaded.** Don't reload it, and open other sites (Zoom, Meet) in a new tab (Ctrl+T). The page remembers your script text and model name (your friend's apart from yours), the sample rate and devices, but not your recording, runs, ratings or notes. Once it holds any of them, Edge asks "Leave site?" or "Reload site?" every time you leave or reload the page, even right after a download. If a step is still running, choose **Cancel**. If you changed anything since you last downloaded the results (a run, a rating, a blind-test count or a note), choose **Cancel** and download first. Otherwise choose **Leave** (or **Reload**).
 
-The free trials last 7 days each. Starting them 5–6 days before the interview means they still run on interview day.
+**An interview before our app is ready?** Only then follow [INTERVIEW.md](INTERVIEW.md) with a ready-made app: it says when to start Part 2, so that its 7-day free trials still run on the interview day (and what an app costs if you already did Part 2), and when an app is good enough to use.
 
 ## Before you start (once)
 
@@ -78,22 +79,60 @@ The free trials last 7 days each. Starting them 5–6 days before the interview 
    11. **Download results (JSON)** and send me the file. It has no audio. It holds:
        - the measurements, your ratings and your notes;
        - the settings, with your device names;
-       - the browser version, and the script text if you changed it;
+       - the browser version, whose voice it is, and the script text if you changed it;
        - the address check and the page log.
 
        The WAV download is your own voice: keep it on your PC.
 4. Stop the server with Ctrl+C.
 
-## Part 2: compare the ready-made apps (5–6 days before your interview)
+### Your friend's voice test (about 45 minutes)
+
+Your friend is the app's main user, so Sanas must convert **their** accent well too, not only yours: the decision in [spike/FINDINGS.md](spike/FINDINGS.md) waits for this test. It runs on your laptop with your Sanas key. You start the server and work the page; your friend only reads and rates, and never sees or gets your key. It uses about 6 minutes of Sanas time, about $0.05 of your credit.
+
+Do it once you have done Part 1's steps 3.1 to 3.7 yourself, so you know the page: at the end of one of your sittings, or in a sitting of its own. In a Part 2 sitting, finish Part 2 first, including its blind test (step 5) and its download (step 6): the reload in step 1 below throws away the sound the blind test plays.
+
+**Before the sitting:**
+- **Ask your friend first.** Tell them that their voice goes through Sanas cloud on your account (Sanas says it is processed live and not stored: see [Privacy](#privacy)), that their 15 lines stay in Edge on your laptop until you remove them, and that the results file (their lines, no audio) comes to me. Go ahead only if they agree.
+- Ask your friend to write their own 15 lines, as in Part 1, step 3.2: their name, their past employers, their tech stack, and the phrases they will really say in interviews. They send them to you in a message, so you can copy them.
+- **A headset, wired or USB, never Bluetooth:** yours, with its ear cushions wiped, or your friend's own wired or USB one.
+- If step 1 of the page has no **Whose voice**, first stop the server if it is running (Ctrl+C in its window). Then download the code again as in [Before you start](#before-you-start-once), step 2 (or from the link I send), into a new folder. Open a terminal in that folder (step 3 there) and start the server from it, the same way as before (with `--port 8090` if you used that). Use this new folder from now on. This takes about 15 minutes more. The page still remembers your own script.
+
+1. **Before your friend sits down: the server and the page** (5 min).
+   - If the page is still open from your own sitting: press **Download results (JSON)**. If you stopped the server, start it again (Part 1, step 2). Then reload the page (F5) and choose **Reload**.
+   - Otherwise start the server as in Part 1, step 2, paste your key, and open http://localhost:8080/spike/.
+   - Either way, press **Allow microphone**. Then copy any word (select a word on this page and press Ctrl+C), so that your key is no longer on the clipboard: a Ctrl+V later must not paste it.
+2. **Whose voice** (1 min). In step 1 of the page, set **Whose voice** to **Your friend's**. Step 2 of the page now says "Your friend's script" and shows the example script (or your friend's lines from an earlier sitting). If it shows your own lines, Whose voice is still **Yours**. Your own script and model name stay saved: the page opens on **Yours** every time. If the page is reloaded during the sitting, set **Your friend's** again.
+3. **Their script and model name** (5 min). Open your friend's message on this laptop (if it is on a website, in a new tab: Ctrl+T), select their 15 lines and press Ctrl+C. Then click in step 2's box, press Ctrl+A, then Ctrl+V. Check that there are 15 lines. In step 1, type the model name for your friend's voice: if the Console showed `AT5.2_Masculine` and `AT5.2_Feminine`, the one that matches their voice (unless I ask you for a retest with the other one); otherwise the name you use. Press **Connect to Sanas**.
+4. **The headset** (3 min). If it is your friend's own: plug it in and make its headphones the default playback device: press Windows key + R, type `mmsys.cpl` and press Enter → **Playback** → right-click their headset → **Set as Default Device** → **OK**. Then pick it in step 1 of the page as the microphone and the headphones. Your friend puts the headset on.
+5. **Record** (5 min). Press **Record**. Your friend reads the whole script in one take, with about one second of pause between lines. Then press **Stop**.
+6. **Baseline, only with your friend's own headset** (2 min, free). Pick the **Mock** engine, press **Run** once, then switch back to **Sanas**. With your headset, skip this: your own baseline from Part 1 counts.
+7. **Two runs, each rated right after it** (about 20 min):
+   1. Set Sample rate to **16 kHz** and press **Run**.
+   2. Your friend rates it in step 4 of the page: for every line, they play **▶ converted** (and **▶ original** if they like), and tick a box only if it really is true: sounds natural, still my voice, every word right, sounds American. The ratings are theirs: let them tick the boxes, or tick exactly what they say.
+   3. Set Sample rate to **48 kHz**, press **Run**, and your friend rates it the same way.
+
+   If a run says it "dropped the call", press **Run** again at the same sample rate, and your friend rates the new run. If a run's **Score** in step 4 is from 6.0 to 7.9, ask your friend whether they would use it in an interview as it is, and type their answer in **Notes** (for example "16 kHz: yes").
+8. **Live** (3 min). Press **Start live**. Your friend talks for a minute and hears their converted voice, a little late. Then press **Stop**.
+9. **Save** (3 min).
+   1. In **Notes**, type anything else your friend noticed.
+   2. Press **Download results (JSON)**: the file's name starts with `sanas-check-friend-`, and inside it says that it holds your friend's voice. Don't download a WAV: that would be your friend's voice.
+   3. Close the page's tab. Edge asks "Leave site?": you have downloaded, so choose **Leave**. Then stop the server with Ctrl+C.
+   4. If your friend used their own headset: unplug it, and make your headset's headphones the default playback device again (as in step 4: `mmsys.cpl` → **Playback** → right-click your headset → **Set as Default Device**). The next time you open the page, pick your headset in its step 1.
+
+**Send me the file:** your friend agreed to that before the sitting. It has no audio, but it holds their script, with their name and past employers. The next time you open the page, it is back on **Yours**, with your own script and model name. Its Sample rate stays on the last one your friend's test used (48 kHz): check it in step 1 of the page before your next run.
+
+## Part 2: compare the ready-made apps (any time after Part 1)
+
+Part 2 is the yardstick: it measures Krisp and the Sanas desktop app on your laptop the same way as Sanas cloud, with your voice. Do it any time after Part 1. Part 2 starts both free trials, and a free trial can usually be used only once: after them, using Krisp or the Sanas desktop app in an interview means paying. Krisp is about $15–30 a month for a plan whose daily minutes cover a 90-minute interview (its $8–16 plan gives only 1 hour a day; prices not checked). The Sanas desktop app's price after its trial is not published. If you want to use one of these apps in an interview before our app is ready, time Part 2 as [INTERVIEW.md](INTERVIEW.md) says, so that the trials still run on the interview day.
 
 **Any day before Part 2 (10 minutes):** open both trial sign-up pages without starting a trial. Note:
 - what each asks for (a card? a work email? a sales call?);
-- the price after the trial;
+- the price after the trial, and how many minutes a day of accent conversion each paid plan gives;
 - how many minutes a day of accent conversion the trial gives.
 
 If a card is needed, set a reminder to cancel.
 
-Do Part 2 in **one sitting, without reloading the page**. The page keeps the sound of only the last 6 runs, and only while it stays open; your friend listens to them at the end.
+Do Part 2 in **one sitting, without reloading the page**. The page keeps the sound of only the last 6 runs, and only while it stays open; the listener in step 5 hears them at the end.
 
 1. **Install and start both trials:**
    - **Sanas desktop app:** go to [sanas.ai/get-sanas](https://www.sanas.ai/get-sanas). For the number of agents choose 0–49, then **Start your 7-day trial**. Install it.
@@ -119,23 +158,23 @@ Do Part 2 in **one sitting, without reloading the page**. The page keeps the sou
       - A delay far below the app's own claim (Krisp says about 200 ms) is a warning sign.
    5. Rate the run in step 4.
    6. **Write down the app's delay** (Delay ms, in step 3's table) in the Notes box and on paper: OBS needs it later. A red number in that table fails the bar in INTERVIEW.md.
-   7. **CPU check,** with the charger plugged in and Power mode on **Best performance**, as on the interview day. Set it while plugged in: on Windows 11, Windows Settings → System → **Power & battery** → Power mode; on Windows 10, click the battery icon at the right of the taskbar and drag the slider to **Best performance**. Then:
+   7. **CPU check,** with the charger plugged in and Power mode on **Best performance**, as in an interview. Set it while plugged in: on Windows 11, Windows Settings → System → **Power & battery** → Power mode; on Windows 10, click the battery icon at the right of the taskbar and drag the slider to **Best performance**. Then:
       1. Open zoom.us/test **in a new tab** (Ctrl+T), join the test call with video, and pick the app's microphone in Zoom.
       2. Talk for 2 minutes.
       3. Note the usual **Utilization** in Task Manager → Performance → CPU, not a short spike.
       4. Turn the app's accent conversion off and note it again.
 
       Write both in Notes, for example "Krisp: 35 % (off: 25 %)".
-5. **Blind test with a friend** (about 15 minutes). Ask a friend who knows your voice and who was out of the room while you read. Play three runs: the Sanas cloud run and one read-aloud run of each app. If you read an app more than once (or did the Sanas cloud run twice), the picker shows those runs under the same app name: play only the last one, the one with the highest Run number. Start with an app run, not the Sanas cloud run. For each of the three runs, in turn:
+5. **Blind test with a friend** (about 15 minutes). Ask a friend who knows your voice and who was out of the room while you read. Your friend, the app's main user, can be that listener: then do [their voice test](#your-friends-voice-test-about-45-minutes) after step 6. Play three runs: the Sanas cloud run and one read-aloud run of each app. If you read an app more than once (or did the Sanas cloud run twice), the picker shows those runs under the same app name: play only the last one, the one with the highest Run number. Start with an app run, not the Sanas cloud run. For each of the three runs, in turn:
    1. Pick the run in step 4 under **Run to rate and play**.
    2. Play 5 lines with the small **▶ converted** buttons, not the big ▶ Converted button (that one plays the whole run). Use lines 1–5 for the first run you play, 6–10 for the second, and 11–15 for the third. Don't show the script.
-   3. Your friend says what they heard, whether it sounds like you, and whether it sounds American.
+   3. They say what they heard, whether it sounds like you, and whether it sounds American.
    4. Enter **Lines played**, then the counts: every word right, sound like you, sound American.
 
    Do the blind test before redoing any run, and check that the picker still lists the three runs you will play.
 6. **Download results (JSON)** and send it to me.
 
-Then go to [INTERVIEW.md](INTERVIEW.md): it says when an app is good enough to use, and how to set it up. I'll also tell you from your results.
+I'll tell you from your results how Sanas cloud compares with the two apps. For an interview before our app is ready, [INTERVIEW.md](INTERVIEW.md) says when an app is good enough to use, and how to set it up.
 
 ## Session A2: try the app's test build (about 15 minutes)
 
@@ -231,6 +270,21 @@ Do this when I tell you the Session B build is ready. It takes about 2¼ hours i
 5. **Do Session B steps 6, 7 and 8 above on that page**, with three changes. In step 7.2, open Meet in a new Edge window (Ctrl+N), not in a new tab. Edge has no Hide: in step 7.3, minimize the window with the test page and set the timer to 65 minutes, and skip step 7.4. When the timer rings, open that window again and go on with step 7.5. The checklist judges an Edge run on the time the page was not on screen, because Edge can't tell minimized from hidden.
 6. **Press Copy results** on that page and paste them into your message, under the app's. Then close the test page's window (while it is open, it too sends your microphone into CABLE Input), stop the server with Ctrl+C, and set the sleep setting back.
 
+## Later, on your friend's PC
+
+Nothing to do yet. When the app is finished, your friend installs it on their own Windows PC, with a full guide for them that comes with the finished app. Settings are kept per PC, so nothing from your laptop carries over. Their PC and connection are checked again then: the delay and gaps measured so far, in your friend's voice test too, are your laptop's. What they will need:
+
+- **Their own Sanas account and API key,** never yours: each of you keeps your own key and never sends it to anyone, me included. As in Part 1, step 1: a personal Google account, a key with a **1-year** expiry, the app's addresses under **Allowed origins** (the guide lists them), and a monthly spend cap.
+- **A wired or USB headset,** not Bluetooth.
+- **Windows 10 or 11.**
+- **VB-CABLE,** the free virtual cable.
+- **The app's installer.**
+- **OBS Studio,** if their camera is on in interviews: it delays the video to match the converted voice, as in [INTERVIEW.md](INTERVIEW.md), section 3.
+- **About 2–3 hours** for the install and its checks, like Sessions A2 and B.
+- **INTERVIEW.md's steps, with our app:** ask first, the rehearsal, and the day itself. The guide adapts them.
+
+Before that, I'll ask for a screenshot of Task Manager → Performance → CPU on their PC, so the app suits it. You pass it on to me in a message; it never goes into this repo.
+
 ## Troubleshooting
 
 | You see | Do this |
@@ -248,8 +302,10 @@ Do this when I tell you the Session B build is ready. It takes about 2¼ hours i
 | "The browser blocked the microphone for this page" | Click the icon left of the address bar → Permissions for this site → Microphone → Allow, then reload. The setting is per port: after `--port 8090`, allow it again. |
 | "Windows blocked the microphone" or no microphones listed | Windows Settings → Privacy & security → Microphone: allow access, including "Let desktop apps access your microphone", then reload the page. |
 | "Sanas answered, but no audio connection came up" | A firewall or VPN is blocking WebRTC (UDP). Try without the VPN, or on another network. |
-| A run reports "dropped the call" | The connection to Sanas broke during the run. Note the time; if it happens again, try another network. |
+| A run reports "dropped the call" | The connection to Sanas broke during the run. Note the time, and press **Run** again at the same sample rate: a dropped run doesn't count. If it happens again, try another network. |
 | Run (step 3) or Start (step 6) is grey | Record the script first (step 2). A reopened page has the text but no recording. |
+| **Whose voice** is grey | The page holds a recording, runs or notes. Press **Download results (JSON)**, then reload the page (F5) and choose **Reload**. It is also grey while a step runs. |
+| Your own script was replaced by your friend's lines | They were pasted while **Whose voice** was **Yours**. If **Whose voice** is grey (your friend already recorded or ran, or Notes has text), press **Download results (JSON)** and tell me that this file holds your friend's voice; then reload the page (F5) and choose **Reload**. Set **Whose voice** to **Your friend's** and start again from step 3 of [Your friend's voice test](#your-friends-voice-test-about-45-minutes). Later, under **Yours**, type your own model name again if it changed. Then tell me: your own script is in your earlier results files, and I send it back for you to paste under **Yours**. |
 | Edge asks "Leave site?" or "Reload site?" | It asks every time, even right after a download. If a step is still running, choose **Cancel**. If you changed anything since you last downloaded the results (a run, a rating, a blind-test count or a note), choose **Cancel** and download them first: leaving loses the runs, ratings, notes and recording. Otherwise choose **Leave** (or **Reload**). |
 | Step 4 shows far fewer lines than your script has | You paused too briefly between lines: record or read again with about one second of pause. |
 | Step 7: the other microphone "is silent" or "stayed silent" | The app must be running, with your headset as its microphone and accent conversion on. Some apps convert only while a call app uses their microphone: the page counts as one. |
@@ -267,6 +323,7 @@ Do this when I tell you the Session B build is ready. It takes about 2¼ hours i
 ## Privacy
 
 - **API key, test page (Parts 1 and 2):** only in the test server's memory. It never reaches the browser, the disk or the logs.
+- **Your friend's voice test:** it runs on your key, in the test server's memory; your friend never sees or gets it. The page keeps your friend's script and model name in Edge on your laptop, apart from yours. To remove them, set **Whose voice** to **Your friend's** and delete all of step 2's text and the model name. Their results file holds their script (their name and past employers), but no audio.
 - **API key, app (Session A2):** you paste it once into the app's page. The app checks it with Sanas and keeps it in Windows Credential Manager until you press **Remove key**. It is never written to the app's log or to the results; the page shows only its last 4 characters.
 - **Session B results and log:** they hold no device ids. Device names are hidden, except VB-CABLE's own names and Windows' generic ones such as "Headset Microphone". The log holds state names, codes, timings and short error sentences: never a device name, a device id, a key or a token.
 - **Session B settings, on this PC only:** the microphone and the output you pick in step 2 of the app's page are kept, with their Windows names and ids, in `%LOCALAPPDATA%\io.github.devasahan.accentchanger\settings.json` (in Edge dev mode, in Edge's storage for the page). They never leave the PC and are not in the results or the log. Uninstalling with **Delete the application data** removes them, the log, and the microphone permission the app keeps in its own WebView2 folder there.
