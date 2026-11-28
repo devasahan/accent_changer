@@ -16,6 +16,15 @@
   <main>
     <section id="s-setup">
       <h2>1 · Setup</h2>
+      <p class="row">
+        <label class="inline">Whose voice
+          <select id="speaker" autocomplete="off">
+            <option value="you">Yours</option>
+            <option value="friend">Your friend's</option>
+          </select>
+        </label>
+        <span id="speakerInfo" class="hint"></span>
+      </p>
       <div class="grid">
         <label>Engine
           <select id="engine">
@@ -63,7 +72,8 @@
     <section id="s-record">
       <h2>2 · Record yourself reading the script</h2>
       <p>Read each line at your normal speed. Pause about one second between lines. You can change the text.</p>
-      <textarea id="script" rows="15" spellcheck="false"></textarea>
+      <p id="scriptOwner" class="hint"></p>
+      <textarea id="script" rows="15" spellcheck="false" autocomplete="off"></textarea>
       <p class="row">
         <button id="btnRecord" type="button">Record</button>
         <button id="btnStopRecord" type="button">Stop</button>
@@ -114,7 +124,7 @@
         <span id="blindInfo" class="hint"></span>
       </p>
       <label class="block">Notes (what sounded wrong?)
-        <textarea id="notes" rows="3"></textarea>
+        <textarea id="notes" rows="3" autocomplete="off"></textarea>
       </label>
     </section>
 
@@ -174,7 +184,7 @@
         <button id="btnSaveWav" type="button">Download WAV of the run being rated</button>
         <span id="costInfo"></span>
       </p>
-      <p class="hint">The JSON is the file to share. It has no audio: it holds the measurements, your ratings and notes, the settings with your device names, the browser version, the script text only if you changed it, the Sanas address check, and the page log. WAV files are your voice: keep them on your PC.</p>
+      <p class="hint">The JSON is the file to share. It has no audio: it holds the measurements, your ratings and notes, the settings with your device names, the browser version, whose voice it is, the script text only if you changed it, the Sanas address check, and the page log. WAV files are your voice: keep them on your PC.</p>
       <details>
         <summary>Log</summary>
         <pre id="log"></pre>

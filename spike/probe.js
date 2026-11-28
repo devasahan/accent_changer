@@ -131,6 +131,9 @@ function refreshButtons() {
     else if ($(id).textContent === NEEDS_RECORDING) $(id).textContent = "";
   }
   for (const id of SETUP_IDS) $(id).disabled = state.mode !== "idle";
+  const locked = holdsSomething();
+  $("speaker").disabled = state.mode !== "idle" || locked;
+  $("speakerInfo").textContent = locked ? "To change it, download the results (step 8), then reload the page." : "";
   $("rateRun").disabled = !["idle", "long"].includes(state.mode);
   const mock = $("engine").value === "mock";
   for (const el of document.querySelectorAll(".mock-only")) el.classList.toggle("hidden", !mock);
@@ -163,7 +166,14 @@ function action(id, mode, fn) {
 // ---------- settings this browser remembers ----------
 // Part 2 runs days after Part 1 on a freshly opened page: your own script, the
 // model name, the sample rate and your device choices come back. (Per browser,
-// on this PC only; nothing is sent anywhere.)
+// on this PC only; nothing is sent anywhere.) Your friend's voice test runs on
+// this page too, so the script and the model name are kept per person: yours
+// under the keys the page always used ("script", "model"), your friend's under
+// "friend.script" and "friend.model". The page always opens on yours.
+// Whose voice, the script box, the model name and Notes have autocomplete="off":
+// after Back, or in a reopened or restored tab, Edge would otherwise put their
+// old text back after this code has run, and show your friend's lines or notes
+// under Yours (the first key press would then save them as yours).
 
 const STORE = "accentChanger.";
 
@@ -185,12 +195,32 @@ function recall(key) {
 
 const usingExampleScript = () => $("script").value.trim() === DEFAULT_SCRIPT.trim();
 
+/** Whose voice this page holds: "you" or "friend" (step 1). */
+const speaker = () => ($("speaker").value === "friend" ? "friend" : "you");
+const personKey = (key) => (speaker() === "friend" ? `friend.${key}` : key);
+
+/** Show the script and model name of the person "Whose voice" names. */
+function showPerson() {
+  $("script").value = recall(personKey("script")) || DEFAULT_SCRIPT;
+  $("model").value = recall(personKey("model")) || "AT5.2";
+  $("scriptOwner").textContent =
+    speaker() === "friend"
+      ? "Your friend's script: their own 15 lines. Yours is kept, and the page opens on Yours again."
+      : "Your script. For your friend's voice test, first set Whose voice (step 1) to Your friend's.";
+}
+
+/**
+ * "Whose voice" changes only on a page that holds no recording, run or note
+ * (one that wouldn't ask "Leave site?"), so one results file is one person's voice.
+ */
+const holdsSomething = () => Boolean(state.runs.length || state.recording || $("notes").value.trim());
+
 // ---------- audio plumbing ----------
 
 async function ensureCtx() {
   if (!state.ctx || state.ctx.state === "closed") {
     state.ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
-    await state.ctx.audioWorklet.addModule("./recorder.worklet.js");
+    await state.ctx.audioWorklet.addModule("../src/audio/worklets/recorder.worklet.js");
     await applySink();
   }
   if (state.ctx.state !== "running") await state.ctx.resume();
@@ -271,7 +301,7 @@ function concat(list) {
 
 /** A recorder worklet with `inputs` inputs, recorded side by side. */
 function makeRecorder(ctx, inputs) {
-  const node = new AudioWorkletNode(ctx, "spike-recorder", {
+  const node = new AudioWorkletNode(ctx, "ac-recorder", {
     numberOfInputs: inputs,
     numberOfOutputs: 1,
     outputChannelCount: [1],
@@ -356,6 +386,7 @@ function numberOrUndefined(id) {
 function settings() {
   const mock = $("engine").value === "mock";
   return {
+    speaker: speaker(),
     engine: $("engine").value,
     modelName: $("model").value.trim() || "AT5.2",
     sampleRate: Number($("rate").value),
@@ -497,9 +528,19 @@ action("btnConnect", "busy", async () => {
 
 $("out").addEventListener("change", () => applySink());
 $("pairDevice").addEventListener("change", () => (state.pairChosen = true));
-for (const id of ["mic", "out", "pairDevice", "model", "rate"]) $(id).addEventListener("change", () => remember(id, $(id).value));
-$("model").addEventListener("input", () => remember("model", $("model").value));
-$("script").addEventListener("input", () => remember("script", $("script").value));
+for (const id of ["mic", "out", "pairDevice", "rate"]) $(id).addEventListener("change", () => remember(id, $(id).value));
+$("model").addEventListener("input", () => remember(personKey("model"), $("model").value));
+$("script").addEventListener("input", () => remember(personKey("script"), $("script").value));
+$("speaker").addEventListener("change", () => {
+  showPerson();
+  setStatus(
+    speaker() === "friend"
+      ? "Whose voice: your friend's. Step 2 shows their script and step 1 their model name; yours are kept."
+      : "Whose voice: yours.",
+  );
+  refreshButtons();
+});
+$("notes").addEventListener("input", refreshButtons);
 $("engine").addEventListener("change", refreshButtons);
 navigator.mediaDevices?.addEventListener?.("devicechange", () => listDevices().catch(() => {}));
 
@@ -1364,6 +1405,7 @@ async function openOtherApp() {
 /** The settings a step-7 run saves: which devices it compared. */
 function deviceSettings(p) {
   return {
+    speaker: speaker(),
     engine: "device",
     device: p.otherLabel,
     viaCable: p.viaCable,
@@ -1564,9 +1606,10 @@ function buildResults() {
   const script = $("script").value;
   return {
     tool: "accent-changer spike",
-    schema: 3,
+    schema: 4, // 4: adds speaker ("you" or "friend"), here and in every run's settings
     createdAt: new Date().toISOString(),
     browser: browserName(),
+    speaker: speaker(),
     settings: settings(),
     sanas: {
       init: state.init,
@@ -1599,16 +1642,18 @@ function download(name, blob) {
 }
 
 const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+// Your friend's files say so in their names too.
+const fileStart = () => (speaker() === "friend" ? "sanas-check-friend-" : "sanas-check-");
 
 action("btnSaveJson", null, async () => {
   await loadOriginCheck();
-  download(`sanas-check-${stamp()}.json`, new Blob([JSON.stringify(buildResults(), null, 2)], { type: "application/json" }));
+  download(`${fileStart()}${stamp()}.json`, new Blob([JSON.stringify(buildResults(), null, 2)], { type: "application/json" }));
 });
 
 action("btnSaveWav", null, () => {
   const rate = state.last?.sampleRate ?? state.ctx?.sampleRate ?? 48000;
   const wav = state.last ? encodeWav([state.last.ref, state.last.sig], rate) : encodeWav([state.recording], rate);
-  download(`sanas-check-${stamp()}${state.last ? "-original-left-converted-right" : "-recording"}.wav`, new Blob([wav], { type: "audio/wav" }));
+  download(`${fileStart()}${stamp()}${state.last ? "-original-left-converted-right" : "-recording"}.wav`, new Blob([wav], { type: "audio/wav" }));
 });
 
 /** The server's check of which page addresses Sanas accepts (it runs when the key is accepted). */
@@ -1645,14 +1690,17 @@ window.addEventListener("beforeunload", (event) => {
   }
 });
 
+// The lock on Whose voice follows the page's contents: check it again whenever the page is shown.
+window.addEventListener("pageshow", refreshButtons);
+
 window.addEventListener("pagehide", () => {
   state.liveStart?.abort();
   for (const handle of state.sessions) handle.stop();
   disconnectSanas();
 });
 
-$("script").value = recall("script") || DEFAULT_SCRIPT;
-if (recall("model")) $("model").value = recall("model");
+$("speaker").value = "you"; // the page always opens on yours
+showPerson();
 if ([...$("rate").options].some((o) => o.value === recall("rate"))) $("rate").value = recall("rate");
 if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
   setStatus(

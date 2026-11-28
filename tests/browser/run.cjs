@@ -29,6 +29,7 @@ async function main() {
   const { synthSpeech } = await load("tests/helpers/synth.js");
   const { encodeWav, decodeWav } = await load("src/core/wav.js");
   const { startSpikeServer } = await load("spike/serve.mjs");
+  const { DEFAULT_SCRIPT } = await load("spike/script.js");
 
   // Fake microphone: ~10 s of speech-like audio (Chromium loops the file).
   const speech = synthSpeech({ seconds: 10, seed: 5, leadSec: 0.4, tailSec: 0.6 });
@@ -598,12 +599,18 @@ async function main() {
 
     // 8 · downloads
     const [jsonDl] = await Promise.all([page.waitForEvent("download"), page.click("#btnSaveJson")]);
-    const jsonPath = path.join(OUT, await jsonDl.suggestedFilename());
+    const jsonName = await jsonDl.suggestedFilename();
+    const jsonPath = path.join(OUT, jsonName);
     await jsonDl.saveAs(jsonPath);
     const text = fs.readFileSync(jsonPath, "utf8");
     const results = JSON.parse(text);
     const runCount = await spike(() => window.__spike.state.runs.length);
-    check(results.schema === 3 && results.runs.length === runCount && runCount >= 10, "results JSON has every run", `${results.runs.length} of ${runCount}`);
+    check(results.schema === 4 && results.runs.length === runCount && runCount >= 10, "results JSON has every run", `${results.runs.length} of ${runCount}`);
+    check(
+      results.speaker === "you" && results.runs.every((r) => r.settings.speaker === "you") && /^sanas-check-[\d-]+\.json$/.test(jsonName),
+      "the results say whose voice they hold: yours, in the file and in every run",
+      `${jsonName} ${results.speaker}`,
+    );
     check(results.originCheck?.appReady === true && Array.isArray(results.pairs) && results.pairs.length === 1, "it holds the address check and the quick check");
     check(results.runs[0].rating?.perUtterance.length === results.runs[0].utterances.length, "each script run carries its own rating");
     check(
@@ -676,6 +683,175 @@ async function main() {
     await page.fill("#notes", "");
     const askedEmpty = await reloadAsks();
     check(askedEmpty === "no question", "and doesn't ask when the page holds nothing", askedEmpty);
+
+    // Your friend's voice test (README, Part 1): "Whose voice" keeps a script and a model name per person,
+    // the page opens on yours, and your friend's results and WAV say whose voice they hold.
+    await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    check(
+      (await page.locator("#speaker").inputValue()) === "you" &&
+        (await page.locator("#speaker").isEnabled()) &&
+        (await page.locator("#scriptOwner").textContent()) === "Your script. For your friend's voice test, first set Whose voice (step 1) to Your friend's.",
+      "the page opens on Whose voice: Yours, says so above the script, and a page that holds nothing can change it",
+      await page.locator("#scriptOwner").textContent(),
+    );
+    // A note is part of one person's results too: it locks the choice, and emptying Notes unlocks it.
+    await page.click("#notes");
+    await page.keyboard.type("x");
+    const lockedByNote =
+      (await page.locator("#speaker").isDisabled()) && /download the results \(step 8\)/.test(await page.locator("#speakerInfo").textContent());
+    await page.fill("#notes", "");
+    check(
+      lockedByNote && (await page.locator("#speaker").isEnabled()) && (await page.locator("#speakerInfo").textContent()) === "",
+      "a note locks Whose voice, and emptying Notes unlocks it",
+      String(lockedByNote),
+    );
+    // A run alone locks it too. Live needs no recording (nor do step 7's read-aloud and long check, which
+    // INTERVIEW's rehearsal uses), so on such a page the run is all that keeps one results file to one voice.
+    await page.selectOption("#engine", "mock");
+    await page.click("#btnLive");
+    await page.waitForFunction(() => window.__spike.state.mode === "live", null, { timeout: 10000 });
+    await page.waitForTimeout(3000);
+    await page.click("#btnStopLive");
+    await waitIdle(10000);
+    const runOnly = await spike(() => ({
+      runs: window.__spike.state.runs.map((r) => r.kind),
+      recording: Boolean(window.__spike.state.recording),
+      notes: document.querySelector("#notes").value,
+    }));
+    check(
+      runOnly.runs.join() === "live" &&
+        !runOnly.recording &&
+        runOnly.notes === "" &&
+        (await page.locator("#speaker").isDisabled()) &&
+        /download the results \(step 8\)/.test(await page.locator("#speakerInfo").textContent()),
+      "a live run alone, with no recording and no note, locks Whose voice too",
+      `${JSON.stringify(runOnly)} · ${await page.locator("#speakerInfo").textContent()}`,
+    );
+    const askedLive = await reloadAsks();
+    await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    check(
+      askedLive === "beforeunload" && (await page.locator("#speaker").isEnabled()),
+      "that page asks before you reload it, and the reloaded page can change Whose voice again",
+      askedLive,
+    );
+    await page.selectOption("#speaker", "friend");
+    check(
+      (await page.locator("#script").inputValue()) === DEFAULT_SCRIPT &&
+        (await page.locator("#model").inputValue()) === "AT5.2" &&
+        /Your friend's script/.test(await page.locator("#scriptOwner").textContent()),
+      "Your friend's: their own script (the example at first) and model name; the page says whose script it is",
+    );
+    await page.fill("#script", "Friend's first line.\nFriend's second line.");
+    await page.fill("#model", "AT5.2_Masculine");
+    const savedKeys = () =>
+      spike(() =>
+        Object.fromEntries(["script", "model", "friend.script", "friend.model"].map((k) => [k, localStorage.getItem(`accentChanger.${k}`)])),
+      );
+    const keys = await savedKeys();
+    check(
+      keys.script === "My own first line.\nMy own second line." &&
+        keys.model === "AT5.2_Feminine" &&
+        keys["friend.script"] === "Friend's first line.\nFriend's second line." &&
+        keys["friend.model"] === "AT5.2_Masculine",
+      "your friend's script and model name are kept apart; yours stay under the keys the page always used",
+      JSON.stringify(keys),
+    );
+    // Once the page holds your friend's voice, Whose voice stays as it is until the page is reloaded.
+    await page.click("#btnRecord");
+    await page.waitForFunction(() => window.__spike.state.mode === "recording", null, { timeout: 10000 });
+    // Grey while a step runs: during a first recording the page holds nothing yet.
+    check(await page.locator("#speaker").isDisabled(), "Whose voice is grey while a step runs (here, the first recording)");
+    await page.waitForTimeout(2000);
+    await page.click("#btnStopRecord");
+    await waitIdle(10000);
+    check(
+      (await page.locator("#speaker").isDisabled()) && /download the results \(step 8\), then reload the page/.test(await page.locator("#speakerInfo").textContent()),
+      "Whose voice can't change while the page holds a recording, and the page says what to do",
+      await page.locator("#speakerInfo").textContent(),
+    );
+    const [friendDl] = await Promise.all([page.waitForEvent("download"), page.click("#btnSaveJson")]);
+    const friendName = await friendDl.suggestedFilename();
+    const friendPath = path.join(OUT, friendName);
+    await friendDl.saveAs(friendPath);
+    const friend = JSON.parse(fs.readFileSync(friendPath, "utf8"));
+    check(
+      /^sanas-check-friend-[\d-]+\.json$/.test(friendName) &&
+        friend.speaker === "friend" &&
+        friend.settings.speaker === "friend" &&
+        friend.settings.modelName === "AT5.2_Masculine" &&
+        friend.script === "Friend's first line.\nFriend's second line.",
+      "your friend's results file says so, in its name and inside, with their script and model name",
+      `${friendName} ${JSON.stringify({ speaker: friend.speaker, model: friend.settings.modelName, script: friend.script })}`,
+    );
+    const [friendWav] = await Promise.all([page.waitForEvent("download"), page.click("#btnSaveWav")]);
+    const friendWavName = await friendWav.suggestedFilename();
+    check(/^sanas-check-friend-[\d-]+-recording\.wav$/.test(friendWavName), "and so does a WAV of their voice", friendWavName);
+    const askedFriend = await reloadAsks();
+    check(askedFriend === "beforeunload", "a page with your friend's recording asks before you leave it", askedFriend);
+    await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    check(
+      (await page.locator("#speaker").inputValue()) === "you" &&
+        (await page.locator("#script").inputValue()) === "My own first line.\nMy own second line." &&
+        (await page.locator("#model").inputValue()) === "AT5.2_Feminine",
+      "a reopened page is back on Yours, with your own script and model name",
+    );
+    await page.selectOption("#speaker", "friend");
+    check(
+      (await page.locator("#script").inputValue()) === "Friend's first line.\nFriend's second line." &&
+        (await page.locator("#model").inputValue()) === "AT5.2_Masculine",
+      "and your friend's come back when you pick Your friend's again",
+    );
+
+    // Back (like a reopened or restored tab) must not put the old text back into the boxes: the page opens
+    // on Yours, so your friend's lines would show there and be saved as yours at the first key press.
+    await page.fill("#script", "Friend's third line.");
+    await page.click("#notes");
+    await page.keyboard.type("They liked the 48 kHz run.");
+    const savedBefore = await savedKeys();
+    const leave = (d) => d.accept();
+    page.on("dialog", leave);
+    try {
+      await page.goto(`${base}/spike/probe.css`);
+      await page.goBack();
+    } finally {
+      page.off("dialog", leave);
+    }
+    await page.waitForFunction(() => /Ready/.test(document.querySelector("#status").textContent), null, { timeout: 10000 });
+    await page.waitForTimeout(500); // Chromium puts saved form text back after the page's own start-up
+    const afterBack = {
+      speaker: await page.locator("#speaker").inputValue(),
+      enabled: await page.locator("#speaker").isEnabled(),
+      script: await page.locator("#script").inputValue(),
+      notes: await page.locator("#notes").inputValue(),
+      saved: await savedKeys(),
+    };
+    check(
+      afterBack.speaker === "you" &&
+        afterBack.enabled &&
+        afterBack.script === "My own first line.\nMy own second line." &&
+        afterBack.notes === "" &&
+        JSON.stringify(afterBack.saved) === JSON.stringify(savedBefore),
+      "after Back, the page is on Yours with your own script and empty Notes, and nothing saved has changed",
+      JSON.stringify(afterBack),
+    );
+
+    // Privacy: emptying your friend's script box and model name removes them; the example and AT5.2 come back.
+    await page.selectOption("#speaker", "friend");
+    await page.fill("#script", "");
+    await page.fill("#model", "");
+    await page.selectOption("#speaker", "you");
+    await page.selectOption("#speaker", "friend");
+    const cleared = await savedKeys();
+    check(
+      (await page.locator("#script").inputValue()) === DEFAULT_SCRIPT &&
+        (await page.locator("#model").inputValue()) === "AT5.2" &&
+        !cleared["friend.script"] &&
+        !cleared["friend.model"] &&
+        cleared.script === "My own first line.\nMy own second line." &&
+        cleared.model === "AT5.2_Feminine",
+      "emptying your friend's script and model name removes them (README, Privacy), and keeps yours",
+      JSON.stringify(cleared),
+    );
   } catch (err) {
     check(false, "scenario finished", err.stack || err.message);
     await page.screenshot({ path: path.join(OUT, "failure.png"), fullPage: true }).catch(() => {});

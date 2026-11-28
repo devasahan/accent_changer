@@ -2,6 +2,8 @@
 
 Until our own app is built and tested, you can use Krisp or the Sanas desktop app in an interview, but only one that passes the bar below and the rehearsal in section 4. Its numbers come from Part 2 of the [README](README.md); I'll also check them from your results file.
 
+**When to do Part 2:** if you haven't done it yet, 5–6 days before the interview. The free trials last 7 days each, so they still run on the interview day. **If you already did Part 2 and its trials have ended,** the app that passed costs money from then on: Krisp about $15–30 a month for a plan whose daily minutes cover a 90-minute interview (its $8–16 plan gives only 1 hour a day; prices not checked); the Sanas desktop app's price after its trial is not published.
+
 ## 1. Does the app pass?
 
 Every line must hold:
@@ -15,11 +17,11 @@ Every line must hold:
 | Delay (Delay ms in the page's table) | about 500 ms or less |
 | Gaps (in the page's table, its read-aloud run) | at most 1 |
 | CPU during the Zoom video test | the usual Utilization with the app on is about 60 % or less |
-| Daily limit | the trial's minutes of accent conversion per day cover the interview (plan 90 minutes) plus your checks |
+| Daily limit | the trial's, or the paid plan's, minutes of accent conversion per day cover the interview (plan 90 minutes) plus your checks |
 
 In the page's table, a red number fails its line.
 
-- **If both apps pass,** pick the one whose lines your friend got right more often. If that is a tie, pick the higher score, then the lower delay.
+- **If both apps pass,** pick the one whose lines the blind listener got right more often. If that is a tie, pick the higher score, then the lower delay.
 - **If neither passes, or no trial works,** do the interview without a tool. Mangled technical words are worse than an accent.
 
 ## 2. Ask first (as soon as an app passes, about 5 days before)
@@ -86,7 +88,7 @@ If it didn't pass, or there isn't time for all that, do the interview without a 
 ## 5. On the day
 
 1. Plug in the charger and set Power mode to **Best performance** (as in section 4). Use a cable to the internet if you can.
-2. Plug in your wired or USB headset, then start the app and OBS's virtual camera. Keep your own check short (a minute): the trial's daily minutes count.
+2. Plug in your wired or USB headset, then start the app and OBS's virtual camera. Keep your own check short (a minute): the trial's, or the paid plan's, daily minutes count.
 3. On the meeting's pre-join screen, check that:
    - the microphone is the app's;
    - its level moves when you speak;
